@@ -37,8 +37,8 @@ cargo build --locked --release
 
 两项外部 SSH 用例在默认套件中继续忽略；本记录不把模拟远端命令的协议测试算作真实 Linux 部署或 systemd 验收。双端真实部署证据见 [真实 Linux 部署验收](linux-ssh-acceptance.md)。
 
-## 仍未验证
+## 本记录之外的验收
 
-- 真实 systemd 服务重启、无端口 Worker 稳定性及不稳定服务补偿；仍需用户授权准备 WSL 的 SSH 服务端和临时系统服务。
+- 本客户端验证不包含真实 systemd；用户随后授权准备临时环境，该部分已由 Windows 客户端驱动的 [WSL systemd 验收](systemd-acceptance.md) 补齐。
 - macOS、其他 Linux 发行版、声明的最低 Rust 1.88，以及完整 SSH Agent/Host Key 轮换矩阵。
 - 活动部署中的退出、错误和 panic 的实机终端恢复，以及全部 TUI 页面视觉交互。此处只做了空项目列表的正常退出冒烟。

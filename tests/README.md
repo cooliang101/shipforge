@@ -14,6 +14,34 @@ The test refuses to write without the explicit opt-in, two distinct ports/Host K
 
 The async acceptance scenario has a ten-minute deadline. Run `./tests/run-linux-acceptance-cleanup-tests.ps1` to check the runner's cleanup paths with in-memory doubles; it needs only PowerShell 7 and never starts WSL/Docker or deletes files. This separate regression checks native exit-code handling, aggregated cleanup failures, ownership/path refusal, environment restoration, and helper-process disposal.
 
+## WSL systemd deployment acceptance
+
+With explicit permission to create temporary **system-level services and a root SSH test endpoint** in a development WSL distro, run:
+
+```powershell
+./tests/run-systemd-acceptance.ps1 -Distribution Ubuntu-22.04
+```
+
+Requires PowerShell 7, Windows Rust/Git/`ssh-keygen`, and WSL Python 3, systemd, OpenSSH server, and `nobody:nogroup` (UID/GID 65534). The runner does not install packages or unlock accounts. It does not change default SSH settings, existing authorized keys, PAM/polkit policy, saved ShipForge connections, or business services. Do not use a production distro.
+
+Each run has an exclusive `/var/tmp/shipforge-systemd-<run-id>/` directory, two runtime-only Worker units, and a separate SSH unit listening on one random IPv4 loopback port. Authentication requires a temporary Ed25519 identity and an independently obtained Host Key fingerprint. The dedicated authorized public-key file is under `/run`, so OpenSSH StrictModes remains enabled. The control connection is root because the production Driver calls system-level `systemctl` directly; the test payloads run as `nobody` without network sockets. This does not validate non-root service-management authorization.
+
+The ignored `linux_ssh_systemd.rs` test exercises real `DeploymentService`/Driver packaging, SFTP, activation, default ten-second systemd stability, historical/undeployed rollback, unstable-update compensation, and failed first deployment. It verifies actual payload startup/exit evidence, restored versions, running/stopped processes, and SQLite terminal records. No HTTP health endpoint is configured. Payload scripts are test-generated; the build command is `rustc --version`.
+
+The test deadline is ten minutes. The SSH unit has a separate fifteen-minute runtime cap; Worker units stop with it. Cleanup verifies the run marker, runtime unit files, process/session ownership and listener closure before removal. Ambiguous resources are preserved and cause failure. Windows temporary keys and process environment are cleaned independently of WSL cleanup failures. OpenSSH's shared `/run/sshd` runtime prerequisite and normal system authentication/journal records may remain; they are not application configuration. An abruptly terminated runner may need explicit cleanup of its reported run ID after inspecting the retained evidence.
+
+The runner sets only process-local test variables: `SHIPFORGE_SYSTEMD_ACCEPTANCE`, `SHIPFORGE_SYSTEMD_RUN_ID`, `SHIPFORGE_TEST_SSH_PORT`, `SHIPFORGE_TEST_SSH_HOST_KEY`, and `SHIPFORGE_TEST_SSH_IDENTITY_FILE`. These are fixture inputs, not ShipForge user configuration or a deployment CLI.
+
+Safety regressions mock system operations and do not provision services; Python cases also use their own temporary files:
+
+```powershell
+./tests/run-systemd-acceptance-cleanup-tests.ps1
+```
+
+```sh
+python3 -B tests/fixtures/systemd/test_fixture.py
+```
+
 ## Read-only external OpenSSH probe
 
 `linux_ssh_disposable.rs` is deliberately ignored by the default test suite. It never reads the ShipForge Destination registry and refuses non-loopback hosts.
@@ -36,4 +64,4 @@ The default `linux_ssh_protocol.rs` test runs an in-process SSH/SFTP server and 
 
 `tests/support/deployment_service.rs` composes the production application service with that server: a temporary Git project is built with `rustc`, only the selected Component is deployed, and build/prepare/activate intents, logs, and manifest source revision are checked against one Deployment ID. Fixture Git initialization uses isolated configuration, no user hooks, and a ten-second deadline per command; the full async protocol fixture has a 180-second deadline. No registry or credentials from real Projects are read.
 
-The default protocol suite uses real SSH/SFTP wire exchanges but simulated remote commands and filesystem state; the read-only external probe verifies basic OpenSSH compatibility only. The separate two-container suite above exercises real Linux deployment and compensation, but systemd service activation/stability still needs live acceptance before M1 can pass. The Unix-only inherited-process-pipe tests have now passed in WSL Linux, requiring both bounded completion and non-truncated EOF; Windows cannot exercise those cases. See [Linux client validation](../docs/validation/linux-client.md), [TUI-DEP-01 validation](../docs/validation/tui-dep-01.md), and [real Linux deployment validation](../docs/validation/linux-ssh-acceptance.md).
+The default protocol suite uses real SSH/SFTP wire exchanges but simulated remote commands and filesystem state; the read-only external probe verifies basic OpenSSH compatibility only. The separate two-container and WSL systemd suites provide real deployment/compensation and service-stability evidence. The Unix-only inherited-process-pipe tests have passed in WSL Linux, requiring both bounded completion and non-truncated EOF; Windows cannot exercise those cases. See [Linux client validation](../docs/validation/linux-client.md), [TUI-DEP-01 validation](../docs/validation/tui-dep-01.md), [two-Destination validation](../docs/validation/linux-ssh-acceptance.md), and [systemd/M1 acceptance](../docs/validation/systemd-acceptance.md).

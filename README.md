@@ -4,7 +4,7 @@ ShipForge is a Rust TUI for building local project Components and deploying thei
 
 ## Development status
 
-The project is in M1 acceptance, not a production-ready release. Setup, deployment planning, live logs, cancellation, and the core rollback service are implemented. History/recovery/retention management and final TUI hardening remain on the [roadmap](docs/roadmap.md). Real two-Destination deployment tests pass; live systemd acceptance and the platform matrix are still incomplete.
+M1's safe deployment loop has passed acceptance, but this is not a production-ready release. Setup, deployment planning, live logs, cancellation, and the core rollback service are implemented. Real two-Destination deployment and [WSL systemd lifecycle tests](docs/validation/systemd-acceptance.md) pass. M2 history/recovery/retention management, final TUI hardening, and the complete platform matrix remain on the [roadmap](docs/roadmap.md).
 
 ## Run locally
 

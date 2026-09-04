@@ -41,9 +41,8 @@ HTTP 由目标内的真实 Python 服务提供，根据实际 `current/health.tx
 
 WSL 的前台输入管道只用于保证 Windows 测试运行期间实例不退出，不修改 WSL 或 Docker 配置。清理限于本轮带匹配标签的容器、唯一镜像标签和精确临时密钥目录；Docker 构建缓存可能保留。
 
-## 未完成的验收
+## 本记录之外的验收
 
-- 容器不运行 systemd。本次只证明 HTTP 健康检查；真实服务重启、无端口 Worker 稳定窗口和不稳定服务的恢复仍待执行。
-- WSL 已有运行中的 systemd，但缺少可用 SSH 服务端，且非交互 sudo 不可用。安装及临时系统服务变更须先获用户确认，不能以特权容器替代授权。
+- 容器不运行 systemd，本记录只证明 HTTP 健康检查。用户随后授权安装 WSL SSH 服务端并继续测试；真实服务重启、无端口 Worker 稳定窗口及失败恢复已由独立 [systemd 验收](systemd-acceptance.md) 补齐，不倒填为本容器用例的能力。
 - Unix 专用子进程回归与 WSL Linux 的编译/正常退出冒烟已由后续 [Linux 客户端验证](linux-client.md) 补齐；macOS、其他 Linux 环境、SSH Agent 和 Host Key 轮换等完整平台矩阵仍属 QA-01。
 - TUI 视觉交互、M2 历史/恢复/保留及 M3/M4 工作不由此测试证明完成。

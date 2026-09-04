@@ -14,7 +14,7 @@
 
 `TUI-DEP-01` 已实现并通过自动化工作包验收：Environment/Component 选择、只读预检、含 Git 和目标信息的计划预览、显式确认、后台构建和发布、实时脱敏日志、安全取消、逐 Component 结果及人工恢复指引均已接通。构建与远端操作共用 Deployment ID；每次 Driver 写操作前复核配置，上传前检查实际解压容量及远端状态。日志故障触发安全取消，但不覆盖已知部署结果；终端错误退出也等待恢复边界。验证范围和已知限制见 [TUI-DEP-01 验收记录](validation/tui-dep-01.md)。
 
-**M1 整体尚未验收**：两台一次性 Debian/OpenSSH Destination 的单 Component 发布、联合发布、指定版本/未部署状态回滚、HTTP 健康失败补偿及取消已实际执行通过；真实 systemd 服务激活与无端口 Worker 稳定性检查仍待验收。完整范围及复现入口见 [真实 Linux 验收记录](validation/linux-ssh-acceptance.md)。默认 Loopback 协议测试的模拟远端文件系统不替代真实 Linux 验收；M2/M3/M4 不因此视为完成。
+**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；下一阶段为 M2，M2/M3/M4 尚未完成。
 
 WSL Linux 客户端已通过原生单测（含 Unix 继承管道回归）、协议测试、编译及正常启动/退出冒烟；范围见 [Linux 客户端验证](validation/linux-client.md)。这不等于真实 systemd 验收或全部平台支持。
 

@@ -13,6 +13,7 @@ ShipForge uses `russh` and `russh-sftp` for the built-in `linux-ssh` Driver. It 
 - `linux-ssh` target validation rejects non-normalized roots, unsafe systemd unit names, credential-bearing or ambiguous health URLs, unsupported health schemes, and unknown fields.
 - The in-process SSH/SFTP protocol test covers authenticated command execution, bounded streaming upload progress, a partial-write failure followed by cleanup and retry, no-clobber conflicts, cancellation cleanup, remote SHA-256 success and mismatch, Release Prepare, Component-level atomic `current` activation, final observation, and Destination-side HTTP health execution over one real SSH session.
 - The opt-in two-container acceptance suite uses real Debian/OpenSSH endpoints and the production deployment service for single/joint deployment, explicit rollback, destination-side HTTP failure compensation, and cancellation. See [live evidence and limits](validation/linux-ssh-acceptance.md); this does not establish systemd or cross-platform acceptance.
+- A separate [WSL systemd acceptance suite](validation/systemd-acceptance.md) now verifies a no-port Worker, stability failures, compensation, and historical/undeployed rollback. Its temporary root control connection does not establish non-root service authorization or the complete platform matrix.
 
 ## Release-Gate Live Checks
 
