@@ -5,7 +5,6 @@ use std::{
 };
 
 use flate2::{Compression, GzBuilder};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 use thiserror::Error;
@@ -13,12 +12,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{ResolvedArtifact, ResolvedArtifactKind},
-    domain::{
-        ComponentGeneration, ComponentName, ComponentRelease, EnvironmentId, ProjectId,
-        ReleaseVersion,
-    },
+    domain::ComponentRelease,
     drivers::ReleasePackage,
 };
+
+pub use crate::domain::ReleaseManifest;
 
 const MANIFEST_PATH: &str = "manifest.json";
 const FILE_MODE: u32 = 0o644;
@@ -26,39 +24,6 @@ const DIRECTORY_MODE: u32 = 0o755;
 const EXECUTABLE_MODE: u32 = 0o755;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_ARCHIVE_PATH_BYTES: usize = 4096;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReleaseManifest {
-    pub schema_version: u32,
-    pub project_id: ProjectId,
-    pub environment_id: EnvironmentId,
-    pub component: ComponentName,
-    pub generation: ComponentGeneration,
-    pub version: ReleaseVersion,
-    pub created_at_unix: u64,
-    pub source_revision: Option<String>,
-}
-
-impl ReleaseManifest {
-    #[must_use]
-    pub fn new(
-        release: &ComponentRelease,
-        created_at_unix: u64,
-        source_revision: Option<String>,
-    ) -> Self {
-        Self {
-            schema_version: 1,
-            project_id: release.project_id.clone(),
-            environment_id: release.environment_id.clone(),
-            component: release.component.clone(),
-            generation: release.generation,
-            version: release.version.clone(),
-            created_at_unix,
-            source_revision,
-        }
-    }
-}
 
 /// Packages one resolved build output into one immutable Release.
 ///
@@ -604,7 +569,10 @@ pub enum PackageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{DestinationKey, DestinationRevision};
+    use crate::domain::{
+        ComponentGeneration, ComponentName, DestinationKey, DestinationRevision, EnvironmentId,
+        ProjectId, ReleaseVersion,
+    };
     use flate2::read::GzDecoder;
     use std::collections::BTreeMap;
 

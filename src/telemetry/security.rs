@@ -31,9 +31,18 @@ impl<T> fmt::Display for Secret<T> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Redactor {
     values: Vec<String>,
+}
+
+impl fmt::Debug for Redactor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Redactor")
+            .field("registered_values", &self.values.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Redactor {
@@ -53,6 +62,10 @@ impl Redactor {
         self.values.iter().fold(input.to_owned(), |text, secret| {
             text.replace(secret, "[REDACTED]")
         })
+    }
+
+    pub(crate) fn values(&self) -> &[String] {
+        &self.values
     }
 }
 
@@ -235,6 +248,14 @@ mod tests {
             redactor.redact("authorization=token-123"),
             "authorization=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn redactor_debug_never_exposes_registered_secrets() {
+        let redactor = Redactor::new(["never-print-this-token".into()]);
+        let debug = format!("{redactor:?}");
+        assert!(debug.contains("registered_values: 1"));
+        assert!(!debug.contains("never-print"));
     }
 
     #[test]

@@ -38,7 +38,7 @@ Use `ratatui` with the `crossterm` backend. Build frames off-screen and flush ch
 
 ## Commit & Pull Request Guidelines
 
-There is no commit history yet. Use imperative subjects, preferably Conventional Commits, such as `feat: validate release paths`. Pull requests must describe the change, tests, risks, and rollback impact; link issues and include TUI screenshots when applicable. Highlight schema changes and update `docs/requirements.md` when behavior changes.
+Use imperative Conventional Commits, such as `feat: validate release paths`; the initial snapshot uses `chore:`. Finish each roadmap work package with code review, passing tests and quality gates, then a separate commit before starting the next. Do not label a WIP snapshot as completed work. Pull requests must describe changes, tests, risks, and rollback impact; link issues and include TUI screenshots when applicable. Highlight schema changes and update `docs/requirements.md` when behavior changes.
 
 ## Security & Deployment Safety
 

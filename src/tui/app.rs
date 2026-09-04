@@ -3,14 +3,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, SyncSender},
     },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     application::{
@@ -42,6 +42,7 @@ pub(super) enum Screen {
     },
     DeploySelection(DeploySelectionState),
     DeploymentPlanning {
+        request_id: uuid::Uuid,
         selection: DeploySelectionState,
         cancellation: tokio_util::sync::CancellationToken,
     },
@@ -60,6 +61,7 @@ pub(super) enum Screen {
         root: PathBuf,
         config: ProjectConfig,
         summary: String,
+        scroll: u16,
         logs: VecDeque<DriverLog>,
     },
     SetupComponents(ComponentSetupState),
@@ -159,9 +161,9 @@ trait TuiDeploymentGateway: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug)]
 struct LocalDeploymentGateway {
-    destination_path: PathBuf,
-    credential_path: PathBuf,
-    history_path: PathBuf,
+    destinations: PathBuf,
+    credentials: PathBuf,
+    history: PathBuf,
 }
 
 #[async_trait(?Send)]
@@ -172,13 +174,13 @@ impl TuiDeploymentGateway for LocalDeploymentGateway {
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<DeploymentPlan, String> {
         let destinations =
-            DestinationRegistry::load(&self.destination_path).map_err(|error| error.to_string())?;
+            DestinationRegistry::load(&self.destinations).map_err(|error| error.to_string())?;
         let credentials = Arc::new(
-            CredentialRegistry::load(&self.credential_path).map_err(|error| error.to_string())?,
+            CredentialRegistry::load(&self.credentials).map_err(|error| error.to_string())?,
         );
         let drivers = crate::bootstrap::deployment_driver_registry(credentials)
             .map_err(|error| error.to_string())?;
-        DeploymentService::new(Arc::new(drivers), self.history_path.clone())
+        DeploymentService::new(Arc::new(drivers), self.history.clone())
             .plan(selection, &destinations, cancellation)
             .await
             .map_err(|error| error.to_string())
@@ -191,12 +193,12 @@ impl TuiDeploymentGateway for LocalDeploymentGateway {
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<DeploymentReport, String> {
         let credentials = Arc::new(
-            CredentialRegistry::load(&self.credential_path).map_err(|error| error.to_string())?,
+            CredentialRegistry::load(&self.credentials).map_err(|error| error.to_string())?,
         );
         let drivers = crate::bootstrap::deployment_driver_registry(credentials)
             .map_err(|error| error.to_string())?;
-        DeploymentService::new(Arc::new(drivers), self.history_path.clone())
-            .execute(plan, events, cancellation)
+        DeploymentService::new(Arc::new(drivers), self.history.clone())
+            .execute(plan, &self.destinations, events, cancellation)
             .await
             .map_err(|error| error.to_string())
     }
@@ -240,7 +242,7 @@ enum BackgroundEvent {
     AgentIdentities(Result<Vec<LocalIdentityCandidate>, String>),
     HostKey(Result<String, String>),
     Authentication(Result<RemoteSetupCandidates, String>),
-    DeploymentPlan(Result<DeploymentPlan, String>),
+    DeploymentPlan(uuid::Uuid, Result<DeploymentPlan, String>),
     DeploymentProgress(DriverLog),
     DeploymentFinished(Result<DeploymentReport, String>),
 }
@@ -365,7 +367,7 @@ pub(super) struct App {
     initial_directory: PathBuf,
     home_directory: Option<PathBuf>,
     runtime: Option<tokio::runtime::Handle>,
-    background_sender: Sender<BackgroundEvent>,
+    background_sender: SyncSender<BackgroundEvent>,
     background_receiver: Receiver<BackgroundEvent>,
     setup_service: DestinationSetupService,
     deployment_gateway: Arc<dyn TuiDeploymentGateway>,
@@ -393,9 +395,9 @@ impl App {
     ) -> Result<Self, ProjectRegistryError> {
         let credential_path = destination_registry_path.with_file_name("credentials.yaml");
         let deployment_gateway = Arc::new(LocalDeploymentGateway {
-            destination_path: destination_registry_path.clone(),
-            credential_path,
-            history_path: destination_registry_path.with_file_name("history.sqlite3"),
+            destinations: destination_registry_path.clone(),
+            credentials: credential_path,
+            history: destination_registry_path.with_file_name("history.sqlite3"),
         });
         Self::new_with_services(
             registry_path,
@@ -417,7 +419,7 @@ impl App {
             .map_err(|source| ProjectRegistryError::browser(initial_directory, source))?;
         let recent = ProjectRegistry::load(&registry_path)?.statuses();
         let credential_registry_path = destination_registry_path.with_file_name("credentials.yaml");
-        let (background_sender, background_receiver) = mpsc::channel();
+        let (background_sender, background_receiver) = mpsc::sync_channel(256);
         Ok(Self {
             screen: Screen::Projects,
             recent,
@@ -438,7 +440,10 @@ impl App {
     }
 
     pub fn poll_background(&mut self) {
-        while let Ok(event) = self.background_receiver.try_recv() {
+        for _ in 0..256 {
+            let Ok(event) = self.background_receiver.try_recv() else {
+                break;
+            };
             match event {
                 BackgroundEvent::AgentIdentities(result) => match &mut self.screen {
                     Screen::NewSshDestination(draft) | Screen::KeyBrowser { draft, .. } => {
@@ -510,17 +515,8 @@ impl App {
                         }
                     }
                 }
-                BackgroundEvent::DeploymentPlan(result) => {
-                    let Screen::DeploymentPlanning { selection, .. } = self.screen.clone() else {
-                        continue;
-                    };
-                    match result {
-                        Ok(plan) => self.screen = Screen::DeploymentReview { plan, scroll: 0 },
-                        Err(error) => {
-                            self.screen = Screen::DeploySelection(selection);
-                            self.message = Some(error);
-                        }
-                    }
+                BackgroundEvent::DeploymentPlan(completed_id, result) => {
+                    self.finish_deployment_plan(completed_id, result);
                 }
                 BackgroundEvent::DeploymentProgress(log) => {
                     if let Screen::DeploymentRunning { logs, .. } = &mut self.screen {
@@ -534,10 +530,48 @@ impl App {
         }
     }
 
+    fn finish_deployment_plan(
+        &mut self,
+        completed_id: uuid::Uuid,
+        result: Result<DeploymentPlan, String>,
+    ) {
+        let Screen::DeploymentPlanning {
+            request_id,
+            selection,
+            ..
+        } = self.screen.clone()
+        else {
+            return;
+        };
+        if completed_id != request_id {
+            return;
+        }
+        match result {
+            Ok(plan) => self.screen = Screen::DeploymentReview { plan, scroll: 0 },
+            Err(error) => {
+                self.screen = Screen::DeploySelection(selection);
+                self.message = Some(error);
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // In raw mode Ctrl+C is an input event, not a process signal. Never
+        // let modified shortcuts fall through to plain confirmation keys.
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                self.request_deployment_cancellation();
+            }
+            return false;
+        }
         self.message = None;
         match self.screen.clone() {
-            Screen::Projects => self.handle_projects(key.code),
+            Screen::Projects => {
+                if key.code == KeyCode::Char('q') {
+                    return true;
+                }
+                self.handle_projects(key.code);
+            }
             Screen::Browser(browser) => self.handle_browser(key.code, &browser),
             Screen::SetupComponents(setup) => self.handle_setup_components(key.code, &setup),
             Screen::SetupDestinations(setup) => self.handle_setup_destinations(key.code, &setup),
@@ -589,6 +623,7 @@ impl App {
             Screen::DeploymentPlanning {
                 selection,
                 cancellation,
+                ..
             } => {
                 if key.code == KeyCode::Esc {
                     cancellation.cancel();
@@ -598,25 +633,54 @@ impl App {
             Screen::DeploymentReview { plan, .. } => {
                 self.handle_deployment_review(key.code, plan);
             }
-            Screen::DeploymentRunning { cancellation, .. } => {
+            Screen::DeploymentRunning { .. } => {
                 if key.code == KeyCode::Esc {
-                    cancellation.cancel();
-                    if let Screen::DeploymentRunning {
-                        cancellation_requested,
-                        ..
-                    } = &mut self.screen
-                    {
-                        *cancellation_requested = true;
-                    }
+                    self.request_deployment_cancellation();
                 }
             }
             Screen::DeploymentFinished { root, config, .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.screen = Screen::Overview { root, config };
+                } else if let Screen::DeploymentFinished { scroll, .. } = &mut self.screen {
+                    *scroll = match key.code {
+                        KeyCode::Up => scroll.saturating_sub(1),
+                        KeyCode::Down => scroll.saturating_add(1),
+                        KeyCode::PageUp => scroll.saturating_sub(10),
+                        KeyCode::PageDown => scroll.saturating_add(10),
+                        _ => *scroll,
+                    };
                 }
             }
         }
         false
+    }
+
+    fn request_deployment_cancellation(&mut self) {
+        if let Screen::DeploymentRunning {
+            cancellation,
+            cancellation_requested,
+            ..
+        } = &mut self.screen
+        {
+            cancellation.cancel();
+            *cancellation_requested = true;
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        match &self.screen {
+            Screen::DeploymentPlanning { cancellation, .. }
+            | Screen::HostKeyPending { cancellation, .. }
+            | Screen::SshAuthenticationPending { cancellation, .. } => cancellation.cancel(),
+            _ => {}
+        }
+        self.request_deployment_cancellation();
+        // The Running screen is set before the worker acquires its session
+        // permit, so waiting on is_active alone would introduce an exit race.
+        while matches!(self.screen, Screen::DeploymentRunning { .. }) {
+            self.poll_background();
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn open_deployment(&mut self, root: PathBuf, config: ProjectConfig) {
@@ -732,7 +796,9 @@ impl App {
             environment,
             components: selection.selected.clone(),
         };
+        let request_id = uuid::Uuid::now_v7();
         let result = spawn_plan_thread(
+            request_id,
             runtime,
             Arc::clone(&self.deployment_gateway),
             request,
@@ -744,6 +810,7 @@ impl App {
             return;
         }
         self.screen = Screen::DeploymentPlanning {
+            request_id,
             selection: selection.clone(),
             cancellation,
         };
@@ -808,16 +875,14 @@ impl App {
             return;
         };
         let summary = match result {
-            Ok(report) => format!(
-                "Deployment {} finished with {:?}",
-                report.deployment.id, report.deployment.state
-            ),
+            Ok(report) => deployment_summary(&report),
             Err(error) => format!("Deployment did not complete: {error}"),
         };
         self.screen = Screen::DeploymentFinished {
             root,
             config,
             summary,
+            scroll: 0,
             logs,
         };
     }
@@ -1656,12 +1721,18 @@ fn selection_state(selection: &DeploymentSelection) -> DeploySelectionState {
 
 #[derive(Debug)]
 struct ProgressEvents {
-    sender: Sender<BackgroundEvent>,
+    sender: SyncSender<BackgroundEvent>,
 }
 
 impl EventSink for ProgressEvents {
-    fn emit(&self, event: DriverLog) {
-        let _ = self.sender.send(BackgroundEvent::DeploymentProgress(event));
+    fn emit(&self, mut event: DriverLog) {
+        // Progress is a bounded UI projection, not the durable operation log.
+        // A slow renderer must not stall cancellation or remote recovery.
+        event.namespace = event.namespace.chars().take(128).collect();
+        event.message = event.message.chars().take(4096).collect();
+        let _ = self
+            .sender
+            .try_send(BackgroundEvent::DeploymentProgress(event));
     }
 }
 
@@ -1673,18 +1744,75 @@ fn push_bounded_log(logs: &mut VecDeque<DriverLog>, log: DriverLog) {
     logs.push_back(log);
 }
 
+fn deployment_summary(report: &DeploymentReport) -> String {
+    use crate::application::DeploymentFailure;
+    use std::fmt::Write as _;
+
+    let mut summary = format!(
+        "Deployment {}: {:?}\n",
+        report.deployment.id, report.deployment.state
+    );
+    if let Some(failure) = &report.failure {
+        match failure {
+            DeploymentFailure::Cancelled => summary.push_str("Cancellation requested.\n"),
+            DeploymentFailure::Driver {
+                component,
+                stage,
+                error,
+                ..
+            } => {
+                let _ = writeln!(summary, "{component} / {stage:?}: {error}");
+            }
+            DeploymentFailure::Contract {
+                component,
+                stage,
+                message,
+                ..
+            } => {
+                let _ = writeln!(summary, "{component} / {stage:?}: {message}");
+            }
+        }
+    }
+    for (component, result) in &report.deployment.components {
+        let observed = result
+            .observed_release
+            .as_ref()
+            .map_or("none reported", |version| version.as_str());
+        let _ = writeln!(
+            summary,
+            "{component}: {:?}; observed Release: {observed}",
+            result.outcome
+        );
+    }
+    for (component, error) in &report.compensation_failures {
+        let _ = writeln!(summary, "MANUAL RECOVERY REQUIRED — {component}: {error}");
+    }
+    for warning in &report.warnings {
+        let _ = writeln!(summary, "WARNING — {warning}");
+    }
+    summary
+}
+
+fn catch_worker_failure<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err("Background operation stopped unexpectedly. Remote state may be incomplete; inspect deployment history and remote state before retrying.".into())
+    })
+}
+
 fn spawn_plan_thread(
+    request_id: uuid::Uuid,
     runtime: tokio::runtime::Handle,
     gateway: Arc<dyn TuiDeploymentGateway>,
     selection: DeploymentSelection,
     cancellation: tokio_util::sync::CancellationToken,
-    sender: Sender<BackgroundEvent>,
+    sender: SyncSender<BackgroundEvent>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("shipforge-deployment-plan".into())
         .spawn(move || {
-            let result = runtime.block_on(gateway.plan(selection, &cancellation));
-            let _ = sender.send(BackgroundEvent::DeploymentPlan(result));
+            let result =
+                catch_worker_failure(|| runtime.block_on(gateway.plan(selection, &cancellation)));
+            let _ = sender.send(BackgroundEvent::DeploymentPlan(request_id, result));
         })
         .map(drop)
 }
@@ -1695,7 +1823,7 @@ fn spawn_execute_thread(
     session: Arc<DeploymentSession>,
     plan: DeploymentPlan,
     cancellation: tokio_util::sync::CancellationToken,
-    sender: Sender<BackgroundEvent>,
+    sender: SyncSender<BackgroundEvent>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("shipforge-deployment-run".into())
@@ -1703,14 +1831,15 @@ fn spawn_execute_thread(
             let events = ProgressEvents {
                 sender: sender.clone(),
             };
-            let result = runtime.block_on(async {
-                session
-                    .run(gateway.execute(plan, &events, &cancellation))
-                    .await
+            let result = catch_worker_failure(|| {
+                runtime.block_on(async {
+                    session
+                        .run(gateway.execute(plan, &events, &cancellation))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result)
+                })
             });
-            let result = result
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
             let _ = sender.send(BackgroundEvent::DeploymentFinished(result));
         })
         .map(drop)
@@ -1801,6 +1930,281 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeDeploymentGateway {
+        executed: AtomicBool,
+        cancelled: AtomicBool,
+    }
+
+    #[async_trait(?Send)]
+    impl TuiDeploymentGateway for FakeDeploymentGateway {
+        async fn plan(
+            &self,
+            selection: DeploymentSelection,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> Result<DeploymentPlan, String> {
+            Ok(DeploymentPlan {
+                activation_order: selection.components.iter().cloned().collect(),
+                selection,
+                entries: Vec::new(),
+                git: crate::application::GitWorktreeState::NotRepository,
+                git_metadata: crate::application::GitMetadata::default(),
+            })
+        }
+
+        async fn execute(
+            &self,
+            _: DeploymentPlan,
+            events: &dyn EventSink,
+            cancellation: &tokio_util::sync::CancellationToken,
+        ) -> Result<DeploymentReport, String> {
+            self.executed.store(true, Ordering::SeqCst);
+            events.emit(DriverLog {
+                namespace: "test".into(),
+                message: "execution started".into(),
+            });
+            cancellation.cancelled().await;
+            self.cancelled.store(true, Ordering::SeqCst);
+            let mut deployment = crate::domain::Deployment::new();
+            deployment.start().unwrap();
+            deployment.cancel().unwrap();
+            Ok(DeploymentReport {
+                deployment,
+                failure: Some(crate::application::DeploymentFailure::Cancelled),
+                compensation_failures: std::collections::BTreeMap::new(),
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    async fn wait_for_screen(app: &mut App, predicate: impl Fn(&Screen) -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.poll_background();
+                if predicate(&app.screen) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("background operation should produce the expected screen");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deployment_requires_confirmation_and_waits_for_safe_cancellation() {
+        assert_confirmation_and_cancellation(Some(key(KeyCode::Esc))).await;
+        assert_confirmation_and_cancellation(Some(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert_confirmation_and_cancellation(None).await;
+    }
+
+    async fn assert_confirmation_and_cancellation(cancel_key: Option<KeyEvent>) {
+        let directory = tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("shipforge.yaml"),
+            include_str!("../../docs/examples/shipforge.yaml"),
+        )
+        .unwrap();
+        let crate::config::ProjectConfigState::Loaded(config) =
+            crate::config::load(directory.path()).unwrap()
+        else {
+            panic!("expected example configuration");
+        };
+        let gateway = Arc::new(FakeDeploymentGateway::default());
+        let mut app = App::new(
+            directory.path().join("projects.yaml"),
+            directory.path().join("destinations.yaml"),
+            directory.path(),
+        )
+        .unwrap();
+        app.deployment_gateway = gateway.clone();
+        app.screen = Screen::Overview {
+            root: directory.path().to_owned(),
+            config,
+        };
+        assert!(!app.handle_key(key(KeyCode::Char('d'))));
+        assert!(matches!(app.screen, Screen::DeploySelection(_)));
+        assert!(!app.handle_key(key(KeyCode::Enter)));
+        wait_for_screen(&mut app, |screen| {
+            matches!(screen, Screen::DeploymentReview { .. })
+        })
+        .await;
+        assert!(!gateway.executed.load(Ordering::SeqCst));
+        assert!(!app.handle_key(key(KeyCode::Enter)));
+        assert!(!gateway.executed.load(Ordering::SeqCst));
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), modifiers)));
+            assert!(matches!(app.screen, Screen::DeploymentReview { .. }));
+            assert!(!gateway.executed.load(Ordering::SeqCst));
+        }
+        assert!(!app.handle_key(key(KeyCode::Char('c'))));
+        assert!(matches!(app.screen, Screen::DeploymentRunning { .. }));
+        assert!(!app.handle_key(key(KeyCode::Char('q'))));
+        assert!(matches!(app.screen, Screen::DeploymentRunning { .. }));
+        if let Some(cancel_key) = cancel_key {
+            assert!(!app.handle_key(cancel_key));
+            assert!(matches!(
+                app.screen,
+                Screen::DeploymentRunning {
+                    cancellation_requested: true,
+                    ..
+                }
+            ));
+        } else {
+            app.shutdown();
+            assert!(matches!(app.screen, Screen::DeploymentFinished { .. }));
+        }
+        wait_for_screen(&mut app, |screen| {
+            matches!(screen, Screen::DeploymentFinished { .. })
+        })
+        .await;
+        assert!(gateway.executed.load(Ordering::SeqCst));
+        assert!(gateway.cancelled.load(Ordering::SeqCst));
+        assert!(!app.deployment_session.is_active());
+        assert!(!app.handle_key(key(KeyCode::Enter)));
+        assert!(matches!(app.screen, Screen::Overview { .. }));
+    }
+
+    #[test]
+    fn stale_deployment_check_cannot_replace_a_new_request() {
+        let directory = tempdir().unwrap();
+        let mut app = App::new(
+            directory.path().join("projects.yaml"),
+            directory.path().join("destinations.yaml"),
+            directory.path(),
+        )
+        .unwrap();
+        let request_id = uuid::Uuid::now_v7();
+        let selection = DeploySelectionState {
+            root: directory.path().to_owned(),
+            config: ProjectConfig {
+                schema_version: 1,
+                project_id: crate::domain::ProjectId::new(),
+                project: "routing-test".into(),
+                components: std::collections::BTreeMap::new(),
+                environments: std::collections::BTreeMap::new(),
+            },
+            environment_cursor: 0,
+            component_cursor: 0,
+            selected: BTreeSet::new(),
+        };
+        app.screen = Screen::DeploymentPlanning {
+            request_id,
+            selection,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        app.background_sender
+            .send(BackgroundEvent::DeploymentPlan(
+                uuid::Uuid::now_v7(),
+                Err("stale failure".into()),
+            ))
+            .unwrap();
+        app.poll_background();
+        assert!(matches!(app.screen, Screen::DeploymentPlanning { .. }));
+        assert!(app.message.is_none());
+        app.background_sender
+            .send(BackgroundEvent::DeploymentPlan(
+                request_id,
+                Err("current failure".into()),
+            ))
+            .unwrap();
+        app.poll_background();
+        assert!(matches!(app.screen, Screen::DeploySelection(_)));
+        assert_eq!(app.message.as_deref(), Some("current failure"));
+    }
+
+    #[test]
+    fn worker_panic_returns_a_safe_diagnostic_without_payload() {
+        let result = catch_worker_failure::<()>(|| panic!("secret panic payload"));
+        let error = result.unwrap_err();
+        assert!(error.contains("Remote state may be incomplete"));
+        assert!(!error.contains("secret panic payload"));
+        assert_eq!(catch_worker_failure(|| Ok(42)), Ok(42));
+        assert_eq!(
+            catch_worker_failure::<()>(|| Err("failure".into())),
+            Err("failure".into())
+        );
+    }
+
+    #[test]
+    fn deployment_summary_preserves_failure_and_manual_recovery_instructions() {
+        use crate::{
+            application::{DeploymentFailure, OrchestrationStage},
+            domain::{ComponentDeploymentResult, ComponentOutcome, Deployment},
+            drivers::DriverError,
+        };
+        let component = ComponentName::parse("worker").unwrap();
+        let error = DriverError {
+            stage: "compensate".into(),
+            target: "worker".into(),
+            message: "current changed externally".into(),
+            suggested_action: "inspect current before retrying".into(),
+        };
+        let mut deployment = Deployment::new();
+        deployment.start().unwrap();
+        deployment.fail().unwrap();
+        deployment.components.insert(
+            component.clone(),
+            ComponentDeploymentResult {
+                outcome: ComponentOutcome::CompensationFailed,
+                attempted_release: None,
+                observed_release: None,
+            },
+        );
+        let report = DeploymentReport {
+            deployment,
+            failure: Some(DeploymentFailure::Driver {
+                component: component.clone(),
+                stage: OrchestrationStage::Activate,
+                error: error.clone(),
+                observed_release: None,
+            }),
+            compensation_failures: std::collections::BTreeMap::from([(component, error)]),
+            warnings: vec!["Deployment log incomplete: disk full".into()],
+        };
+        let summary = deployment_summary(&report);
+        assert!(summary.contains("worker / Activate"));
+        assert!(summary.contains("CompensationFailed"));
+        assert!(summary.contains("MANUAL RECOVERY REQUIRED"));
+        assert!(summary.contains("inspect current before retrying"));
+        assert!(summary.contains("none reported"));
+        assert!(summary.contains("WARNING — Deployment log incomplete: disk full"));
+    }
+
+    #[test]
+    fn progress_flood_is_nonblocking_and_bounds_unicode_payloads() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let events = ProgressEvents { sender };
+        for _ in 0..1000 {
+            events.emit(DriverLog {
+                namespace: "界".repeat(200),
+                message: "界".repeat(5000),
+            });
+        }
+        let retained: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(retained.len(), 2);
+        for event in retained {
+            let BackgroundEvent::DeploymentProgress(log) = event else {
+                panic!("expected a progress projection");
+            };
+            assert_eq!(log.namespace.chars().count(), 128);
+            assert_eq!(log.message.chars().count(), 4096);
+        }
+        drop(receiver);
+        events.emit(DriverLog {
+            namespace: "closed".into(),
+            message: "ignored".into(),
+        });
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2076,6 +2480,11 @@ mod tests {
         assert!(!directory.path().join("shipforge.yaml").exists());
 
         app.handle_key(key(KeyCode::Char('n')));
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), modifiers));
+            assert!(matches!(app.screen, Screen::SetupReview { .. }));
+            assert!(!directory.path().join("shipforge.yaml").exists());
+        }
         app.handle_key(key(KeyCode::Char('c')));
         assert!(matches!(app.screen, Screen::Overview { .. }));
         assert!(directory.path().join("shipforge.yaml").is_file());

@@ -4,7 +4,9 @@ mod artifact;
 mod build;
 mod clock;
 mod deployment;
+mod deployment_logs;
 mod destination_setup;
+mod execution_guard;
 mod orchestrator;
 mod planner;
 mod rollback;
@@ -12,7 +14,7 @@ mod session;
 
 pub use crate::drivers::ReleasePackage;
 pub use artifact::{PackageError, ReleaseManifest, package_release};
-pub use build::{BuildError, BuildReport, GitWorktreeState, inspect_git, run_build};
+pub use build::{BuildError, BuildReport, GitMetadata, GitWorktreeState, inspect_git, run_build};
 pub use deployment::{
     DeploymentPlan, DeploymentPlanEntry, DeploymentSelection, DeploymentService,
     DeploymentServiceError,

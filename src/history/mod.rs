@@ -5,7 +5,8 @@ mod store;
 
 pub use logs::{RollingLogError, RollingLogWriter};
 pub use store::{
-    HistoryError, HistoryStore, IntentId, IntentRecord, IntentStatus, PersistedComponentResult,
+    DeploymentLogRecord, HistoryError, HistoryStore, IntentId, IntentRecord, IntentStatus,
+    PersistedComponentResult,
 };
 
 /// Returns the platform-local history database path.

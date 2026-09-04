@@ -95,6 +95,7 @@ impl AuthenticatedSession {
         cancellation: &CancellationToken,
     ) -> Result<Option<ReleaseVersion>, ActivateReleaseError> {
         validate_options(options)?;
+        self.check_release_layout(target, cancellation).await?;
         observe_with_remote(self, target, options.command_timeout, cancellation).await
     }
 
@@ -118,6 +119,13 @@ impl AuthenticatedSession {
         options: ActivationOptions,
         cancellation: &CancellationToken,
     ) -> Result<ActivatedRemoteRelease, ActivateReleaseError> {
+        self.check_release_manifest(
+            target,
+            &super::DeploymentMarker::for_release(prepared.release()),
+            &prepared.release().version,
+            cancellation,
+        )
+        .await?;
         activate_with_remote(
             self,
             target,
@@ -150,6 +158,8 @@ impl AuthenticatedSession {
         if activation.root != target.root {
             return Err(ActivateReleaseError::InvalidActivationReceipt);
         }
+        self.check_release_layout(target, &CancellationToken::new())
+            .await?;
         compensate(
             self,
             target,
@@ -186,6 +196,7 @@ impl AuthenticatedSession {
         options: ActivationOptions,
         cancellation: &CancellationToken,
     ) -> Result<RolledBackRemoteRelease, ActivateReleaseError> {
+        self.check_release_layout(target, cancellation).await?;
         rollback_with_remote(
             self,
             target,
@@ -197,6 +208,65 @@ impl AuthenticatedSession {
         )
         .await
     }
+
+    /// Restores a historical Release after an explicit rollback removed `current`.
+    ///
+    /// # Errors
+    /// Returns an error on cancellation, current drift, unsafe history, or a
+    /// command failure. The caller must observe and report any partial change.
+    pub async fn restore_undeployed_release(
+        &self,
+        target: &LinuxSshTarget,
+        desired: &ComponentRelease,
+        deployment: &DeploymentId,
+        options: ActivationOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ActivateReleaseError> {
+        self.check_release_layout(target, cancellation).await?;
+        restore_undeployed_with_remote(self, target, desired, deployment, options, cancellation)
+            .await
+    }
+}
+
+async fn restore_undeployed_with_remote<R: ActivationRemote>(
+    remote: &R,
+    target: &LinuxSshTarget,
+    desired: &ComponentRelease,
+    deployment: &DeploymentId,
+    options: ActivationOptions,
+    cancellation: &CancellationToken,
+) -> Result<(), ActivateReleaseError> {
+    validate_options(options)?;
+    if cancellation.is_cancelled() {
+        return Err(ActivateReleaseError::Cancelled);
+    }
+    let recovery = CancellationToken::new();
+    let timeout = options.command_timeout.min(COMPENSATION_TIMEOUT);
+    verify_current(remote, target, None, timeout, &recovery).await?;
+    let activation = ActivatedRemoteRelease {
+        root: target.root.clone(),
+        release: desired.clone(),
+        previous: None,
+        systemd_restarted: false,
+    };
+    restore_previous(
+        remote,
+        target,
+        &activation,
+        &desired.version,
+        None,
+        deployment,
+        timeout,
+        &recovery,
+    )
+    .await
+    .map_err(|cause| ActivateReleaseError::ExplicitRollbackFailed {
+        cause,
+        manual_action: format!(
+            "Inspect {}/current and the service before retrying recovery",
+            target.root
+        ),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -649,6 +719,7 @@ async fn compensate<R: ActivationRemote>(
             target,
             activation,
             previous,
+            Some(&activation.release.version),
             deployment,
             timeout,
             &cancellation,
@@ -666,13 +737,22 @@ async fn restore_previous<R: ActivationRemote>(
     target: &LinuxSshTarget,
     activation: &ActivatedRemoteRelease,
     previous: &ReleaseVersion,
+    expected_current: Option<&ReleaseVersion>,
     deployment: &DeploymentId,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let paths = ReleasePaths::new(target, &activation.release, deployment);
     let previous_directory = format!("{}/{}", paths.release_parent, previous);
-    validate_historical_release(remote, &previous_directory, timeout, cancellation).await?;
+    validate_historical_release(
+        remote,
+        &previous_directory,
+        &activation.release,
+        previous,
+        timeout,
+        cancellation,
+    )
+    .await?;
     let temporary_link = format!(
         "{}/{}.rollback-current",
         paths.temporary_directory, deployment
@@ -698,14 +778,8 @@ async fn restore_previous<R: ActivationRemote>(
     if let Err(error) = create {
         return Err(cleanup_error(remote, &temporary_link, timeout, error).await);
     }
-    if let Err(error) = verify_current(
-        remote,
-        target,
-        Some(&activation.release.version),
-        timeout,
-        cancellation,
-    )
-    .await
+    if let Err(error) =
+        verify_current(remote, target, expected_current, timeout, cancellation).await
     {
         return Err(cleanup_error(remote, &temporary_link, timeout, error).await);
     }
@@ -748,6 +822,8 @@ async fn restore_previous<R: ActivationRemote>(
 async fn validate_historical_release<R: ActivationRemote>(
     remote: &R,
     directory: &str,
+    identity: &ComponentRelease,
+    version: &ReleaseVersion,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
@@ -778,7 +854,22 @@ async fn validate_historical_release<R: ActivationRemote>(
     reject_symbolic_path(remote, &manifest, timeout, cancellation)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(())
+    let output = run(
+        remote,
+        "read previous Release manifest",
+        "head",
+        ["-c", "8193", "--", &manifest],
+        timeout,
+        cancellation,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if output.exit_status != 0 || output.stdout_truncated {
+        return Err("previous Release manifest could not be read safely".into());
+    }
+    super::DeploymentMarker::for_release(identity)
+        .validate_manifest(&output.stdout, version)
+        .map_err(|error| error.to_string())
 }
 
 async fn restore_not_deployed<R: ActivationRemote>(
@@ -1240,6 +1331,8 @@ fn manual_action(target: &LinuxSshTarget, activation: &ActivatedRemoteRelease) -
 
 #[derive(Debug, Error)]
 pub enum ActivateReleaseError {
+    #[error(transparent)]
+    UnsafeRemote(#[from] super::MarkerError),
     #[error("activation command timeout must be non-zero")]
     ZeroCommandTimeout,
     #[error("Release activation was cancelled before current changed")]
@@ -1313,6 +1406,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeState {
         files: BTreeSet<String>,
+        manifests: BTreeMap<String, Vec<u8>>,
         directories: BTreeSet<String>,
         links: BTreeMap<String, String>,
         commands: Vec<String>,
@@ -1341,16 +1435,40 @@ mod tests {
             ]);
             let current = format!("{}/current", target.root);
             let mut links = BTreeMap::new();
-            let mut files = BTreeSet::from([prepared.archive_path().as_str().to_owned()]);
+            let mut files = BTreeSet::from([
+                prepared.archive_path().as_str().to_owned(),
+                format!("{}/manifest.json", prepared.release_directory()),
+            ]);
+            let mut manifests = BTreeMap::from([(
+                format!("{}/manifest.json", prepared.release_directory()),
+                serde_json::to_vec(&crate::domain::ReleaseManifest::new(
+                    prepared.release(),
+                    1,
+                    None,
+                ))
+                .unwrap(),
+            )]);
             if let Some(previous) = previous {
                 let previous_directory = format!("{}/releases/{previous}", target.root);
                 directories.insert(previous_directory.clone());
                 files.insert(format!("{previous_directory}/manifest.json"));
+                let mut previous_release = prepared.release().clone();
+                previous_release.version = previous.clone();
+                manifests.insert(
+                    format!("{previous_directory}/manifest.json"),
+                    serde_json::to_vec(&crate::domain::ReleaseManifest::new(
+                        &previous_release,
+                        1,
+                        None,
+                    ))
+                    .unwrap(),
+                );
                 links.insert(current, format!("releases/{previous}"));
             }
             Self {
                 state: Mutex::new(FakeState {
                     files,
+                    manifests,
                     directories,
                     links,
                     commands: Vec::new(),
@@ -1397,6 +1515,10 @@ mod tests {
             }
 
             match command.program.as_str() {
+                "head" => match state.manifests.get(args.last().unwrap()) {
+                    Some(bytes) => Ok(output(0, &bytes[..bytes.len().min(8193)])),
+                    None => Ok(output(1, b"")),
+                },
                 "test" => {
                     let predicate = &args[0];
                     let path = &args[1];
@@ -1936,6 +2058,57 @@ mod tests {
         .unwrap();
         assert_eq!(receipt.current(), None);
         assert_eq!(remote.current(&target), None);
+        restore_undeployed_with_remote(
+            &remote,
+            &target,
+            activated.release(),
+            &DeploymentId::new(),
+            ActivationOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            remote.current(&target),
+            Some(format!("releases/{}", activated.release().version))
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_undeployed_rejects_existing_current_and_early_cancellation() {
+        let target = target(false);
+        let deployment = DeploymentId::new();
+        let prepared = prepared(&target, &deployment);
+        let previous = ReleaseVersion::parse("v1").unwrap();
+        let remote = FakeRemote::fixture(&target, &prepared, Some(&previous));
+        assert!(
+            restore_undeployed_with_remote(
+                &remote,
+                &target,
+                prepared.release(),
+                &DeploymentId::new(),
+                ActivationOptions::default(),
+                &CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(remote.current(&target).as_deref(), Some("releases/v1"));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            restore_undeployed_with_remote(
+                &remote,
+                &target,
+                prepared.release(),
+                &DeploymentId::new(),
+                ActivationOptions::default(),
+                &cancelled,
+            )
+            .await,
+            Err(ActivateReleaseError::Cancelled)
+        ));
+        assert_eq!(remote.current(&target).as_deref(), Some("releases/v1"));
     }
 
     #[tokio::test]
@@ -2005,5 +2178,43 @@ mod tests {
         };
         assert!(manual_action.contains("releases/v1"));
         assert_eq!(remote.current(&target).as_deref(), Some("releases/v1"));
+    }
+
+    #[tokio::test]
+    async fn historical_manifest_identity_mismatch_stops_before_restoring_a_link() {
+        let target = target(false);
+        let deployment = DeploymentId::new();
+        let prepared = prepared(&target, &deployment);
+        let remote = FakeRemote::fixture(&target, &prepared, None);
+        let path = format!("{}/manifest.json", prepared.release_directory());
+        let mut manifest = crate::domain::ReleaseManifest::new(prepared.release(), 1, None);
+        manifest.project_id = ProjectId::new();
+        remote
+            .state
+            .lock()
+            .unwrap()
+            .manifests
+            .insert(path, serde_json::to_vec(&manifest).unwrap());
+        let error = restore_undeployed_with_remote(
+            &remote,
+            &target,
+            prepared.release(),
+            &DeploymentId::new(),
+            ActivationOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("manifest identity"));
+        assert_eq!(remote.current(&target), None);
+        assert!(
+            !remote
+                .state
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| command.starts_with("'ln'"))
+        );
     }
 }

@@ -70,13 +70,14 @@ trait DeploymentDriver {
     async fn plan(&self, ctx: &ComponentExecutionContext,
         request: &ComponentRequest) -> ComponentPlan;
     async fn current(&self, ctx: &ComponentExecutionContext) -> Option<ReleaseRef>;
-    async fn prepare(&self, ctx: &ComponentExecutionContext, plan: &ComponentPlan,
+    async fn prepare(&self, deployment: &DeploymentId,
+        ctx: &ComponentExecutionContext, plan: &ComponentPlan,
         package: &ReleasePackage, events: &dyn EventSink)
         -> PreparedRelease;
-    async fn activate(&self, ctx: &ComponentExecutionContext,
+    async fn activate(&self, deployment: &DeploymentId, ctx: &ComponentExecutionContext,
         release: &ReleaseRef) -> ActivationReceipt;
-    async fn rollback(&self, ctx: &ComponentExecutionContext,
-        release: &ReleaseRef) -> ActivationReceipt;
+    async fn rollback(&self, deployment: &DeploymentId, ctx: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>, target: Option<&ReleaseRef>) -> ActivationReceipt;
     async fn logs(&self, ctx: &ComponentExecutionContext,
         release: &ReleaseRef) -> LogStream;
     async fn cleanup(&self, ctx: &ComponentExecutionContext,
@@ -224,7 +225,9 @@ Cross-Component runtime dependencies use optional `after` edges within one Envir
 
 The application orchestrator accepts frozen Component plans, their sealed Release packages, and the planner's exact activation order. It rejects duplicate, missing, or cross-Project/Environment inputs before creating a Deployment. Each prepare, activation, and compensation call receives a durable intent first. A prepare receipt must preserve the full planned Release identity and capability snapshot. An activation error triggers a fresh observation: if the candidate is current it joins compensation; if another Release is observed, the orchestrator records that fact without blindly overwriting it. Recovery calls use a fresh cancellation token, and compensation failures retain the Driver's suggested manual action in the Deployment report.
 
-Automatic compensation remains part of the failed or cancelled Deployment. An explicit rollback creates a separately linked Rollback Deployment, preflights every selected Component before changing anything, then processes the selected dependency graph in reverse activation order. Each target is either a frozen historical `ReleaseRef` or `not_deployed`; current-state drift stops the operation before side effects. A partial rollback failure is observed and any confirmed changes are compensated in reverse actual order. SQLite schema version 3 distinguishes deploy and rollback records, stores the source Deployment link, and permits a `not_deployed` target.
+Automatic compensation remains part of the failed or cancelled Deployment. An explicit rollback creates a separately linked Rollback Deployment, preflights every selected Component before changing anything, then processes the selected dependency graph in reverse activation order. Each target is either a frozen historical `ReleaseRef` or `not_deployed`; the Driver also receives the expected source, so absence is checked rather than treated as a wildcard. A partial rollback failure is observed with an independent bounded token; observation errors remain unknown and include manual guidance, never a fabricated `not_deployed` result. SQLite schema version 4 retains version 3's operation type, source Deployment link and nullable rollback target, and adds the bounded per-Deployment log index.
+
+The TUI deployment service freezes Git branch/revision/worktree status and the selected configuration for confirmation. It creates the Deployment and build intent before invoking any build, then uses that same ID for preparation, activation, compensation and logs. Before each Driver mutation, a wrapper revalidates the saved Project and selected Destination snapshots; read-only observation of the frozen endpoint remains available after configuration drift. Terminal input/render errors request cancellation and wait for the running operation before closing the runtime.
 
 ## Linux SSH Driver
 
@@ -248,7 +251,7 @@ local build → tar.gz + SHA-256 → SFTP temporary upload
 └── metadata/{deployments,releases}.jsonl
 ```
 
-The Driver verifies SSH Host Keys, remote tools, hashes, paths, disk, permissions, endpoint fingerprints, Component generations, and same-filesystem activation. `.shipforge-project.json` is a static Deployment Marker containing Project/Environment IDs, Component name, and generation; preflight rejects a conflict. It is not application configuration or a runtime dependency. For every selected Component, the Driver uploads the already packaged Release, verifies its digest, and hard-links the verified bytes into `archives/<version>.tar.gz` with no-clobber semantics. It extracts first into `temporary/<deployment>.dir`, validates the embedded manifest exists, then uses a same-filesystem no-clobber rename into `releases/<version>`. The sealed Prepare receipt is bound to that Deployment. Prepare never creates or rewrites the archive and does not touch `current`.
+The Driver verifies SSH Host Keys, remote tools, hashes, paths, disk, permissions, endpoint fingerprints, Component generations, and same-filesystem activation. `.shipforge-project.json` is a static Deployment Marker containing Project/Environment IDs, Component name, and generation; preflight rejects a conflict. It is not application configuration or a runtime dependency. Before preparation writes, the Driver rechecks `current` against the frozen plan and estimates peak storage from the existing archive's actual entries, remote block size, and metadata reserve. This is a point-in-time check, not a space reservation. Marker, path ancestors and internal directories reject unsafe links; current and historical manifests must match identity and version. The Driver uploads the already packaged Release, verifies its digest, and hard-links the verified bytes into `archives/<version>.tar.gz` with no-clobber semantics. It extracts first into `temporary/<deployment>.dir`, validates the embedded manifest, then uses a same-filesystem no-clobber rename into `releases/<version>`. The sealed Prepare receipt is bound to that Deployment. Prepare never creates or rewrites the archive and does not touch `current`.
 
 Prepare may create only recorded, disposable staged resources for candidate Releases. Those writes must be retryable or cleanable and must not change `current`, services, databases, or business state. Shared persistent-content mapping is outside the MVP. After atomically switching each selected Component's `current`, the Driver activates and checks it in normalized dependency order; unselected Components are untouched.
 
@@ -261,6 +264,8 @@ Every effect has a durable intent record before execution and an outcome afterwa
 ## Persistence and Recovery
 
 SQLite is authoritative for local Deployment intent, Steps, per-Component Release receipts and observations, logs, and recovery progress. Numbered migrations run transactionally and reject newer schemas. Deployment state updates use compare-and-set semantics; each external effect requires a pending intent row before execution and exactly one redacted outcome afterward. SQLite uses foreign keys, WAL, and full synchronous durability. Raw sanitized output drains into per-Deployment bounded rolling files; Unix database and log files use mode `0600`. UI notifications use bounded channels and may coalesce progress; terminal states and errors are never dropped.
+
+Live build output is redacted across chunk boundaries before reaching disk or UI. A dedicated writer consumes a bounded queue; saturation or I/O failure requests safe cancellation and preserves the first diagnostic. Logs use a 1 MiB current file and up to three rotated files per Deployment. The UI projection has separate length/window limits. Final log failure is appended as a warning to an existing Deployment report and must not replace known outcomes or hide compensation failures. History browsing/export and recovery remain M2/M3 work.
 
 Each Driver defines how to observe actual Component state. For `linux-ssh`, each Component's `current` link, archive, extracted directory, and manifest are authoritative; JSONL is an audit aid. Future managed Drivers use provider APIs and external IDs. Given a valid `shipforge.yaml`, recovery compares durable local intent with Driver observations and may rebuild the Component Release inventory; it never reconstructs Project identity or configuration from remote data. A failed multi-Component Deployment keeps explicit results for every selected Component until compensation or manual repair completes.
 

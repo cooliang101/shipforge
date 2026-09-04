@@ -1,8 +1,11 @@
-use std::{fmt, path::Path, str::FromStr, time::Duration};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
-#[cfg(test)]
-use rusqlite::OptionalExtension;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::domain::{
@@ -11,7 +14,7 @@ use crate::domain::{
 };
 use crate::telemetry::Redactor;
 
-const LATEST_SCHEMA_VERSION: u32 = 3;
+const LATEST_SCHEMA_VERSION: u32 = 4;
 const MIGRATION_1: &str = r"
 CREATE TABLE deployments (
  id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL,
@@ -52,6 +55,15 @@ CREATE TABLE component_results_v3 (
 INSERT INTO component_results_v3 SELECT * FROM component_results;
 DROP TABLE component_results;
 ALTER TABLE component_results_v3 RENAME TO component_results;
+";
+const MIGRATION_4: &str = r"
+CREATE TABLE deployment_logs (
+ deployment_id TEXT PRIMARY KEY NOT NULL REFERENCES deployments(id),
+ relative_path TEXT NOT NULL UNIQUE
+   CHECK (relative_path = 'logs/' || deployment_id || '.log'),
+ max_bytes INTEGER NOT NULL CHECK (max_bytes > 0),
+ retained_files INTEGER NOT NULL CHECK (retained_files > 0)
+) STRICT;
 ";
 
 pub struct HistoryStore {
@@ -124,6 +136,12 @@ impl HistoryStore {
             transaction.pragma_update(None, "user_version", 3_u32)?;
             transaction.commit()?;
         }
+        if self.schema_version()? == 3 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(MIGRATION_4)?;
+            transaction.pragma_update(None, "user_version", 4_u32)?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -156,6 +174,80 @@ impl HistoryStore {
             params![deployment.to_string(), project.to_string(), environment.to_string(), timestamp],
         )?;
         Ok(())
+    }
+
+    /// Indexes one bounded log beneath the history database's sibling `logs` directory.
+    ///
+    /// The path is generated from the Deployment ID, never supplied by output
+    /// or configuration. `retained_files` counts rotated files, excluding the
+    /// active log. Registration does not create or modify log files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero/out-of-range limits, an unknown Deployment,
+    /// duplicate registration, or database failure.
+    pub fn register_deployment_log(
+        &self,
+        deployment: &DeploymentId,
+        max_bytes: u64,
+        retained_files: u32,
+    ) -> Result<DeploymentLogRecord, HistoryError> {
+        if max_bytes == 0 || retained_files == 0 {
+            return Err(HistoryError::InvalidLogLimits);
+        }
+        let stored_max = i64::try_from(max_bytes).map_err(|_| HistoryError::InvalidLogLimits)?;
+        let relative_path = format!("logs/{deployment}.log");
+        self.connection.execute(
+            "INSERT INTO deployment_logs (deployment_id,relative_path,max_bytes,retained_files)
+             VALUES (?1,?2,?3,?4)",
+            params![
+                deployment.to_string(),
+                relative_path,
+                stored_max,
+                retained_files
+            ],
+        )?;
+        Ok(DeploymentLogRecord {
+            deployment: deployment.clone(),
+            relative_path: relative_path.into(),
+            max_bytes,
+            retained_files,
+        })
+    }
+
+    /// Returns the registered relative log path and rotation limits, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid persisted metadata or a database failure.
+    pub fn deployment_log(
+        &self,
+        deployment: &DeploymentId,
+    ) -> Result<Option<DeploymentLogRecord>, HistoryError> {
+        let row = self.connection.query_row(
+            "SELECT relative_path,max_bytes,retained_files FROM deployment_logs WHERE deployment_id=?1",
+            [deployment.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, u32>(2)?)),
+        ).optional()?;
+        let Some((relative_path, max_bytes, retained_files)) = row else {
+            return Ok(None);
+        };
+        let max_bytes = u64::try_from(max_bytes)
+            .map_err(|_| HistoryError::Corrupt("invalid Deployment log size limit".into()))?;
+        if relative_path != format!("logs/{deployment}.log")
+            || max_bytes == 0
+            || retained_files == 0
+        {
+            return Err(HistoryError::Corrupt(
+                "invalid Deployment log metadata".into(),
+            ));
+        }
+        Ok(Some(DeploymentLogRecord {
+            deployment: deployment.clone(),
+            relative_path: relative_path.into(),
+            max_bytes,
+            retained_files,
+        }))
     }
 
     /// Persists a Rollback Deployment linked to an existing Deployment in the
@@ -440,6 +532,16 @@ impl HistoryStore {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntentId(i64);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeploymentLogRecord {
+    pub deployment: DeploymentId,
+    /// Relative to the directory containing the history database.
+    pub relative_path: PathBuf,
+    pub max_bytes: u64,
+    /// Number of rotated files kept in addition to the active log.
+    pub retained_files: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntentStatus {
     Succeeded,
@@ -590,6 +692,8 @@ pub enum HistoryError {
     IntentConflict(IntentId),
     #[error("intent outcome/error combination is invalid")]
     InvalidOutcome,
+    #[error("Deployment log limits must be non-zero and fit the SQLite integer range")]
+    InvalidLogLimits,
     #[error("{field} must contain 1-1024 non-control characters")]
     InvalidText { field: &'static str },
     #[error("timestamp {0} exceeds SQLite range")]
@@ -597,6 +701,9 @@ pub enum HistoryError {
     #[error("history database contains invalid data: {0}")]
     Corrupt(String),
 }
+
+#[cfg(test)]
+mod log_index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -617,11 +724,11 @@ mod tests {
         let path = directory.path().join("nested/history.sqlite3");
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            3
+            4
         );
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            3
+            4
         );
     }
 
@@ -664,7 +771,7 @@ mod tests {
             )
             .unwrap();
         let persisted = store.component_results(&deployment).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
         assert_eq!(persisted[0].result, result);
         assert_eq!(persisted[0].error.as_deref(), Some("[REDACTED] failed"));
     }

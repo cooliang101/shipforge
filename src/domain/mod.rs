@@ -15,4 +15,4 @@ pub use deployment::{
 pub use destination::{DestinationKey, DestinationKeyError, DestinationRevision};
 pub use ids::{DeploymentId, EnvironmentId, IdParseError, ProjectId};
 pub use observation::{ComponentObservation, EnvironmentObservation, protected_releases};
-pub use release::{ComponentRelease, ReleaseVersion, ReleaseVersionError};
+pub use release::{ComponentRelease, ReleaseManifest, ReleaseVersion, ReleaseVersionError};

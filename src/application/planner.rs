@@ -15,6 +15,7 @@ pub struct PlannedComponent {
     pub driver: Arc<dyn DeploymentDriver>,
     pub context: ComponentExecutionContext,
     pub plan: ComponentPlan,
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -108,6 +109,7 @@ impl DeploymentPlanner {
             driver,
             context,
             plan,
+            notices: preflight.notices,
         })
     }
 }

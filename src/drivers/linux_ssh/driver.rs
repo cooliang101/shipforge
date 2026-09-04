@@ -156,6 +156,7 @@ impl DeploymentDriver for LinuxSshDriver {
         )
         .await
         .map_err(|source| operation_error("connect", context, source))?;
+        check_marker(&session, target, context, true).await?;
         let candidates = probe_remote_setup(
             &session,
             &target.root,
@@ -181,9 +182,20 @@ impl DeploymentDriver for LinuxSshDriver {
                 ));
             }
         }
+        let mut notices = candidates.notices;
+        notices.extend(
+            super::preflight::check_preflight(
+                &session,
+                target,
+                PREFLIGHT_TIMEOUT,
+                &context.cancellation,
+            )
+            .await
+            .map_err(|source| operation_error("preflight", context, source))?,
+        );
         Ok(PreflightReport {
             effective_capabilities: capabilities(),
-            notices: candidates.notices,
+            notices,
         })
     }
 
@@ -218,11 +230,23 @@ impl DeploymentDriver for LinuxSshDriver {
         )
         .await
         .map_err(|source| operation_error("connect", context, source))?;
-        session
+        check_marker(&session, target, context, true).await?;
+        let observed = session
             .observe_current(target, ActivationOptions::default(), &context.cancellation)
             .await
-            .map(|version| version.map(|version| Self::release_ref(context, version)))
-            .map_err(|source| operation_error("observe", context, source))
+            .map_err(|source| operation_error("observe", context, source))?;
+        if let Some(version) = &observed {
+            session
+                .check_release_manifest(
+                    target,
+                    &super::DeploymentMarker::for_context(context),
+                    version,
+                    &context.cancellation,
+                )
+                .await
+                .map_err(|source| operation_error("observe", context, source))?;
+        }
+        Ok(observed.map(|version| Self::release_ref(context, version)))
     }
 
     async fn prepare(
@@ -233,6 +257,7 @@ impl DeploymentDriver for LinuxSshDriver {
         package: &ReleasePackage,
         events: &dyn EventSink,
     ) -> Result<PreparedRelease, DriverError> {
+        validate_prepare_request(context, plan, package)?;
         let (destination, target, credential) = self.settings(context)?;
         let session = connect_authenticated(
             destination,
@@ -242,6 +267,24 @@ impl DeploymentDriver for LinuxSshDriver {
         )
         .await
         .map_err(|source| operation_error("connect", context, source))?;
+        super::space::check_release_space(
+            &session,
+            target,
+            package,
+            PREFLIGHT_TIMEOUT,
+            &context.cancellation,
+        )
+        .await
+        .map_err(|source| operation_error("space", context, source))?;
+        check_preparation_state(&session, target, context, plan).await?;
+        session
+            .ensure_deployment_marker(
+                target,
+                &super::DeploymentMarker::for_context(context),
+                &context.cancellation,
+            )
+            .await
+            .map_err(|source| operation_error("marker", context, source))?;
         let component = context.component.clone();
         let receipt = session
             .prepare_release(
@@ -295,6 +338,7 @@ impl DeploymentDriver for LinuxSshDriver {
         context: &ComponentExecutionContext,
         release: &ReleaseRef,
     ) -> Result<ActivationReceipt, DriverError> {
+        validate_release_ref("activate", context, release)?;
         let key = Self::prepared_key(deployment, context, &release.version);
         let prepared = self
             .prepared
@@ -323,6 +367,7 @@ impl DeploymentDriver for LinuxSshDriver {
         )
         .await
         .map_err(|source| operation_error("connect", context, source))?;
+        check_marker(&session, target, context, false).await?;
         let activation = session
             .activate_release(
                 target,
@@ -355,8 +400,15 @@ impl DeploymentDriver for LinuxSshDriver {
         &self,
         deployment: &DeploymentId,
         context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
         release: Option<&ReleaseRef>,
     ) -> Result<ActivationReceipt, DriverError> {
+        if let Some(expected) = expected_current {
+            validate_release_ref("rollback", context, expected)?;
+        }
+        if let Some(release) = release {
+            validate_release_ref("rollback", context, release)?;
+        }
         let (destination, target, credential) = self.settings(context)?;
         let session = connect_authenticated(
             destination,
@@ -366,10 +418,32 @@ impl DeploymentDriver for LinuxSshDriver {
         )
         .await
         .map_err(|source| operation_error("connect", context, source))?;
+        check_marker(&session, target, context, false).await?;
         let current = session
             .observe_current(target, ActivationOptions::default(), &context.cancellation)
             .await
-            .map_err(|source| operation_error("observe", context, source))?
+            .map_err(|source| operation_error("observe", context, source))?;
+        if current.as_ref() != expected_current.map(|release| &release.version) {
+            return Err(error(
+                "rollback",
+                &context.component,
+                "current changed since the rollback was planned; inspect the external change before retrying",
+            ));
+        }
+        if let Some(version) = &current {
+            session
+                .check_release_manifest(
+                    target,
+                    &super::DeploymentMarker::for_context(context),
+                    version,
+                    &context.cancellation,
+                )
+                .await
+                .map_err(|source| operation_error("observe", context, source))?;
+        }
+        let version = current
+            .clone()
+            .or_else(|| release.map(|release| release.version.clone()))
             .ok_or_else(|| {
                 error(
                     "rollback",
@@ -377,27 +451,41 @@ impl DeploymentDriver for LinuxSshDriver {
                     "Component is not currently deployed",
                 )
             })?;
+        let current_is_absent = current.is_none();
         let current = ComponentRelease {
             project_id: context.project_id.clone(),
             environment_id: context.environment_id.clone(),
             component: context.component.clone(),
             generation: context.generation,
-            version: current,
+            version,
             destination: context.destination.clone(),
             destination_revision: context.destination_revision,
         };
         let desired = release.map(|release| &release.version);
-        session
-            .rollback_release(
-                target,
-                &current,
-                desired,
-                deployment,
-                ActivationOptions::default(),
-                &context.cancellation,
-            )
-            .await
-            .map_err(|source| operation_error("rollback", context, source))?;
+        if current_is_absent {
+            session
+                .restore_undeployed_release(
+                    target,
+                    &current,
+                    deployment,
+                    ActivationOptions::default(),
+                    &context.cancellation,
+                )
+                .await
+                .map_err(|source| operation_error("rollback", context, source))?;
+        } else {
+            session
+                .rollback_release(
+                    target,
+                    &current,
+                    desired,
+                    deployment,
+                    ActivationOptions::default(),
+                    &context.cancellation,
+                )
+                .await
+                .map_err(|source| operation_error("rollback", context, source))?;
+        }
         if release.is_some() {
             session
                 .check_health(target, HealthCheckOptions::default(), &context.cancellation)
@@ -467,6 +555,122 @@ fn operation_error(
     }
 }
 
+fn validate_prepare_request(
+    context: &ComponentExecutionContext,
+    plan: &ComponentPlan,
+    package: &ReleasePackage,
+) -> Result<(), DriverError> {
+    let release = package.release();
+    if release != &plan.release
+        || release.project_id != context.project_id
+        || release.environment_id != context.environment_id
+        || release.component != context.component
+        || release.generation != context.generation
+        || release.destination != context.destination
+        || release.destination_revision != context.destination_revision
+    {
+        return Err(error(
+            "prepare",
+            &context.component,
+            "Release package identity differs from the frozen plan or execution context",
+        ));
+    }
+    if let Some(previous) = &plan.expected_current {
+        validate_release_ref("prepare", context, previous)?;
+    }
+    Ok(())
+}
+
+async fn check_preparation_state(
+    session: &super::AuthenticatedSession,
+    target: &LinuxSshTarget,
+    context: &ComponentExecutionContext,
+    plan: &ComponentPlan,
+) -> Result<(), DriverError> {
+    check_marker(session, target, context, true).await?;
+    let observed = session
+        .observe_current(target, ActivationOptions::default(), &context.cancellation)
+        .await
+        .map_err(|source| operation_error("prepare", context, source))?;
+    if let Some(version) = &observed {
+        session
+            .check_release_manifest(
+                target,
+                &super::DeploymentMarker::for_context(context),
+                version,
+                &context.cancellation,
+            )
+            .await
+            .map_err(|source| operation_error("prepare", context, source))?;
+    }
+    if observed.as_ref()
+        != plan
+            .expected_current
+            .as_ref()
+            .map(|release| &release.version)
+    {
+        return Err(error(
+            "prepare",
+            &context.component,
+            "current changed since the plan; no preparation writes were made",
+        ));
+    }
+    Ok(())
+}
+
+async fn check_marker(
+    session: &super::AuthenticatedSession,
+    target: &LinuxSshTarget,
+    context: &ComponentExecutionContext,
+    allow_new: bool,
+) -> Result<(), DriverError> {
+    let present = session
+        .check_deployment_marker(
+            target,
+            &super::DeploymentMarker::for_context(context),
+            &context.cancellation,
+        )
+        .await
+        .map_err(|source| operation_error("marker", context, source))?;
+    if !present {
+        if !allow_new {
+            return Err(operation_error(
+                "marker",
+                context,
+                super::MarkerError::Missing,
+            ));
+        }
+        session
+            .check_unmarked_root(target, &context.cancellation)
+            .await
+            .map_err(|source| operation_error("marker", context, source))?;
+    }
+    Ok(())
+}
+
+fn validate_release_ref(
+    stage: &str,
+    context: &ComponentExecutionContext,
+    release: &ReleaseRef,
+) -> Result<(), DriverError> {
+    if release.driver != crate::drivers::DriverKind::linux_ssh()
+        || release.project_id != context.project_id
+        || release.environment_id != context.environment_id
+        || release.component != context.component
+        || release.generation != context.generation
+        || release.destination != context.destination
+        || release.destination_revision != context.destination_revision
+        || release.endpoint_fingerprint != context.endpoint_fingerprint
+    {
+        return Err(error(
+            stage,
+            &context.component,
+            "Release identity differs from execution context; create a new plan",
+        ));
+    }
+    Ok(())
+}
+
 fn error(stage: &str, component: &ComponentName, message: &str) -> DriverError {
     DriverError {
         stage: stage.into(),
@@ -492,6 +696,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn mismatched_release_is_rejected_before_credentials_or_network_access() {
+        let driver = LinuxSshDriver::new(Arc::new(CredentialRegistry::new()));
+        let context = context(&driver);
+        let valid = LinuxSshDriver::release_ref(&context, ReleaseVersion::parse("v1").unwrap());
+        assert!(validate_release_ref("activate", &context, &valid).is_ok());
+        let mut wrong = valid;
+        wrong.project_id = ProjectId::new();
+        let id = DeploymentId::new();
+        let activation = driver.activate(&id, &context, &wrong).await.unwrap_err();
+        let rollback = driver
+            .rollback(&id, &context, None, Some(&wrong))
+            .await
+            .unwrap_err();
+        assert_eq!(activation.stage, "activate");
+        assert_eq!(rollback.stage, "rollback");
+        assert!(activation.message.contains("identity differs"));
+        assert!(rollback.message.contains("identity differs"));
+    }
 
     fn context(driver: &LinuxSshDriver) -> ComponentExecutionContext {
         let destination = driver

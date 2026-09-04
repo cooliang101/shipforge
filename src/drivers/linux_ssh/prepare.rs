@@ -169,6 +169,7 @@ impl AuthenticatedSession {
     where
         F: Fn(UploadProgress) + Send + Sync,
     {
+        self.check_release_layout(target, cancellation).await?;
         prepare_with_remote(
             self,
             target,
@@ -720,6 +721,8 @@ fn map_ssh_error(stage: &'static str, error: &SshConnectionError) -> PrepareRele
 
 #[derive(Debug, Error)]
 pub enum PrepareReleaseError {
+    #[error(transparent)]
+    UnsafeRemote(#[from] super::MarkerError),
     #[error("Release preparation was cancelled")]
     Cancelled,
     #[error("Release command timeout must be non-zero")]

@@ -3,10 +3,13 @@ mod connection;
 mod destination;
 mod driver;
 mod health;
+mod marker;
+mod preflight;
 mod prepare;
 mod probe;
 mod setup_gateway;
 mod setup_probe;
+mod space;
 mod target;
 mod transfer;
 
@@ -22,6 +25,7 @@ pub use health::{
     HealthCheckError, HealthCheckOptions, HealthCheckReport, HealthVerificationError, HttpHealth,
     SystemdHealth,
 };
+pub use marker::{DeploymentMarker, MarkerError};
 pub use prepare::{PrepareReleaseError, PrepareReleaseOptions, PreparedRemoteRelease};
 pub use probe::{
     AgentIdentitySummary, HostKeyVerifier, SshProbeError, capture_host_key, probe_agent_identities,

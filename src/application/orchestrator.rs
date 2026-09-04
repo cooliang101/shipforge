@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +19,8 @@ use crate::{
 };
 
 use super::{PlannedComponent, clock::MonotonicClock};
+
+const RECOVERY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct DeploymentComponent {
@@ -74,6 +79,8 @@ pub struct DeploymentReport {
     pub deployment: Deployment,
     pub failure: Option<DeploymentFailure>,
     pub compensation_failures: BTreeMap<ComponentName, DriverError>,
+    /// Local diagnostics must not replace known remote outcomes or recovery guidance.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -110,12 +117,42 @@ impl<'a> DeploymentOrchestrator<'a> {
         events: &dyn EventSink,
         cancellation: &CancellationToken,
     ) -> Result<DeploymentReport, OrchestrationError> {
-        let components = validate_components(components, activation_order)?;
-        let mut deployment = self.start_deployment(&components)?;
+        let checked = validate_components(components.clone(), activation_order)?;
+        let deployment = self.start_deployment(&checked)?;
+        self.deploy_started(
+            deployment,
+            components,
+            activation_order,
+            events,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(super) async fn deploy_started(
+        &self,
+        mut deployment: Deployment,
+        components: Vec<DeploymentComponent>,
+        activation_order: &[ComponentName],
+        events: &dyn EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<DeploymentReport, OrchestrationError> {
+        let mut components = validate_components(components, activation_order)?;
+        // Planning and execution are separate TUI operations. Drivers must use
+        // the execution token, not the token retained by the read-only plan.
+        for component in components.values_mut() {
+            component.planned.context.cancellation = cancellation.clone();
+        }
 
         if cancellation.is_cancelled() {
             return self
-                .finish_failure(deployment, components, DeploymentFailure::Cancelled, &[])
+                .finish_failure(
+                    deployment,
+                    components,
+                    DeploymentFailure::Cancelled,
+                    &[],
+                    events,
+                )
                 .await;
         }
 
@@ -126,7 +163,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             Ok(prepared) => prepared,
             Err(failure) => {
                 return self
-                    .finish_failure(deployment, components, failure, &[])
+                    .finish_failure(deployment, components, failure, &[], events)
                     .await;
             }
         };
@@ -137,6 +174,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                 &prepared,
                 activation_order,
                 cancellation,
+                events,
             )
             .await?;
 
@@ -145,7 +183,7 @@ impl<'a> DeploymentOrchestrator<'a> {
         }
         if let Some(failure) = failure {
             return self
-                .finish_failure(deployment, components, failure, &activated)
+                .finish_failure(deployment, components, failure, &activated, events)
                 .await;
         }
 
@@ -172,6 +210,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             deployment,
             failure: None,
             compensation_failures: BTreeMap::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -184,11 +223,18 @@ impl<'a> DeploymentOrchestrator<'a> {
                 "at least one Component must be selected".into(),
             ));
         };
+        self.start_for_context(&first.planned.context)
+    }
+
+    pub(super) fn start_for_context(
+        &self,
+        context: &ComponentExecutionContext,
+    ) -> Result<Deployment, OrchestrationError> {
         let mut deployment = Deployment::new();
         self.history.create_deployment(
             &deployment.id,
-            &first.planned.context.project_id,
-            &first.planned.context.environment_id,
+            &context.project_id,
+            &context.environment_id,
             self.timestamp()?,
         )?;
         self.history.transition_deployment(
@@ -228,12 +274,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                         component: name.clone(),
                         stage: OrchestrationStage::Prepare,
                         error,
-                        observed_release: component
-                            .planned
-                            .plan
-                            .expected_current
-                            .as_ref()
-                            .map(|release| release.version.clone()),
+                        observed_release: None,
                     }));
                 }
             }
@@ -248,6 +289,7 @@ impl<'a> DeploymentOrchestrator<'a> {
         prepared: &BTreeMap<ComponentName, PreparedRelease>,
         activation_order: &[ComponentName],
         cancellation: &CancellationToken,
+        events: &dyn EventSink,
     ) -> Result<(Vec<ActivatedComponent>, Option<DeploymentFailure>), OrchestrationError> {
         let mut activated = Vec::new();
         for name in activation_order {
@@ -256,8 +298,19 @@ impl<'a> DeploymentOrchestrator<'a> {
             }
             let component = &components[name];
             let receipt = &prepared[name];
+            events.emit(crate::drivers::DriverLog {
+                namespace: "activate.started".into(),
+                message: format!("Activating {name} and checking health"),
+            });
             match self.activate(deployment, name, component, receipt).await? {
                 Ok(activation) => {
+                    events.emit(crate::drivers::DriverLog {
+                        namespace: "activate.finished".into(),
+                        message: format!(
+                            "{name}: activation returned; healthy={}",
+                            activation.healthy
+                        ),
+                    });
                     let points_to_candidate = activation.current.as_ref() == Some(&receipt.release);
                     if points_to_candidate {
                         activated.push(ActivatedComponent {
@@ -290,30 +343,9 @@ impl<'a> DeploymentOrchestrator<'a> {
                     }
                 }
                 Err(error) => {
-                    let observed = component
-                        .planned
-                        .driver
-                        .current(&component.planned.context)
-                        .await
-                        .ok()
-                        .flatten();
-                    if observed.as_ref() == Some(&receipt.release) {
-                        activated.push(ActivatedComponent {
-                            name: name.clone(),
-                            previous: component.planned.plan.expected_current.clone(),
-                            observed: observed.clone(),
-                        });
-                    }
-                    let failure = if cancellation.is_cancelled() {
-                        DeploymentFailure::Cancelled
-                    } else {
-                        DeploymentFailure::Driver {
-                            component: name.clone(),
-                            stage: OrchestrationStage::Activate,
-                            error,
-                            observed_release: observed.map(|release| release.version),
-                        }
-                    };
+                    let failure =
+                        activation_failure(component, receipt, error, cancellation, &mut activated)
+                            .await;
                     return Ok((activated, Some(failure)));
                 }
             }
@@ -426,10 +458,17 @@ impl<'a> DeploymentOrchestrator<'a> {
         components: BTreeMap<ComponentName, DeploymentComponent>,
         failure: DeploymentFailure,
         activated: &[ActivatedComponent],
+        events: &dyn EventSink,
     ) -> Result<DeploymentReport, OrchestrationError> {
         let mut component_results = BTreeMap::new();
         let compensation_failures = self
-            .compensate(&deployment, &components, activated, &mut component_results)
+            .compensate(
+                &deployment,
+                &components,
+                activated,
+                &mut component_results,
+                events,
+            )
             .await?;
         deployment.components = component_results;
         let failed_component = failure_component(&failure);
@@ -443,14 +482,9 @@ impl<'a> DeploymentOrchestrator<'a> {
                     } else {
                         ComponentOutcome::Cancelled
                     };
-                    let observed_release = failure_observed(&failure, name).or_else(|| {
-                        component
-                            .planned
-                            .plan
-                            .expected_current
-                            .as_ref()
-                            .map(|release| release.version.clone())
-                    });
+                    // A plan is a past observation, never evidence of the state
+                    // after a failure. None may mean unknown; keep its diagnostic.
+                    let observed_release = failure_observed(&failure, name);
                     ComponentDeploymentResult {
                         outcome,
                         attempted_release: Some(component.package.release().version.clone()),
@@ -489,6 +523,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             deployment,
             failure: Some(failure),
             compensation_failures,
+            warnings: Vec::new(),
         })
     }
 
@@ -498,9 +533,14 @@ impl<'a> DeploymentOrchestrator<'a> {
         components: &BTreeMap<ComponentName, DeploymentComponent>,
         activated: &[ActivatedComponent],
         results: &mut BTreeMap<ComponentName, ComponentDeploymentResult>,
+        events: &dyn EventSink,
     ) -> Result<BTreeMap<ComponentName, DriverError>, OrchestrationError> {
         let mut failures = BTreeMap::new();
         for activated in activated.iter().rev() {
+            events.emit(crate::drivers::DriverLog {
+                namespace: "compensate.started".into(),
+                message: format!("Restoring {} to its previous state", activated.name),
+            });
             let component = &components[&activated.name];
             let intent = self.history.record_intent(
                 &deployment.id,
@@ -513,40 +553,47 @@ impl<'a> DeploymentOrchestrator<'a> {
             let rollback = component
                 .planned
                 .driver
-                .rollback(&deployment.id, &context, activated.previous.as_ref())
+                .rollback(
+                    &deployment.id,
+                    &context,
+                    activated.observed.as_ref(),
+                    activated.previous.as_ref(),
+                )
                 .await;
+            let rollback = rollback.and_then(|receipt| {
+                if receipt.current == activated.previous && receipt.healthy {
+                    Ok(receipt)
+                } else {
+                    Err(contract_driver_error(
+                        "compensate",
+                        &activated.name,
+                        "Driver rollback receipt is unhealthy or differs from the pre-activation Release",
+                    ))
+                }
+            });
             let intent_outcome = rollback.as_ref().map(|_| ()).map_err(Clone::clone);
             self.complete_intent(intent, &intent_outcome)?;
-            let (outcome, observed) = match rollback {
-                Ok(receipt) if receipt.current == activated.previous => (
-                    ComponentOutcome::Compensated,
-                    receipt.current.map(|release| release.version),
-                ),
-                Ok(receipt) => {
-                    failures.insert(
-                        activated.name.clone(),
-                        contract_driver_error(
-                            "compensate",
-                            &activated.name,
-                            "Driver rollback receipt differs from the pre-activation Release",
-                        ),
-                    );
-                    (
-                        ComponentOutcome::CompensationFailed,
+            let (outcome, observed) =
+                match rollback {
+                    Ok(receipt) => (
+                        ComponentOutcome::Compensated,
                         receipt.current.map(|release| release.version),
-                    )
-                }
-                Err(error) => {
-                    failures.insert(activated.name.clone(), error);
-                    (
-                        ComponentOutcome::CompensationFailed,
-                        activated
-                            .observed
-                            .as_ref()
-                            .map(|release| release.version.clone()),
-                    )
-                }
-            };
+                    ),
+                    Err(error) => {
+                        let (error, observed) =
+                            match observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT)
+                                .await
+                            {
+                                Ok(observed) => (error, observed),
+                                Err(observation) => (unobserved_failure(error, &observation), None),
+                            };
+                        failures.insert(activated.name.clone(), error);
+                        (
+                            ComponentOutcome::CompensationFailed,
+                            observed.map(|release| release.version),
+                        )
+                    }
+                };
             results.insert(
                 activated.name.clone(),
                 ComponentDeploymentResult {
@@ -649,6 +696,81 @@ fn recovery_context(context: &ComponentExecutionContext) -> ComponentExecutionCo
     let mut context = context.clone();
     context.cancellation = CancellationToken::new();
     context
+}
+
+async fn activation_failure(
+    component: &DeploymentComponent,
+    receipt: &PreparedRelease,
+    error: DriverError,
+    cancellation: &CancellationToken,
+    activated: &mut Vec<ActivatedComponent>,
+) -> DeploymentFailure {
+    let name = &component.planned.context.component;
+    match observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await {
+        Ok(observed) => {
+            if observed.as_ref() == Some(&receipt.release) {
+                activated.push(ActivatedComponent {
+                    name: name.clone(),
+                    previous: component.planned.plan.expected_current.clone(),
+                    observed: observed.clone(),
+                });
+            }
+            if cancellation.is_cancelled()
+                && (observed.as_ref() == Some(&receipt.release)
+                    || observed == component.planned.plan.expected_current)
+            {
+                DeploymentFailure::Cancelled
+            } else {
+                DeploymentFailure::Driver {
+                    component: name.clone(),
+                    stage: OrchestrationStage::Activate,
+                    error,
+                    observed_release: observed.map(|release| release.version),
+                }
+            }
+        }
+        Err(observation) => DeploymentFailure::Driver {
+            component: name.clone(),
+            stage: OrchestrationStage::Activate,
+            error: unobserved_failure(error, &observation),
+            observed_release: None,
+        },
+    }
+}
+
+async fn observe_after_failure(
+    component: &DeploymentComponent,
+    timeout: Duration,
+) -> Result<Option<ReleaseRef>, DriverError> {
+    // Cancellation of the user operation must not suppress the read that decides
+    // whether an uncertain activation needs compensation. Bound even a stuck Driver.
+    let context = recovery_context(&component.planned.context);
+    if let Ok(result) =
+        tokio::time::timeout(timeout, component.planned.driver.current(&context)).await
+    {
+        result
+    } else {
+        context.cancellation.cancel();
+        Err(DriverError {
+            stage: "observe".into(),
+            target: context.component.to_string(),
+            message: "post-failure observation timed out".into(),
+            suggested_action: "inspect the remote current Release and service before retrying"
+                .into(),
+        })
+    }
+}
+
+fn unobserved_failure(mut original: DriverError, observation: &DriverError) -> DriverError {
+    original.message = format!(
+        "{}; current state is unknown because post-failure observation failed: {}",
+        original.message, observation
+    );
+    original.suggested_action = format!(
+        "{}; inspect the remote current Release and service before retrying; {}",
+        original.suggested_action, observation.suggested_action
+    );
+    original
 }
 
 fn failure_component(failure: &DeploymentFailure) -> Option<&ComponentName> {

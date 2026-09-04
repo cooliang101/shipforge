@@ -1,12 +1,13 @@
 mod app;
 
 use std::{
+    fmt::Write as _,
     io::{self, BufWriter, Stdout},
     time::Duration,
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -79,16 +80,28 @@ fn run_event_loop() -> io::Result<()> {
     let mut app = App::new(registry_path, destination_registry_path, &initial_directory)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let mut guard = TerminalGuard::enter()?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drive_event_loop(&mut app, &mut guard)
+    }));
+    // Keep the runtime alive until safe cancellation finishes even if terminal
+    // drawing or input fails. A broken terminal must not silently detach work.
+    drop(guard);
+    app.shutdown();
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
 
+fn drive_event_loop(app: &mut App, guard: &mut TerminalGuard) -> io::Result<()> {
     loop {
         app.poll_background();
-        guard.terminal.draw(|frame| render(frame, &app))?;
+        guard.terminal.draw(|frame| render(frame, app))?;
 
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && (matches!(key.code, KeyCode::Char('q')) && matches!(app.screen, Screen::Projects)
-                || app.handle_key(key))
+            && app.handle_key(key)
         {
             break;
         }
@@ -111,7 +124,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             Screen::Browser(_) => {
                 "↑/↓ select   Enter enter directory   Backspace parent   s select root   Esc back"
             }
-            Screen::Overview { .. } => "Esc projects   q quit",
+            Screen::Overview { .. } => "d deploy   Esc projects   q quit",
             Screen::DeploySelection(_) => {
                 "←/→ Environment   ↑/↓ Component   Space toggle   Enter check   Esc overview"
             }
@@ -129,7 +142,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                     "Deployment running   Esc request safe cancellation"
                 }
             }
-            Screen::DeploymentFinished { .. } => "Enter/Esc return to project overview",
+            Screen::DeploymentFinished { .. } => {
+                "↑/↓ or PgUp/PgDn scroll   Enter/Esc project overview"
+            }
             Screen::SetupComponents(_) => "↑/↓ select   Space toggle   Enter next   Esc projects",
             Screen::SetupDestinations(_) => {
                 "←/→ Component   ↑/↓ Destination   Space assign   a add SSH   n review   Esc Components"
@@ -218,8 +233,13 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             cancellation_requested,
             ..
         } => render_deployment_running(frame, area, logs, *cancellation_requested),
-        Screen::DeploymentFinished { summary, logs, .. } => {
-            render_deployment_finished(frame, area, summary, logs);
+        Screen::DeploymentFinished {
+            summary,
+            logs,
+            scroll,
+            ..
+        } => {
+            render_deployment_finished(frame, area, summary, logs, *scroll);
         }
         Screen::SetupComponents(setup) => {
             render_component_setup(frame, area, setup);
@@ -331,23 +351,149 @@ fn render_deployment_review(
         "Project: {}\nEnvironment: {}\nGit: {git}\n\n",
         plan.selection.config.project, plan.selection.environment
     );
+    let _ = writeln!(
+        content,
+        "Branch: {}\nCommit: {}",
+        plan.git_metadata
+            .branch
+            .as_deref()
+            .unwrap_or("detached / unavailable"),
+        plan.git_metadata.revision.as_deref().unwrap_or("no commit")
+    );
+    let order = plan
+        .activation_order
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let _ = writeln!(content, "Activation order: {order}");
+    content.push_str(
+        "Build order: Component name order. Only selected Components will be deployed.\n\n",
+    );
     for entry in &plan.entries {
         let current = entry
             .current
             .as_ref()
             .map_or("not_deployed".into(), ToString::to_string);
-        content.push_str(&format!(
+        let _ = write!(
+            content,
             "{}: {current} → {}\n  Destination: {}\n  Root: {}\n",
             entry.component, entry.release, entry.destination, entry.root
-        ));
+        );
+        for notice in &entry.notices {
+            let _ = writeln!(content, "  Environment check: {notice}");
+        }
+        if let Some(build) = plan.selection.config.components.get(&entry.component) {
+            content.push_str(&build_preview(build));
+        }
+        if let Some(target) = plan
+            .selection
+            .config
+            .environments
+            .get(&plan.selection.environment)
+            .and_then(|environment| environment.components.get(&entry.component))
+        {
+            let _ = writeln!(
+                content,
+                "  Service: {}",
+                target.systemd.as_deref().unwrap_or("none; files only")
+            );
+            let health = match (target.systemd.is_some(), target.health.is_some()) {
+                (true, true) => "systemd stability and remote HTTP/HTTPS",
+                (true, false) => "systemd stability",
+                (false, true) => "remote HTTP/HTTPS",
+                (false, false) => "none configured; application health will not be verified",
+            };
+            let _ = writeln!(content, "  Health: {health}\n");
+        }
     }
     content.push_str("\nConfirm to build, package, upload, activate, and check health.");
     frame.render_widget(
         Paragraph::new(content)
-            .block(Block::default().title(" Deployment plan ").borders(Borders::ALL))
-           Holder .scroll((scroll, 0))
+            .block(
+                Block::default()
+                    .title(" Deployment plan ")
+                    .borders(Borders::ALL),
+            )
+            .scroll((scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
+    );
+}
+
+fn build_preview(build: &crate::config::ComponentConfig) -> String {
+    let mut content = format!(
+        "  Working directory: {}\n  Artifact (relative to working directory): {}\n",
+        build.working_directory.display(),
+        build.artifact.path.display()
+    );
+    for command in &build.build {
+        if command.shell {
+            let _ = writeln!(content, "  Build [explicit shell]: {:?}", command.program);
+        } else {
+            let _ = writeln!(
+                content,
+                "  Build [program + arguments]: {:?} {:?}",
+                command.program, command.args
+            );
+        }
+    }
+    content
+}
+
+fn render_deployment_running(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
+    cancellation_requested: bool,
+) {
+    let status = if cancellation_requested {
+        "Safe cancellation requested; waiting for recovery. Do not close the terminal."
+    } else {
+        "Deployment running. Esc requests safe cancellation."
+    };
+    render_deployment_log(frame, area, " Deployment progress ", status, logs);
+}
+
+fn render_deployment_finished(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    summary: &str,
+    logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
+    scroll: u16,
+) {
+    let mut content = format!("{summary}\nRecent events:\n");
+    for event in logs {
+        let _ = writeln!(content, "[{}] {}", event.namespace, event.message);
+    }
+    frame.render_widget(
+        panel(" Deployment result ", content).scroll((scroll, 0)),
+        area,
+    );
+}
+
+fn render_deployment_log(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    title: &'static str,
+    status: &str,
+    logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
+) {
+    let areas = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+    frame.render_widget(panel(title, status.to_owned()), areas[0]);
+    let visible = usize::from(areas[1].height.saturating_sub(2));
+    let lines: Vec<_> = logs
+        .iter()
+        .skip(logs.len().saturating_sub(visible))
+        .map(|event| Line::from(format!("[{}] {}", event.namespace, event.message)))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Recent events ")
+                .borders(Borders::ALL),
+        ),
+        areas[1],
     );
 }
 
@@ -697,4 +843,75 @@ fn panel(title: &'static str, content: String) -> Paragraph<'static> {
     Paragraph::new(content)
         .block(Block::default().title(title).borders(Borders::ALL))
         .wrap(Wrap { trim: false })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use crate::drivers::DriverLog;
+
+    #[test]
+    fn build_preview_distinguishes_shell_and_argument_boundaries() {
+        use crate::config::{ArtifactSpec, BuildCommand, ComponentConfig};
+        let build = ComponentConfig {
+            working_directory: "services/api".into(),
+            artifact: ArtifactSpec {
+                path: "dist".into(),
+            },
+            build: vec![
+                BuildCommand::argv("builder", ["--label", "two words"]),
+                BuildCommand::shell("build && prepare"),
+            ],
+        };
+        let preview = super::build_preview(&build);
+        assert!(preview.contains("services/api"));
+        assert!(preview.contains("relative to working directory): dist"));
+        assert!(preview.contains(r#"[program + arguments]: "builder" ["--label", "two words"]"#));
+        assert!(preview.contains(r#"[explicit shell]: "build && prepare""#));
+    }
+
+    #[test]
+    fn progress_keeps_cancellation_status_and_latest_events_visible() {
+        let logs: VecDeque<_> = (0..100)
+            .map(|index| DriverLog {
+                namespace: "build".into(),
+                message: format!("event-{index:03}"),
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|frame| super::render_deployment_running(frame, frame.area(), &logs, true))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(content.contains("Safe cancellation requested"));
+        assert!(content.contains("event-099"));
+        assert!(!content.contains("event-000"));
+    }
+
+    #[test]
+    fn deployment_result_renders_on_tiny_and_empty_terminals() {
+        for (width, height) in [(0, 0), (1, 1), (20, 3), (80, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render_deployment_finished(
+                        frame,
+                        frame.area(),
+                        "Deployment failed",
+                        &VecDeque::new(),
+                        0,
+                    );
+                })
+                .unwrap();
+        }
+    }
 }

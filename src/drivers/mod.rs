@@ -418,10 +418,13 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         context: &ComponentExecutionContext,
         release: &ReleaseRef,
     ) -> Result<ActivationReceipt, DriverError>;
+    /// Restores `release` only if observation matches `expected_current`.
+    /// `None` means confirmed undeployed, never unknown or an unchecked wildcard.
     async fn rollback(
         &self,
         deployment: &crate::domain::DeploymentId,
         context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
         release: Option<&ReleaseRef>,
     ) -> Result<ActivationReceipt, DriverError>;
     async fn logs(

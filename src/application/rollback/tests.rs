@@ -49,6 +49,11 @@ struct FakeState {
     partial_failure: bool,
     fail_compensation: Option<ComponentName>,
     cancel_after: Option<ComponentName>,
+    cancel_on_error: bool,
+    fail_observation_after_error: Option<ComponentName>,
+    failed_observation: Option<ComponentName>,
+    hang_observation: bool,
+    observation_tokens_cancelled: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -105,6 +110,24 @@ impl DeploymentDriver for FakeDriver {
         &self,
         context: &ComponentExecutionContext,
     ) -> Result<Option<ReleaseRef>, DriverError> {
+        let (failed, hangs) = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .observation_tokens_cancelled
+                .push(context.cancellation.is_cancelled());
+            (
+                state.failed_observation.as_ref() == Some(&context.component),
+                state.hang_observation,
+            )
+        };
+        if hangs {
+            std::future::pending::<()>().await;
+        }
+        if failed || context.cancellation.is_cancelled() {
+            let mut error = Self::error(&context.component);
+            error.stage = "observe".into();
+            return Err(error);
+        }
         Ok(self
             .state
             .lock()
@@ -135,15 +158,25 @@ impl DeploymentDriver for FakeDriver {
         &self,
         _deployment: &crate::domain::DeploymentId,
         context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
         target: Option<&ReleaseRef>,
     ) -> Result<ActivationReceipt, DriverError> {
         let target_name = target.map_or("not_deployed", |release| release.version.as_str());
         let mut state = self.state.lock().unwrap();
+        if context.cancellation.is_cancelled() {
+            return Err(Self::error(&context.component));
+        }
+        if state.current.get(&context.component) != expected_current {
+            return Err(Self::error(&context.component));
+        }
         state
             .actions
             .push(format!("rollback:{}->{target_name}", context.component));
         let restoring_original = target.is_some_and(|release| release.version.as_str() == "v3");
         if restoring_original && state.fail_compensation.as_ref() == Some(&context.component) {
+            if state.fail_observation_after_error.as_ref() == Some(&context.component) {
+                state.failed_observation = Some(context.component.clone());
+            }
             return Err(Self::error(&context.component));
         }
         if !restoring_original && state.fail_component.as_ref() == Some(&context.component) {
@@ -155,6 +188,12 @@ impl DeploymentDriver for FakeDriver {
                 } else {
                     state.current.remove(&context.component);
                 }
+            }
+            if state.fail_observation_after_error.as_ref() == Some(&context.component) {
+                state.failed_observation = Some(context.component.clone());
+            }
+            if state.cancel_on_error {
+                self.cancellation.cancel();
             }
             return Err(Self::error(&context.component));
         }
@@ -429,4 +468,174 @@ async fn cancellation_after_one_change_compensates_with_fresh_context() {
         fixture.actions(),
         vec!["rollback:worker->not_deployed", "rollback:worker->v3"]
     );
+}
+
+#[tokio::test]
+async fn unknown_state_is_never_treated_as_a_confirmed_undeployed_target() {
+    let fixture = Fixture::new();
+    let worker = ComponentName::parse("worker").unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_component = Some(worker.clone());
+        state.fail_observation_after_error = Some(worker.clone());
+        state.cancel_on_error = true;
+    }
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(
+        report.deployment.components[&worker].outcome,
+        ComponentOutcome::Failed
+    );
+    assert_eq!(report.deployment.components[&worker].observed_release, None);
+    assert!(report.compensation_failures.is_empty());
+    assert_eq!(fixture.actions(), vec!["rollback:worker->not_deployed"]);
+    assert_eq!(
+        fixture.state.lock().unwrap().current[&worker]
+            .version
+            .as_str(),
+        "v3"
+    );
+    assert!(
+        report
+            .failure
+            .as_ref()
+            .unwrap()
+            .diagnostic()
+            .contains("current state is unknown")
+    );
+    let persisted = fixture
+        .history
+        .component_results(&report.deployment.id)
+        .unwrap();
+    let result = persisted
+        .iter()
+        .find(|result| result.component == worker)
+        .unwrap();
+    assert!(
+        result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("inspect the remote current Release")
+    );
+}
+
+#[tokio::test]
+async fn cancelled_partial_rollback_is_observed_and_restored_with_independent_tokens() {
+    let fixture = Fixture::new();
+    let worker = ComponentName::parse("worker").unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_component = Some(worker.clone());
+        state.partial_failure = true;
+        state.cancel_on_error = true;
+    }
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Cancelled);
+    assert_eq!(
+        report.deployment.components[&worker].outcome,
+        ComponentOutcome::Compensated
+    );
+    assert_eq!(
+        fixture.actions(),
+        vec!["rollback:worker->not_deployed", "rollback:worker->v3"]
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.current[&worker].version.as_str(), "v3");
+    assert!(
+        !state
+            .observation_tokens_cancelled
+            .iter()
+            .any(|cancelled| *cancelled)
+    );
+}
+
+#[tokio::test]
+async fn failed_compensation_observation_preserves_unknown_state_and_manual_context() {
+    let fixture = Fixture::new();
+    let api = ComponentName::parse("api").unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_component = Some(ComponentName::parse("database").unwrap());
+        state.fail_compensation = Some(api.clone());
+        state.fail_observation_after_error = Some(api.clone());
+    }
+    let report = fixture.rollback().await;
+    let result = &report.deployment.components[&api];
+    assert_eq!(result.outcome, ComponentOutcome::CompensationFailed);
+    assert_eq!(result.observed_release, None);
+    let error = &report.compensation_failures[&api];
+    assert!(error.message.contains("current state is unknown"));
+    assert!(
+        error
+            .suggested_action
+            .contains("inspect the remote current Release")
+    );
+}
+
+#[tokio::test]
+async fn cancellation_on_the_last_success_still_compensates_that_change() {
+    let fixture = Fixture::new();
+    let component = fixture.component("worker", None);
+    let worker = component.context.component.clone();
+    fixture.state.lock().unwrap().cancel_after = Some(worker.clone());
+    let report = RollbackOrchestrator::new(&fixture.history, Redactor::default())
+        .rollback(
+            &fixture.source,
+            vec![component],
+            std::slice::from_ref(&worker),
+            &fixture.cancellation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deployment.state, DeploymentState::Cancelled);
+    assert_eq!(
+        fixture.actions(),
+        vec!["rollback:worker->not_deployed", "rollback:worker->v3"]
+    );
+    assert_eq!(
+        report.deployment.components[&worker].outcome,
+        ComponentOutcome::Compensated
+    );
+}
+
+#[tokio::test]
+async fn execution_replaces_the_old_planning_token_before_preflight() {
+    let fixture = Fixture::new();
+    let mut component = fixture.component("worker", None);
+    let worker = component.context.component.clone();
+    let old_token = CancellationToken::new();
+    old_token.cancel();
+    component.context.cancellation = old_token;
+    let report = RollbackOrchestrator::new(&fixture.history, Redactor::default())
+        .rollback(
+            &fixture.source,
+            vec![component],
+            std::slice::from_ref(&worker),
+            &fixture.cancellation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.deployment.state, DeploymentState::Succeeded);
+    assert!(
+        !fixture
+            .state
+            .lock()
+            .unwrap()
+            .observation_tokens_cancelled
+            .iter()
+            .any(|cancelled| *cancelled)
+    );
+}
+
+#[tokio::test]
+async fn failed_rollback_observation_has_a_finite_deadline() {
+    let fixture = Fixture::new();
+    let component = fixture.component("worker", None);
+    fixture.state.lock().unwrap().hang_observation = true;
+    let error = observe_after_failure(&component, Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert_eq!(error.stage, "observe");
+    assert!(error.message.contains("timed out"));
 }

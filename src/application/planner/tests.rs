@@ -77,7 +77,7 @@ impl DeploymentDriver for PlanningDriver {
     ) -> Result<PreflightReport, DriverError> {
         Ok(PreflightReport {
             effective_capabilities: self.effective_capabilities.clone(),
-            notices: Vec::new(),
+            notices: vec!["Remote commands: tar, sha256sum, ln, mv".into()],
         })
     }
 
@@ -129,6 +129,7 @@ impl DeploymentDriver for PlanningDriver {
         &self,
         _deployment: &crate::domain::DeploymentId,
         _context: &ComponentExecutionContext,
+        _expected_current: Option<&ReleaseRef>,
         _release: Option<&ReleaseRef>,
     ) -> Result<ActivationReceipt, DriverError> {
         unreachable!("planning tests do not execute")
@@ -229,6 +230,14 @@ async fn planner_rejects_driver_release_identity_changes() {
         planner.plan_component(context, request).await,
         Err(ApplicationError::Contract(_))
     ));
+}
+
+#[tokio::test]
+async fn planner_preserves_preflight_notices_for_confirmation() {
+    let capabilities = DriverCapabilities::new([Capability::StagedDeployment]);
+    let (planner, context, request) = fixture(capabilities, false);
+    let result = planner.plan_component(context, request).await.unwrap();
+    assert_eq!(result.notices, ["Remote commands: tar, sha256sum, ln, mv"]);
 }
 
 #[tokio::test]

@@ -168,6 +168,7 @@ impl DeploymentDriver for FakeDriver {
         &self,
         _deployment: &crate::domain::DeploymentId,
         context: &ComponentExecutionContext,
+        _expected_current: Option<&ReleaseRef>,
         release: Option<&ReleaseRef>,
     ) -> Result<ActivationReceipt, DriverError> {
         self.record("rollback", context);
@@ -277,7 +278,12 @@ async fn fake_driver_contract_propagates_context_through_every_operation() {
         .await
         .unwrap();
     driver
-        .rollback(&deployment, &context, Some(&prepared.release))
+        .rollback(
+            &deployment,
+            &context,
+            Some(&prepared.release),
+            Some(&prepared.release),
+        )
         .await
         .unwrap();
     driver.logs(&context, &prepared.release).await.unwrap();

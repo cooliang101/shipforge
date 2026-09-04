@@ -8,9 +8,13 @@
 
 `HLT-00` 现已实现：`linux-ssh` 可在 Destination 端执行带重试和限时的 HTTP/HTTPS 检查，建立 systemd `NRestarts` 基线并验证稳定窗口，健康失败可使用激活凭证进入独立令牌补偿。配置采用内置默认值，不增加必填项。
 
-`RBK-00` 现已实现：显式回滚创建关联原发布的 Rollback Deployment，在副作用前校验全部所选 Component，并按部署拓扑逆序恢复到指定 Release 或 `not_deployed`；漂移、部分失败、补偿失败和取消均保留逐 Component 事实与人工处理信息。SQLite schema v3 保存操作类型、关联发布和可空目标版本。
+`RBK-00` 现已实现：显式回滚创建关联原发布的 Rollback Deployment，在副作用前校验全部所选 Component，并按部署拓扑逆序恢复到指定 Release 或 `not_deployed`；漂移、部分失败、补偿失败和取消均保留逐 Component 事实与人工处理信息。当前 SQLite schema v4 保留 v3 的操作类型、关联发布和可空目标版本，并增加 Deployment 日志索引。
 
 `RUN-01` 现已实现：TUI 会话持有唯一的内存执行门，部署与显式回滚共用；第二个操作在执行前被拒绝，完成、失败或取消均自动释放。该机制不使用文件锁、远端锁，也不提供多进程或跨机器协调。
+
+`TUI-DEP-01` 已实现并通过自动化工作包验收：Environment/Component 选择、只读预检、含 Git 和目标信息的计划预览、显式确认、后台构建和发布、实时脱敏日志、安全取消、逐 Component 结果及人工恢复指引均已接通。构建与远端操作共用 Deployment ID；每次 Driver 写操作前复核配置，上传前检查实际解压容量及远端状态。日志故障触发安全取消，但不覆盖已知部署结果；终端错误退出也等待恢复边界。验证范围和已知限制见 [TUI-DEP-01 验收记录](validation/tui-dep-01.md)。
+
+**M1 整体尚未验收**：两台一次性真实 Linux Destination 的联合发布、指定版本回滚和失败补偿仍须实际执行。Loopback 协议测试使用模拟远端文件系统，不替代真实 Linux 验收；M2/M3/M4 不因此视为完成。
 
 ```text
 TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux SSH 闭环 → 恢复与查询 → 交互加固
@@ -97,6 +101,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 ## 质量门禁
 
 - 每个工作包同时提交成功、失败和边界测试；安全闭环不允许“后续再补测试”。
+- 每完成一个工作包，先审查代码、修复问题并通过门禁，再单独提交 Git；提交后才开始下一阶段。WIP 快照不计为阶段完成提交。
 - 合并必须通过 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`、依赖审计及平台编译。
 - 领域层穷举状态和保留规则；每个 Driver 运行共享契约套件；真实 SSH 仅连接一次性环境。
 - 关键操作必须可安全重试，错误必须包含阶段、目标和建议动作。

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Read as _;
 use std::num::NonZeroU8;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,11 @@ use shipforge::{
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/deployment_service.rs"]
+mod deployment_service;
+#[path = "support/preflight_protocol.rs"]
+mod preflight_protocol;
 
 const SENTINEL: &str = "literal;$(not-executed) ' value";
 
@@ -99,7 +105,9 @@ impl server::Handler for ProtocolServer {
         self.channels.lock().await.remove(&channel);
         let command = String::from_utf8_lossy(data).into_owned();
         self.commands.lock().unwrap().push(command.clone());
-        let (status, output) = if command.starts_with("'printf' ") {
+        let (status, output) = if let Some(reply) = preflight_protocol::reply(&command) {
+            reply
+        } else if command.starts_with("'printf' ") {
             (0, SENTINEL.as_bytes())
         } else if command
             == "'systemctl' 'list-unit-files' '--type=service' '--no-legend' '--no-pager'"
@@ -183,6 +191,28 @@ async fn release_command(
         "tar" => tar_command(&words, transfer).await,
         "mv" => move_command(&words, transfer).await,
         "test" => test_command(&words, transfer).await,
+        "head" => {
+            let state = transfer.lock().await;
+            let limit: usize = words.get(2)?.parse().ok()?;
+            match state.files.get(*words.last()?) {
+                Some(bytes) => Some((0, bytes.iter().take(limit).copied().collect())),
+                None => Some((1, Vec::new())),
+            }
+        }
+        "find" => {
+            let state = transfer.lock().await;
+            let prefix = format!("{}/", words.get(1)?);
+            let child = state
+                .files
+                .keys()
+                .chain(state.links.keys())
+                .chain(state.directories.iter())
+                .find(|path| path.starts_with(&prefix));
+            Some((
+                0,
+                child.map_or_else(Vec::new, |path| format!("{path}\n").into_bytes()),
+            ))
+        }
         "ln" => link_command(&words, transfer).await,
         "rm" => {
             let path = *words.last()?;
@@ -222,12 +252,28 @@ async fn tar_command(
     transfer: &Arc<AsyncMutex<TransferState>>,
 ) -> Option<(u32, Vec<u8>)> {
     let directory = *words.get(words.iter().position(|word| *word == "--directory")? + 1)?;
+    let file = *words.get(words.iter().position(|word| *word == "--file")? + 1)?;
+    let bytes = transfer.lock().await.files.get(file)?.clone();
+    let manifest = archive_manifest(&bytes)?;
     transfer
         .lock()
         .await
         .files
-        .insert(format!("{directory}/manifest.json"), b"manifest".to_vec());
+        .insert(format!("{directory}/manifest.json"), manifest);
     Some((0, Vec::new()))
+}
+
+fn archive_manifest(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        if entry.path().ok()?.as_ref() == Path::new("manifest.json") {
+            let mut manifest = Vec::new();
+            entry.read_to_end(&mut manifest).ok()?;
+            return Some(manifest);
+        }
+    }
+    None
 }
 
 async fn move_command(
@@ -310,9 +356,12 @@ async fn link_command(
             .insert(destination.to_owned(), target.to_owned());
         return Some((0, Vec::new()));
     }
-    let source = *words.get(2)?;
-    let destination = *words.get(3)?;
-    if state.files.contains_key(destination) {
+    let source = *words.get(words.len().checked_sub(2)?)?;
+    let destination = *words.last()?;
+    if state.files.contains_key(destination)
+        || state.links.contains_key(destination)
+        || state.directories.contains(destination)
+    {
         return Some((1, Vec::new()));
     }
     let bytes = state.files.get(source)?.clone();
@@ -735,6 +784,112 @@ async fn validate_health(
     assert_eq!(health.http.unwrap().status, 204);
 }
 
+async fn validate_marker_reads(
+    session: &AuthenticatedSession,
+    transfer: &Arc<AsyncMutex<TransferState>>,
+    release: &ComponentRelease,
+    cancellation: &CancellationToken,
+) {
+    use shipforge::drivers::linux_ssh::{DeploymentMarker, MarkerError};
+    let mut target = protocol_target();
+    target.root = "/srv/marker-contract".into();
+    let path = format!("{}/.shipforge-project.json", target.root);
+    let marker = DeploymentMarker::for_release(release);
+    assert!(
+        !session
+            .check_deployment_marker(&target, &marker, cancellation)
+            .await
+            .unwrap()
+    );
+    session
+        .ensure_deployment_marker(&target, &marker, cancellation)
+        .await
+        .unwrap();
+    session
+        .ensure_deployment_marker(&target, &marker, cancellation)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .check_deployment_marker(&target, &marker, cancellation)
+            .await
+            .unwrap()
+    );
+    let mut other = release.clone();
+    other.project_id = ProjectId::new();
+    assert_eq!(
+        session
+            .ensure_deployment_marker(
+                &target,
+                &DeploymentMarker::for_release(&other),
+                cancellation
+            )
+            .await,
+        Err(MarkerError::Conflict)
+    );
+    assert_eq!(
+        transfer.lock().await.files.get(&path),
+        Some(&marker.encode().unwrap())
+    );
+    assert_eq!(
+        session
+            .check_deployment_marker(
+                &target,
+                &DeploymentMarker::for_release(&other),
+                cancellation
+            )
+            .await,
+        Err(MarkerError::Conflict)
+    );
+    transfer
+        .lock()
+        .await
+        .files
+        .insert(path.clone(), vec![b' '; 5000]);
+    assert_eq!(
+        session
+            .check_deployment_marker(&target, &marker, cancellation)
+            .await,
+        Err(MarkerError::Oversized)
+    );
+    transfer
+        .lock()
+        .await
+        .files
+        .insert(path.clone(), b"invalid".to_vec());
+    assert_eq!(
+        session
+            .check_deployment_marker(&target, &marker, cancellation)
+            .await,
+        Err(MarkerError::Malformed)
+    );
+    transfer
+        .lock()
+        .await
+        .links
+        .insert(path.clone(), "somewhere".into());
+    assert_eq!(
+        session
+            .check_deployment_marker(&target, &marker, cancellation)
+            .await,
+        Err(MarkerError::UnsafePath)
+    );
+    let mut state = transfer.lock().await;
+    state.links.remove(&path);
+    state.files.remove(&path);
+    state
+        .files
+        .insert(format!("{}/user-data", target.root), b"preserve".to_vec());
+    drop(state);
+    assert_eq!(
+        session
+            .ensure_deployment_marker(&target, &marker, cancellation)
+            .await,
+        Err(MarkerError::UnmarkedNonempty)
+    );
+    assert!(!transfer.lock().await.files.contains_key(&path));
+}
+
 async fn validate_probe(session: &AuthenticatedSession, cancellation: &CancellationToken) {
     let candidates = probe_remote_setup(
         session,
@@ -751,6 +906,144 @@ async fn validate_probe(session: &AuthenticatedSession, cancellation: &Cancellat
     );
 }
 
+async fn validate_layout_and_manifest_safety(
+    session: &AuthenticatedSession,
+    transfer: &Arc<AsyncMutex<TransferState>>,
+    release: &ComponentRelease,
+    cancellation: &CancellationToken,
+) {
+    use shipforge::drivers::linux_ssh::{DeploymentMarker, MarkerError};
+    let target = protocol_target();
+    let expected = DeploymentMarker::for_release(release);
+    let path = format!("{}/releases/{}/manifest.json", target.root, release.version);
+    let original = transfer.lock().await.files.get(&path).unwrap().clone();
+    session
+        .check_release_manifest(&target, &expected, &release.version, cancellation)
+        .await
+        .unwrap();
+    let mut foreign: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    foreign["projectId"] = serde_json::json!(ProjectId::new());
+    for (bytes, error) in [
+        (
+            Some(serde_json::to_vec(&foreign).unwrap()),
+            MarkerError::ManifestConflict,
+        ),
+        (Some(b"invalid".to_vec()), MarkerError::ManifestMalformed),
+        (Some(vec![b' '; 9000]), MarkerError::ManifestMalformed),
+        (None, MarkerError::ManifestMalformed),
+    ] {
+        if let Some(bytes) = bytes {
+            transfer.lock().await.files.insert(path.clone(), bytes);
+        } else {
+            transfer.lock().await.files.remove(&path);
+        }
+        assert_eq!(
+            session
+                .check_release_manifest(&target, &expected, &release.version, cancellation)
+                .await,
+            Err(error)
+        );
+    }
+    transfer.lock().await.files.insert(path.clone(), original);
+    for linked in [
+        format!("{}/temporary", target.root),
+        format!("{}/archives", target.root),
+        format!("{}/releases", target.root),
+        target.root.clone(),
+        "/srv/shipforge".into(),
+    ] {
+        transfer
+            .lock()
+            .await
+            .links
+            .insert(linked.clone(), "/srv/external".into());
+        assert_eq!(
+            session.check_release_layout(&target, cancellation).await,
+            Err(MarkerError::UnsafePath)
+        );
+        assert!(
+            session
+                .observe_current(&target, ActivationOptions::default(), cancellation)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session
+                .check_release_manifest(&target, &expected, &release.version, cancellation)
+                .await,
+            Err(MarkerError::UnsafePath)
+        );
+        transfer.lock().await.links.remove(&linked);
+    }
+    transfer
+        .lock()
+        .await
+        .links
+        .insert(path.clone(), "/srv/external/manifest.json".into());
+    assert_eq!(
+        session
+            .check_release_manifest(&target, &expected, &release.version, cancellation)
+            .await,
+        Err(MarkerError::ManifestMalformed)
+    );
+    transfer.lock().await.links.remove(&path);
+}
+
+async fn validate_prepare_drift(
+    planned: &shipforge::application::PlannedComponent,
+    package: &shipforge::drivers::ReleasePackage,
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) {
+    let root = protocol_target().root;
+    let path = format!("{root}/current");
+    let previous = transfer.lock().await.links.get(&path).cloned();
+    let mut external = package.release().clone();
+    external.version = ReleaseVersion::parse("external-change").unwrap();
+    let snapshot = {
+        let mut state = transfer.lock().await;
+        state
+            .links
+            .insert(path.clone(), "releases/external-change".into());
+        state
+            .directories
+            .insert(format!("{root}/releases/external-change"));
+        state.files.insert(
+            format!("{root}/releases/external-change/manifest.json"),
+            serde_json::to_vec(&shipforge::domain::ReleaseManifest::new(&external, 1, None))
+                .unwrap(),
+        );
+        (
+            state.files.clone(),
+            state.directories.clone(),
+            state.links.clone(),
+        )
+    };
+    let result = planned
+        .driver
+        .prepare(
+            &DeploymentId::new(),
+            &planned.context,
+            &planned.plan,
+            package,
+            &IgnoreEvents,
+        )
+        .await
+        .unwrap_err();
+    assert!(result.message.contains("current changed"));
+    let mut state = transfer.lock().await;
+    assert_eq!(
+        state.files, snapshot.0,
+        "drift must not create a marker, temporary file, or archive"
+    );
+    assert_eq!(state.directories, snapshot.1);
+    assert_eq!(state.links, snapshot.2);
+    if let Some(previous) = previous {
+        state.links.insert(path, previous);
+    } else {
+        state.links.remove(&path);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn validate_production_driver(
     address: std::net::SocketAddr,
@@ -758,6 +1051,7 @@ async fn validate_production_driver(
     directory: &Path,
     base_release: &ComponentRelease,
     cancellation: &CancellationToken,
+    transfer: &Arc<AsyncMutex<TransferState>>,
 ) {
     let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let identity_path = directory.join("driver_id_ed25519");
@@ -848,6 +1142,7 @@ async fn validate_production_driver(
     )
     .unwrap();
     let deployment = DeploymentId::new();
+    validate_prepare_drift(&planned, &package, transfer).await;
     let prepared = planned
         .driver
         .prepare(
@@ -885,13 +1180,64 @@ async fn validate_production_driver(
             Capability::Cancellation,
         ]),
     };
+    let drift = planned
+        .driver
+        .rollback(
+            &DeploymentId::new(),
+            &planned.context,
+            Some(&previous),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(drift.message.contains("current changed"));
+    assert_eq!(
+        planned.driver.current(&planned.context).await.unwrap(),
+        Some(prepared.release.clone())
+    );
     let rolled_back = planned
         .driver
-        .rollback(&DeploymentId::new(), &planned.context, Some(&previous))
+        .rollback(
+            &DeploymentId::new(),
+            &planned.context,
+            Some(&prepared.release),
+            Some(&previous),
+        )
         .await
         .unwrap();
-    assert_eq!(rolled_back.current, Some(previous));
+    assert_eq!(rolled_back.current, Some(previous.clone()));
     assert!(rolled_back.healthy);
+    let undeployed = planned
+        .driver
+        .rollback(
+            &DeploymentId::new(),
+            &planned.context,
+            Some(&previous),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(undeployed.current, None);
+    assert_eq!(
+        planned.driver.current(&planned.context).await.unwrap(),
+        None
+    );
+    let restored = planned
+        .driver
+        .rollback(
+            &DeploymentId::new(),
+            &planned.context,
+            None,
+            Some(&previous),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.current, Some(previous.clone()));
+    assert!(restored.healthy);
+    assert_eq!(
+        planned.driver.current(&planned.context).await.unwrap(),
+        Some(previous)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -977,15 +1323,40 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
         );
         validate_probe(&session, &cancellation).await;
         transfer.lock().await.health_status = 204;
+        // The earlier low-level activation fixture represents an existing deployment.
+        transfer.lock().await.files.insert(
+            format!("{}/.shipforge-project.json", protocol_target().root),
+            shipforge::drivers::linux_ssh::DeploymentMarker::for_release(activation.release())
+                .encode()
+                .unwrap(),
+        );
         validate_production_driver(
             address,
             &host_fingerprint,
             directory.path(),
             activation.release(),
             &cancellation,
+            &transfer,
+        )
+        .await;
+        validate_marker_reads(&session, &transfer, activation.release(), &cancellation).await;
+        validate_layout_and_manifest_safety(
+            &session,
+            &transfer,
+            activation.release(),
+            &cancellation,
         )
         .await;
         session.disconnect().await.unwrap();
+
+        deployment_service::validate(
+            address,
+            &host_fingerprint,
+            directory.path(),
+            &transfer,
+            &commands,
+        )
+        .await;
 
         let commands = commands.lock().unwrap().clone();
         assert_eq!(
