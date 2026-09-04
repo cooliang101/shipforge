@@ -434,6 +434,9 @@ mod tests {
 
     #[cfg(unix)]
     fn inherited_pipe_command() -> BuildCommand {
+        // This controlled descendant holds both inherited pipes until its
+        // 20-second sleep completes or it is terminated. The tests below must
+        // observe EOF, not merely return after truncating at the drain grace.
         let script = "sleep 20 & printf 'leader-exited\\n'; exit 0";
         BuildCommand::shell(script)
     }
@@ -456,6 +459,8 @@ mod tests {
         assert_eq!(output.termination, ProcessTermination::TimedOut);
         assert_eq!(output.exit_code, Some(0));
         assert!(String::from_utf8_lossy(&output.stdout).contains("leader-exited"));
+        assert!(!output.stdout_truncated, "descendant stdout must reach EOF");
+        assert!(!output.stderr_truncated, "descendant stderr must reach EOF");
     }
 
     #[cfg(unix)]
@@ -492,6 +497,8 @@ mod tests {
         assert_eq!(output.termination, ProcessTermination::Cancelled);
         assert_eq!(output.exit_code, Some(0));
         assert!(String::from_utf8_lossy(&output.stdout).contains("leader-exited"));
+        assert!(!output.stdout_truncated, "descendant stdout must reach EOF");
+        assert!(!output.stderr_truncated, "descendant stderr must reach EOF");
     }
 
     async fn exited_group() -> ProcessGroup {

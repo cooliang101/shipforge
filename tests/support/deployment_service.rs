@@ -2,8 +2,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     path::Path,
+    process::{Output, Stdio},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use shipforge::{
@@ -81,7 +84,7 @@ pub async fn validate(
     let destinations_path = directory.join("service-destinations.yaml");
     destinations.save(&destinations_path).unwrap();
     let config = initialize(&project, setup(destination)).unwrap();
-    let revision = initialize_git(&project);
+    let revision = initialize_git(&project).await;
     let mut registry = DriverRegistry::default();
     registry
         .register(Arc::new(LinuxSshDriver::new(Arc::new(credentials))))
@@ -238,11 +241,50 @@ fn setup(destination: DestinationKey) -> ProjectSetup {
     }
 }
 
-fn initialize_git(project: &Path) -> String {
-    for args in [
-        vec!["init"],
-        vec!["add", "main.rs", "shipforge.yaml"],
-        vec![
+async fn initialize_git(project: &Path) -> String {
+    // Keep fixture-only configuration outside the worktree so the production
+    // planner can still verify that the freshly committed Project is clean.
+    let isolation = project.parent().unwrap().join("git-fixture");
+    std::fs::create_dir(&isolation).unwrap();
+    std::fs::create_dir(isolation.join("template")).unwrap();
+    let hooks = isolation.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(isolation.join("global-config"), []).unwrap();
+
+    fixture_git(project, &isolation, ["init"]).await;
+    fixture_git(
+        project,
+        &isolation,
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("core.hooksPath"),
+            hooks.as_os_str(),
+        ],
+    )
+    .await;
+    fixture_git(
+        project,
+        &isolation,
+        ["config", "--local", "core.fsmonitor", "false"],
+    )
+    .await;
+    let default_hooks = project.join(".git/hooks");
+    std::fs::create_dir_all(&default_hooks).unwrap();
+    let rejected_hook = default_hooks.join("pre-commit");
+    std::fs::write(&rejected_hook, "#!/bin/sh\nexit 23\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&rejected_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // A successful commit proves that the default hooks directory was not
+    // used; it contains only this test-owned, deliberately failing hook.
+    fixture_git(project, &isolation, ["add", "main.rs", "shipforge.yaml"]).await;
+    fixture_git(
+        project,
+        &isolation,
+        [
             "-c",
             "user.name=Protocol Fixture",
             "-c",
@@ -253,25 +295,53 @@ fn initialize_git(project: &Path) -> String {
             "-m",
             "fixture",
         ],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(project)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "fixture git setup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(project)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    )
+    .await;
+    let output = fixture_git(project, &isolation, ["rev-parse", "HEAD"]).await;
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+async fn fixture_git<I, S>(project: &Path, isolation: &Path, args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut hooks = OsString::from("core.hooksPath=");
+    hooks.push(isolation.join("hooks"));
+    let mut template = OsString::from("init.templateDir=");
+    template.push(isolation.join("template"));
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-c")
+        .arg(hooks)
+        .arg("-c")
+        .arg(template)
+        .args(args)
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", isolation.join("global-config"));
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("each isolated fixture Git command must finish within 10 seconds")
+        .expect("spawn isolated fixture Git command");
+    assert!(
+        output.status.success(),
+        "fixture git setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn verify_history(history: &Path, deployment: &str) {

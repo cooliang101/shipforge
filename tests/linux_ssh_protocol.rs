@@ -1376,6 +1376,10 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
         }));
         shutdown.shutdown("test complete".into());
     };
-    let (server_result, ()) = tokio::join!(running, client);
+    let (server_result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(180), async {
+        tokio::join!(running, client)
+    }))
+    .await
+    .expect("the complete loopback protocol fixture must finish within 180 seconds");
     server_result.unwrap();
 }

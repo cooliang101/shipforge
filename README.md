@@ -8,7 +8,7 @@ The project is in M1 acceptance, not a production-ready release. Setup, deployme
 
 ## Run locally
 
-Use a normal interactive terminal and the validated Windows Rust 1.96.1 toolchain. `Cargo.toml` declares Rust 1.88 as the minimum; that minimum and the other client platforms still require validation.
+Use a normal interactive terminal and Rust 1.96.1, validated on Windows and WSL Ubuntu-22.04. The [Linux client record](docs/validation/linux-client.md) includes native tests, a release build, and startup/exit smoke coverage. `Cargo.toml` declares Rust 1.88 as the minimum; that minimum, macOS, and the full platform matrix still require validation.
 
 ```sh
 cargo run

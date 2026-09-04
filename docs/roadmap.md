@@ -16,6 +16,8 @@
 
 **M1 整体尚未验收**：两台一次性 Debian/OpenSSH Destination 的单 Component 发布、联合发布、指定版本/未部署状态回滚、HTTP 健康失败补偿及取消已实际执行通过；真实 systemd 服务激活与无端口 Worker 稳定性检查仍待验收。完整范围及复现入口见 [真实 Linux 验收记录](validation/linux-ssh-acceptance.md)。默认 Loopback 协议测试的模拟远端文件系统不替代真实 Linux 验收；M2/M3/M4 不因此视为完成。
 
+WSL Linux 客户端已通过原生单测（含 Unix 继承管道回归）、协议测试、编译及正常启动/退出冒烟；范围见 [Linux 客户端验证](validation/linux-client.md)。这不等于真实 systemd 验收或全部平台支持。
+
 ```text
 TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux SSH 闭环 → 恢复与查询 → 交互加固
              └──────── 测试、安全、持久化、跨平台验证贯穿全程 ────────┘
