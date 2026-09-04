@@ -44,6 +44,7 @@ impl ValidatedDestinationSettings for Settings {
 #[derive(Debug, Default)]
 struct FakeState {
     actions: Vec<String>,
+    audit_warning: Option<String>,
     fail_prepare: Option<ComponentName>,
     fail_activate: Option<ComponentName>,
     fail_activate_after_switch: Option<ComponentName>,
@@ -245,6 +246,14 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current,
             healthy: true,
+            warnings: self
+                .state
+                .lock()
+                .unwrap()
+                .audit_warning
+                .iter()
+                .cloned()
+                .collect(),
         })
     }
     async fn rollback(
@@ -278,6 +287,7 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current: release.cloned(),
             healthy: true,
+            warnings: state.audit_warning.iter().cloned().collect(),
         })
     }
     async fn logs(
@@ -423,6 +433,46 @@ async fn prepares_every_component_before_topological_activation() {
             .unwrap()
             .len(),
         3
+    );
+}
+
+#[tokio::test]
+async fn remote_audit_warnings_do_not_stop_later_component_activations() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().audit_warning = Some("remote audit unavailable".into());
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Succeeded);
+    assert!(report.failure.is_none());
+    assert_eq!(report.warnings.len(), 3);
+    assert!(fixture.actions().ends_with(&[
+        "activate:worker".into(),
+        "activate:backend".into(),
+        "activate:frontend".into()
+    ]));
+    assert!(
+        fixture
+            .history
+            .pending_intents(&report.deployment.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn remote_audit_warnings_preserve_cancelled_state_and_compensation() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.audit_warning = Some("remote audit unavailable".into());
+        state.cancel_after_activate = Some(ComponentName::parse("worker").unwrap());
+    }
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Cancelled);
+    assert!(report.compensation_failures.is_empty());
+    assert_eq!(report.warnings.len(), 2);
+    assert_eq!(
+        report.deployment.components[&ComponentName::parse("worker").unwrap()].outcome,
+        ComponentOutcome::Compensated
     );
 }
 

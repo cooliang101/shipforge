@@ -1,6 +1,11 @@
 //! Capability-based Deployment Driver SPI and built-in Driver registry.
 
+pub mod audit;
+pub mod inventory;
 pub mod linux_ssh;
+
+pub use audit::RemoteAuditHistory;
+pub use inventory::ReleaseInventory;
 
 use std::{
     any::Any,
@@ -343,6 +348,14 @@ pub struct PreparedRelease {
 pub struct ActivationReceipt {
     pub current: Option<ReleaseRef>,
     pub healthy: bool,
+    /// Auxiliary audit failures never erase a known activation or recovery result.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ComponentInventory {
+    pub releases: ReleaseInventory,
+    pub audit: RemoteAuditHistory,
 }
 
 #[derive(Clone, Debug)]
@@ -424,6 +437,18 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         &self,
         context: &ComponentExecutionContext,
     ) -> Result<Option<ReleaseRef>, DriverError>;
+    /// Reads remote Release facts and auxiliary history without repairing either.
+    async fn inventory(
+        &self,
+        context: &ComponentExecutionContext,
+    ) -> Result<ComponentInventory, DriverError> {
+        Err(DriverError {
+            stage: "inventory".into(),
+            target: context.component.to_string(),
+            message: "Driver does not support Release inventory".into(),
+            suggested_action: "choose a Destination with inventory support".into(),
+        })
+    }
     async fn prepare(
         &self,
         deployment: &crate::domain::DeploymentId,

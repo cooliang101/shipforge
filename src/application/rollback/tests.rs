@@ -44,6 +44,7 @@ impl ValidatedDestinationSettings for Settings {
 #[derive(Debug, Default)]
 struct FakeState {
     actions: Vec<String>,
+    audit_warning: Option<String>,
     current: BTreeMap<ComponentName, ReleaseRef>,
     fail_component: Option<ComponentName>,
     partial_failure: bool,
@@ -210,6 +211,7 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current: target.cloned(),
             healthy: true,
+            warnings: state.audit_warning.iter().cloned().collect(),
         })
     }
     async fn logs(
@@ -378,6 +380,17 @@ async fn rolls_back_in_reverse_topology_and_persists_not_deployed() {
         .unwrap();
     assert_eq!(worker.result.attempted_release, None);
     assert_eq!(worker.result.observed_release, None);
+}
+
+#[tokio::test]
+async fn remote_audit_warnings_do_not_fail_an_explicit_rollback() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().audit_warning = Some("remote audit unavailable".into());
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Succeeded);
+    assert!(report.failure.is_none());
+    assert_eq!(report.warnings.len(), 3);
+    assert_eq!(fixture.actions().len(), 3);
 }
 
 #[tokio::test]

@@ -73,7 +73,9 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ## M2：历史、对账与保留
 
-`HIS-01` 已实现本地 SQLite schema v5、冻结的所选 Component/目标/能力快照、源码和操作者信息、Release manifest/大小/SHA-256、准备回执、带时间的步骤以及明确区分未知与未部署的观察记录。部署与显式回滚已接入；查询采用有界分页，终态中的未完成意图仍可发现。验收范围见 [HIS-01 记录](validation/his-01.md)。这不代表 M2 完成；下一工作包是 `HIS-02`，不提前宣称恢复界面或远端库存已可用。
+`HIS-01` 已实现本地 SQLite schema v5、冻结的所选 Component/目标/能力快照、源码和操作者信息、Release manifest/大小/SHA-256、准备回执、带时间的步骤以及明确区分未知与未部署的观察记录。部署与显式回滚已接入；查询采用有界分页，终态中的未完成意图仍可发现。验收范围见 [HIS-01 记录](validation/his-01.md)。
+
+`HIS-02` 已完成只读远端库存与追加式审计：校验版本归档、摘要、manifest 和目录事实，显式报告不完整条目与未知 current；审计保留原始非秘密引用，不从当前配置补造历史能力或健康。副作用后的辅助审计失败保留已知结果与补偿路径。默认测试、独立审查及真实双 Linux 复跑通过，证据和资源上限见 [HIS-02 记录](validation/his-02.md)。下一工作包为 `REC-01`；M2 尚未完成，恢复决策、清理及 TUI 管理入口仍未交付。
 
 - `HIS-01`：扩展 SQLite Deployment、Step、逐 Component Release Receipt、Environment Observation、Component generation、能力快照及日志索引模型。
 - `HIS-02`：实现 `linux-ssh` Release 库存重建和追加式远端 JSONL 审计记录；Release manifest 由 `ART-01` 创建，由 `REL-01` 和恢复流程读取。

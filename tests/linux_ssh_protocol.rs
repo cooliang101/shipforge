@@ -16,8 +16,7 @@ use shipforge::{
     config::{CredentialRegistry, ResolvedArtifact, ResolvedArtifactKind, SshCredential},
     domain::{
         Capability, ComponentGeneration, ComponentName, ComponentRelease, DeploymentId,
-        DestinationKey, DestinationRevision, DriverCapabilities, EnvironmentId, ProjectId,
-        ReleaseVersion,
+        DestinationKey, DestinationRevision, EnvironmentId, ProjectId, ReleaseVersion,
     },
     drivers::{
         ComponentExecutionContext, ComponentRequest, DeploymentDriver, DriverDestinationInput,
@@ -62,6 +61,7 @@ struct TransferState {
     directories: HashSet<String>,
     links: HashMap<String, String>,
     fail_writes_remaining: usize,
+    fail_audit_appends_remaining: usize,
     removals: usize,
     health_status: u16,
 }
@@ -182,10 +182,8 @@ async fn release_command(
     command: &str,
     transfer: &Arc<AsyncMutex<TransferState>>,
 ) -> Option<(u32, Vec<u8>)> {
-    let words = command
-        .split("' '")
-        .map(|word| word.trim_matches('\''))
-        .collect::<Vec<_>>();
+    let arguments = structured_arguments(command)?;
+    let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     match words.first().copied()? {
         "mkdir" => mkdir_command(&words, transfer).await,
         "tar" => tar_command(&words, transfer).await,
@@ -199,20 +197,11 @@ async fn release_command(
                 None => Some((1, Vec::new())),
             }
         }
-        "find" => {
-            let state = transfer.lock().await;
-            let prefix = format!("{}/", words.get(1)?);
-            let child = state
-                .files
-                .keys()
-                .chain(state.links.keys())
-                .chain(state.directories.iter())
-                .find(|path| path.starts_with(&prefix));
-            Some((
-                0,
-                child.map_or_else(Vec::new, |path| format!("{path}\n").into_bytes()),
-            ))
-        }
+        "find" => find_command(&words, transfer).await,
+        "timeout" => match words.as_slice() {
+            ["timeout", "--kill-after=2", "25", inner @ ..] => audit_command(inner, transfer).await,
+            _ => inventory_command(&words, transfer).await,
+        },
         "ln" => link_command(&words, transfer).await,
         "rm" => {
             let path = *words.last()?;
@@ -221,7 +210,20 @@ async fn release_command(
             state.links.remove(path);
             Some((0, Vec::new()))
         }
-        "stat" => Some((0, b"1\n1\n".to_vec())),
+        "stat" => match words.as_slice() {
+            ["stat", "--dereference", "--format=%d", "--", _, _] => Some((0, b"1\n1\n".to_vec())),
+            ["stat", "--format=%d:%i:%s:%y:%z", "--", path] => {
+                let state = transfer.lock().await;
+                let bytes = state.files.get(*path)?;
+                // Content-derived stamp detects fixture mutations without claiming real inode races.
+                let identity = format!("{:x}", sha2::Sha256::digest(bytes));
+                Some((
+                    0,
+                    format!("1:1:{}:{identity}:0\n", bytes.len()).into_bytes(),
+                ))
+            }
+            _ => None,
+        },
         "readlink" => {
             let path = *words.last()?;
             let target = transfer.lock().await.links.get(path)?.clone();
@@ -236,6 +238,254 @@ async fn release_command(
     }
 }
 
+// Decode only CommandSpec's single-quoted argv, never a general Shell program.
+fn structured_arguments(mut command: &str) -> Option<Vec<String>> {
+    let mut arguments = Vec::new();
+    while !command.is_empty() {
+        command = command.strip_prefix('\'')?;
+        let mut argument = String::new();
+        loop {
+            let end = command.find('\'')?;
+            argument.push_str(&command[..end]);
+            command = &command[end + 1..];
+            if let Some(rest) = command.strip_prefix("\\''") {
+                argument.push('\'');
+                command = rest;
+            } else {
+                break;
+            }
+        }
+        arguments.push(argument);
+        if !command.is_empty() {
+            command = command.strip_prefix(' ')?;
+            if command.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(arguments)
+}
+
+async fn find_command(
+    words: &[&str],
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) -> Option<(u32, Vec<u8>)> {
+    let [
+        "find",
+        root,
+        "-mindepth",
+        "1",
+        "-maxdepth",
+        "1",
+        mode,
+        format,
+    ] = words
+    else {
+        return None;
+    };
+    if !matches!(
+        (*mode, *format),
+        ("-print", "-quit") | ("-printf", "%f\\0%y\\0%s\\0")
+    ) {
+        return None;
+    }
+    let state = transfer.lock().await;
+    if !state.directories.contains(*root) {
+        return Some((1, Vec::new()));
+    }
+    let prefix = format!("{root}/");
+    let mut children = std::collections::BTreeMap::new();
+    for (path, kind, size) in state
+        .files
+        .iter()
+        .map(|(path, bytes)| (path, 'f', bytes.len()))
+        .chain(
+            state
+                .links
+                .iter()
+                .map(|(path, target)| (path, 'l', target.len())),
+        )
+        .chain(state.directories.iter().map(|path| (path, 'd', 0)))
+    {
+        if let Some(name) = path
+            .strip_prefix(&prefix)
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+        {
+            children.insert(name, (kind, size));
+        }
+    }
+    if *mode == "-print" {
+        return Some((
+            0,
+            children
+                .first_key_value()
+                .map_or_else(Vec::new, |(name, _)| {
+                    format!("{prefix}{name}\n").into_bytes()
+                }),
+        ));
+    }
+    let mut output = Vec::new();
+    for (name, (kind, size)) in children {
+        output.extend_from_slice(format!("{name}\0{kind}\0{size}\0").as_bytes());
+    }
+    Some((0, output))
+}
+
+async fn inventory_command(
+    words: &[&str],
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) -> Option<(u32, Vec<u8>)> {
+    let [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=2s",
+        "15s",
+        inner @ ..,
+    ] = words
+    else {
+        return None;
+    };
+    if inner.first() == Some(&"find") {
+        return find_command(inner, transfer).await;
+    }
+    let path = match inner {
+        ["sha256sum", "--", path]
+        | ["gzip", "--test", "--", path]
+        | [
+            "sh",
+            "-c",
+            "gzip -cd -- \"$1\" | head -c 9216",
+            "shipforge-inventory",
+            path,
+        ] => *path,
+        _ => return None,
+    };
+    let state = transfer.lock().await;
+    let Some(bytes) = state.files.get(path) else {
+        return Some((1, Vec::new()));
+    };
+    if inner[0] == "sha256sum" {
+        return Some((
+            0,
+            format!("{:x}  {path}\n", sha2::Sha256::digest(bytes)).into_bytes(),
+        ));
+    }
+    let limit = if inner[0] == "sh" {
+        9216
+    } else {
+        16 * 1024 * 1024
+    };
+    let mut decoded = Vec::new();
+    let result = flate2::read::MultiGzDecoder::new(bytes.as_slice())
+        .take(limit + 1)
+        .read_to_end(&mut decoded);
+    if result.is_err() || (inner[0] == "gzip" && decoded.len() as u64 > limit) {
+        return Some((1, Vec::new()));
+    }
+    decoded.truncate(usize::try_from(limit).ok()?);
+    Some((
+        0,
+        if inner[0] == "sh" {
+            decoded
+        } else {
+            Vec::new()
+        },
+    ))
+}
+
+fn expected_audit_script() -> String {
+    // Equality pins the simulated command to the production script, not arbitrary `sh`.
+    let source = include_str!("../src/drivers/linux_ssh/audit.rs").replace("\r\n", "\n");
+    source
+        .split_once("const AUDIT_SCRIPT: &str = r#\"")
+        .unwrap()
+        .1
+        .split_once("\"#;")
+        .unwrap()
+        .0
+        .to_owned()
+}
+
+async fn audit_command(
+    words: &[&str],
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) -> Option<(u32, Vec<u8>)> {
+    let [
+        "sh",
+        "-c",
+        script,
+        "shipforge-audit",
+        root,
+        file,
+        marker,
+        mode,
+        payload,
+    ] = words
+    else {
+        return None;
+    };
+    if *script != expected_audit_script() {
+        return None;
+    }
+    if !matches!(*file, "releases.jsonl" | "deployments.jsonl")
+        || !matches!(*mode, "read" | "append")
+    {
+        return Some((42, Vec::new()));
+    }
+    let mut state = transfer.lock().await;
+    let mut ancestor = *root;
+    while ancestor != "/" {
+        if state.links.contains_key(ancestor) || !state.directories.contains(ancestor) {
+            return Some((42, Vec::new()));
+        }
+        ancestor =
+            ancestor.rsplit_once('/').map_or(
+                "/",
+                |(parent, _)| if parent.is_empty() { "/" } else { parent },
+            );
+    }
+    let marker_path = format!("{root}/.shipforge-project.json");
+    if state.links.contains_key(&marker_path)
+        || state
+            .files
+            .get(&marker_path)
+            .is_none_or(|bytes| bytes.as_slice() != marker.as_bytes())
+    {
+        return Some((43, Vec::new()));
+    }
+    let metadata = format!("{root}/metadata");
+    if state.links.contains_key(&metadata) || state.files.contains_key(&metadata) {
+        return Some((42, Vec::new()));
+    }
+    if !state.directories.contains(&metadata) {
+        if *mode == "read" {
+            return Some((44, Vec::new()));
+        }
+        state.directories.insert(metadata.clone());
+    }
+    let path = format!("{metadata}/{file}");
+    if state.links.contains_key(&path) || state.directories.contains(&path) {
+        return Some((42, Vec::new()));
+    }
+    if *mode == "read" {
+        return Some(state.files.get(&path).map_or((44, Vec::new()), |bytes| {
+            (0, bytes.iter().take(49_153).copied().collect())
+        }));
+    }
+    let record: shipforge::drivers::audit::RemoteAuditRecord =
+        serde_json::from_str(payload).ok()?;
+    if !record.is_valid() || payload.len() > 8192 {
+        return Some((42, Vec::new()));
+    }
+    if state.fail_audit_appends_remaining > 0 {
+        state.fail_audit_appends_remaining -= 1;
+        return Some((1, Vec::new()));
+    }
+    let bytes = state.files.entry(path).or_default();
+    bytes.extend_from_slice(format!("\n{payload}\n").as_bytes());
+    Some((0, Vec::new()))
+}
+
 async fn mkdir_command(
     words: &[&str],
     transfer: &Arc<AsyncMutex<TransferState>>,
@@ -243,6 +493,16 @@ async fn mkdir_command(
     let mut state = transfer.lock().await;
     for path in words.iter().skip_while(|word| **word != "--").skip(1) {
         state.directories.insert((*path).to_owned());
+        if words.contains(&"--parents") || words.contains(&"-p") {
+            let mut parent = *path;
+            while let Some((ancestor, _)) = parent.rsplit_once('/') {
+                if ancestor.is_empty() {
+                    break;
+                }
+                state.directories.insert(ancestor.to_owned());
+                parent = ancestor;
+            }
+        }
     }
     Some((0, Vec::new()))
 }
@@ -325,6 +585,7 @@ async fn test_command(
                 || state.directories.contains(path)
         }
         "-f" => state.files.contains_key(path),
+        "-w" => state.files.contains_key(path) || state.directories.contains(path),
         "-d" => state.links.get(path).map_or_else(
             || state.directories.contains(path),
             |link| {
@@ -371,8 +632,14 @@ async fn link_command(
 
 struct MemorySftp {
     transfer: Arc<AsyncMutex<TransferState>>,
-    handles: HashMap<String, String>,
+    handles: HashMap<String, MemoryFileHandle>,
     next_handle: u64,
+}
+
+#[derive(Clone)]
+struct MemoryFileHandle {
+    path: String,
+    flags: russh_sftp::protocol::OpenFlags,
 }
 
 impl MemorySftp {
@@ -401,17 +668,66 @@ impl russh_sftp::server::Handler for MemorySftp {
     ) -> Result<russh_sftp::protocol::Handle, Self::Error> {
         use russh_sftp::protocol::{OpenFlags, StatusCode};
         let mut transfer = self.transfer.lock().await;
+        if !flags.intersects(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::APPEND)
+            || (flags.contains(OpenFlags::EXCLUDE) && !flags.contains(OpenFlags::CREATE))
+            || (flags.contains(OpenFlags::TRUNCATE)
+                && !flags.intersects(OpenFlags::WRITE | OpenFlags::APPEND))
+            || transfer.directories.contains(&filename)
+            || transfer.links.contains_key(&filename)
+        {
+            return Err(StatusCode::Failure);
+        }
         if transfer.files.contains_key(&filename) && flags.contains(OpenFlags::EXCLUDE) {
             return Err(StatusCode::Failure);
         }
         if !transfer.files.contains_key(&filename) && !flags.contains(OpenFlags::CREATE) {
             return Err(StatusCode::NoSuchFile);
         }
-        transfer.files.insert(filename.clone(), Vec::new());
+        let file = transfer.files.entry(filename.clone()).or_default();
+        if flags.contains(OpenFlags::TRUNCATE) {
+            file.clear();
+        }
         self.next_handle += 1;
         let handle = format!("handle-{}", self.next_handle);
-        self.handles.insert(handle.clone(), filename);
+        self.handles.insert(
+            handle.clone(),
+            MemoryFileHandle {
+                path: filename,
+                flags,
+            },
+        );
         Ok(russh_sftp::protocol::Handle { id, handle })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<russh_sftp::protocol::Data, Self::Error> {
+        use russh_sftp::protocol::{OpenFlags, StatusCode};
+        let opened = self.handles.get(&handle).ok_or(StatusCode::Failure)?;
+        if !opened.flags.contains(OpenFlags::READ) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        let transfer = self.transfer.lock().await;
+        let bytes = transfer
+            .files
+            .get(&opened.path)
+            .ok_or(StatusCode::NoSuchFile)?;
+        let offset = usize::try_from(offset).map_err(|_| StatusCode::Eof)?;
+        if offset >= bytes.len() && len != 0 {
+            return Err(StatusCode::Eof);
+        }
+        let data = bytes
+            .get(offset..)
+            .unwrap_or_default()
+            .iter()
+            .take(len as usize)
+            .copied()
+            .collect();
+        Ok(russh_sftp::protocol::Data { id, data })
     }
 
     async fn write(
@@ -421,22 +737,33 @@ impl russh_sftp::server::Handler for MemorySftp {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<russh_sftp::protocol::Status, Self::Error> {
-        use russh_sftp::protocol::StatusCode;
-        let path = self
+        use russh_sftp::protocol::{OpenFlags, StatusCode};
+        let opened = self
             .handles
             .get(&handle)
             .ok_or(StatusCode::Failure)?
             .clone();
-        let offset: usize = offset.try_into().map_err(|_| StatusCode::Failure)?;
+        if !opened
+            .flags
+            .intersects(OpenFlags::WRITE | OpenFlags::APPEND)
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
         let mut transfer = self.transfer.lock().await;
         let file = transfer
             .files
-            .get_mut(&path)
+            .get_mut(&opened.path)
             .ok_or(StatusCode::NoSuchFile)?;
-        if file.len() < offset {
-            file.resize(offset, 0);
-        }
+        let offset = if opened.flags.contains(OpenFlags::APPEND) {
+            file.len()
+        } else {
+            usize::try_from(offset).map_err(|_| StatusCode::Failure)?
+        };
         let end = offset.checked_add(data.len()).ok_or(StatusCode::Failure)?;
+        // This deliberately bounded fixture does not allocate arbitrary sparse files.
+        if end > 16 * 1024 * 1024 {
+            return Err(StatusCode::Failure);
+        }
         if file.len() < end {
             file.resize(end, 0);
         }
@@ -453,7 +780,7 @@ impl russh_sftp::server::Handler for MemorySftp {
         id: u32,
         handle: String,
     ) -> Result<russh_sftp::protocol::Status, Self::Error> {
-        self.handles.remove(&handle);
+        self.handles.remove(&handle).ok_or(Self::Error::Failure)?;
         Ok(ok_status(id))
     }
 
@@ -462,17 +789,25 @@ impl russh_sftp::server::Handler for MemorySftp {
         id: u32,
         path: String,
     ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
-        use russh_sftp::protocol::{FileAttributes, StatusCode};
         let transfer = self.transfer.lock().await;
-        let bytes = transfer.files.get(&path).ok_or(StatusCode::NoSuchFile)?;
-        Ok(russh_sftp::protocol::Attrs {
-            id,
-            attrs: FileAttributes {
-                size: Some(bytes.len() as u64),
-                permissions: Some(0o100_600),
-                ..FileAttributes::default()
-            },
-        })
+        memory_attrs(id, &path, &transfer, true)
+    }
+
+    async fn lstat(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
+        memory_attrs(id, &path, &*self.transfer.lock().await, false)
+    }
+
+    async fn fstat(
+        &mut self,
+        id: u32,
+        handle: String,
+    ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
+        let opened = self.handles.get(&handle).ok_or(Self::Error::Failure)?;
+        memory_attrs(id, &opened.path, &*self.transfer.lock().await, false)
     }
 
     async fn remove(
@@ -491,6 +826,47 @@ impl russh_sftp::server::Handler for MemorySftp {
     }
 }
 
+fn memory_attrs(
+    id: u32,
+    path: &str,
+    transfer: &TransferState,
+    follow: bool,
+) -> Result<russh_sftp::protocol::Attrs, russh_sftp::protocol::StatusCode> {
+    use russh_sftp::protocol::{Attrs, FileAttributes, StatusCode};
+    let mut path = path.to_owned();
+    for _ in 0..16 {
+        let (size, permissions) = if let Some(bytes) = transfer.files.get(&path) {
+            (bytes.len(), 0o100_600)
+        } else if transfer.directories.contains(&path) {
+            (0, 0o040_700)
+        } else if let Some(target) = transfer.links.get(&path) {
+            if follow {
+                path = if target.starts_with('/') {
+                    target.clone()
+                } else {
+                    format!(
+                        "{}/{target}",
+                        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+                    )
+                };
+                continue;
+            }
+            (target.len(), 0o120_777)
+        } else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        return Ok(Attrs {
+            id,
+            attrs: FileAttributes {
+                size: Some(size as u64),
+                permissions: Some(permissions),
+                ..FileAttributes::default()
+            },
+        });
+    }
+    Err(StatusCode::Failure)
+}
+
 fn ok_status(id: u32) -> russh_sftp::protocol::Status {
     russh_sftp::protocol::Status {
         id,
@@ -498,6 +874,270 @@ fn ok_status(id: u32) -> russh_sftp::protocol::Status {
         error_message: "ok".into(),
         language_tag: "en".into(),
     }
+}
+
+#[test]
+fn protocol_parser_accepts_only_structured_quoted_arguments() {
+    let values = [SENTINEL, "", "\n$HOME && rm no", "尾部'", "''"];
+    let command = CommandSpec::structured("printf", values.map(CommandArgument::plain)).unwrap();
+    let arguments = structured_arguments(&command.render_posix().unwrap()).unwrap();
+    assert_eq!(arguments[0], "printf");
+    assert_eq!(arguments[1..], values);
+    for invalid in [
+        "printf hello",
+        "'printf'; 'extra'",
+        "'printf'  'extra'",
+        "'unterminated",
+        "'printf' ",
+    ] {
+        assert!(
+            structured_arguments(invalid).is_none(),
+            "unexpectedly accepted {invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_sftp_preserves_read_and_append_contents_and_enforces_access() {
+    use russh_sftp::{
+        protocol::{FileAttributes, OpenFlags, StatusCode},
+        server::Handler as _,
+    };
+    let transfer = Arc::new(AsyncMutex::new(TransferState::default()));
+    transfer
+        .lock()
+        .await
+        .files
+        .insert("/file".into(), b"original".to_vec());
+    let mut sftp = MemorySftp::new(transfer.clone());
+    let reader = sftp
+        .open(
+            1,
+            "/file".into(),
+            OpenFlags::READ,
+            FileAttributes::default(),
+        )
+        .await
+        .unwrap()
+        .handle;
+    assert_eq!(
+        sftp.read(2, reader.clone(), 2, u32::MAX)
+            .await
+            .unwrap()
+            .data,
+        b"iginal"
+    );
+    assert_eq!(
+        sftp.read(3, reader.clone(), u64::MAX, 1).await.unwrap_err(),
+        StatusCode::Eof
+    );
+    assert_eq!(
+        sftp.write(4, reader.clone(), 0, b"overwrite".to_vec())
+            .await
+            .unwrap_err(),
+        StatusCode::PermissionDenied
+    );
+    let appender = sftp
+        .open(
+            5,
+            "/file".into(),
+            OpenFlags::WRITE | OpenFlags::APPEND,
+            FileAttributes::default(),
+        )
+        .await
+        .unwrap()
+        .handle;
+    sftp.write(6, appender.clone(), 0, b"-added".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(transfer.lock().await.files["/file"], b"original-added");
+    assert_eq!(
+        sftp.read(7, appender.clone(), 0, 1).await.unwrap_err(),
+        StatusCode::PermissionDenied
+    );
+    assert_eq!(
+        sftp.fstat(8, reader.clone()).await.unwrap().attrs.size,
+        Some(14)
+    );
+    sftp.close(9, reader.clone()).await.unwrap();
+    assert_eq!(
+        sftp.fstat(10, reader).await.unwrap_err(),
+        StatusCode::Failure
+    );
+    let writer = sftp
+        .open(
+            11,
+            "/file".into(),
+            OpenFlags::WRITE,
+            FileAttributes::default(),
+        )
+        .await
+        .unwrap()
+        .handle;
+    sftp.write(12, writer.clone(), 0, b"O".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(transfer.lock().await.files["/file"], b"Original-added");
+    assert_eq!(
+        sftp.write(13, writer, u64::MAX, vec![1]).await.unwrap_err(),
+        StatusCode::Failure
+    );
+    assert_eq!(transfer.lock().await.files["/file"], b"Original-added");
+}
+
+#[tokio::test]
+async fn memory_sftp_honors_exclusive_create_and_explicit_truncate() {
+    use russh_sftp::{
+        protocol::{FileAttributes, OpenFlags, StatusCode},
+        server::Handler as _,
+    };
+    let transfer = Arc::new(AsyncMutex::new(TransferState::default()));
+    let mut sftp = MemorySftp::new(transfer.clone());
+    assert_eq!(
+        sftp.open(
+            1,
+            "/missing".into(),
+            OpenFlags::READ,
+            FileAttributes::default()
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::NoSuchFile
+    );
+    let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
+    let created = sftp
+        .open(2, "/file".into(), flags, FileAttributes::default())
+        .await
+        .unwrap()
+        .handle;
+    sftp.write(3, created, 0, b"keep".to_vec()).await.unwrap();
+    assert_eq!(
+        sftp.open(4, "/file".into(), flags, FileAttributes::default())
+            .await
+            .unwrap_err(),
+        StatusCode::Failure
+    );
+    assert_eq!(transfer.lock().await.files["/file"], b"keep");
+    assert_eq!(
+        sftp.open(
+            5,
+            "/file".into(),
+            OpenFlags::READ | OpenFlags::TRUNCATE,
+            FileAttributes::default()
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::Failure
+    );
+    sftp.open(
+        6,
+        "/file".into(),
+        OpenFlags::WRITE | OpenFlags::TRUNCATE,
+        FileAttributes::default(),
+    )
+    .await
+    .unwrap();
+    assert!(transfer.lock().await.files["/file"].is_empty());
+}
+
+#[tokio::test]
+async fn memory_sftp_lstat_distinguishes_links_and_directories() {
+    use russh_sftp::{
+        protocol::{FileAttributes, OpenFlags, StatusCode},
+        server::Handler as _,
+    };
+    let transfer = Arc::new(AsyncMutex::new(TransferState::default()));
+    {
+        let mut state = transfer.lock().await;
+        state.directories.insert("/dir".into());
+        state.files.insert("/dir/file".into(), vec![1, 2, 3]);
+        state.links.insert("/dir/link".into(), "file".into());
+        state.links.insert("/dir/loop".into(), "loop".into());
+    }
+    let mut sftp = MemorySftp::new(transfer);
+    assert_eq!(
+        sftp.lstat(1, "/dir".into())
+            .await
+            .unwrap()
+            .attrs
+            .permissions,
+        Some(0o040_700)
+    );
+    assert_eq!(
+        sftp.lstat(2, "/dir/link".into())
+            .await
+            .unwrap()
+            .attrs
+            .permissions,
+        Some(0o120_777)
+    );
+    assert_eq!(
+        sftp.stat(3, "/dir/link".into()).await.unwrap().attrs.size,
+        Some(3)
+    );
+    assert_eq!(
+        sftp.stat(4, "/dir/loop".into()).await.unwrap_err(),
+        StatusCode::Failure
+    );
+    assert_eq!(
+        sftp.open(
+            5,
+            "/dir/link".into(),
+            OpenFlags::READ,
+            FileAttributes::default()
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::Failure
+    );
+}
+
+#[tokio::test]
+async fn protocol_simulator_rejects_unrecognized_scripts_and_timeout_options() {
+    let transfer = Arc::new(AsyncMutex::new(TransferState::default()));
+    for arguments in [
+        vec![
+            "--kill-after=2",
+            "25",
+            "sh",
+            "-c",
+            "exit 0",
+            "shipforge-audit",
+            "/root",
+            "releases.jsonl",
+            "{}",
+            "read",
+            "",
+        ],
+        vec![
+            "--signal=TERM",
+            "--kill-after=2s",
+            "15s",
+            "sh",
+            "-c",
+            "printf safe",
+            "shipforge-inventory",
+            "/archive",
+        ],
+        vec![
+            "--signal=KILL",
+            "--kill-after=2s",
+            "15s",
+            "sha256sum",
+            "--",
+            "/archive",
+        ],
+    ] {
+        let command =
+            CommandSpec::structured("timeout", arguments.into_iter().map(CommandArgument::plain))
+                .unwrap();
+        assert!(
+            release_command(&command.render_posix().unwrap(), &transfer)
+                .await
+                .is_none()
+        );
+    }
+    assert!(transfer.lock().await.files.is_empty());
 }
 
 async fn connect_client(
@@ -1161,6 +1801,8 @@ async fn validate_production_driver(
         .unwrap();
     assert_eq!(activated.current.as_ref(), Some(&prepared.release));
     assert!(activated.healthy);
+    assert!(activated.warnings.is_empty());
+    validate_driver_inventory(&planned, &package, transfer).await;
 
     let previous = ReleaseRef {
         driver: prepared.release.driver.clone(),
@@ -1172,13 +1814,7 @@ async fn validate_production_driver(
         destination: prepared.release.destination.clone(),
         destination_revision: prepared.release.destination_revision,
         endpoint_fingerprint: prepared.release.endpoint_fingerprint.clone(),
-        effective_capabilities: DriverCapabilities::new([
-            Capability::StagedDeployment,
-            Capability::ExplicitActivation,
-            Capability::Observe,
-            Capability::Rollback,
-            Capability::Cancellation,
-        ]),
+        effective_capabilities: prepared.release.effective_capabilities.clone(),
     };
     let drift = planned
         .driver
@@ -1207,21 +1843,12 @@ async fn validate_production_driver(
         .unwrap();
     assert_eq!(rolled_back.current, Some(previous.clone()));
     assert!(rolled_back.healthy);
-    let undeployed = planned
-        .driver
-        .rollback(
-            &DeploymentId::new(),
-            &planned.context,
-            Some(&previous),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(undeployed.current, None);
+    validate_undeploy_preserves_original_audit_ref(&planned, &previous).await;
     assert_eq!(
         planned.driver.current(&planned.context).await.unwrap(),
         None
     );
+    transfer.lock().await.fail_audit_appends_remaining = 1;
     let restored = planned
         .driver
         .rollback(
@@ -1235,9 +1862,161 @@ async fn validate_production_driver(
     assert_eq!(restored.current, Some(previous.clone()));
     assert!(restored.healthy);
     assert_eq!(
+        restored.warnings.len(),
+        1,
+        "post-effect audit failure retains the healthy receipt"
+    );
+    assert_eq!(
         planned.driver.current(&planned.context).await.unwrap(),
         Some(previous)
     );
+}
+
+async fn validate_undeploy_preserves_original_audit_ref(
+    planned: &shipforge::application::PlannedComponent,
+    current: &ReleaseRef,
+) {
+    use shipforge::drivers::audit::{RemoteAuditObserved, RemoteAuditPhase};
+    let mut original = current.clone();
+    original.effective_capabilities = shipforge::domain::DriverCapabilities::new([
+        Capability::StagedDeployment,
+        Capability::ExplicitActivation,
+        Capability::Observe,
+        Capability::Rollback,
+        Capability::Cancellation,
+    ]);
+    assert!(
+        planned
+            .driver
+            .static_capabilities()
+            .contains(Capability::Inventory)
+    );
+    assert!(
+        !original
+            .effective_capabilities
+            .contains(Capability::Inventory)
+    );
+    let deployment = DeploymentId::new();
+    let undeployed = planned
+        .driver
+        .rollback(&deployment, &planned.context, Some(&original), None)
+        .await
+        .unwrap();
+    assert_eq!(undeployed.current, None);
+    assert!(undeployed.warnings.is_empty());
+    let inventory = planned.driver.inventory(&planned.context).await.unwrap();
+    let record = inventory
+        .audit
+        .records
+        .iter()
+        .find(|record| {
+            record.deployment == deployment && record.phase == RemoteAuditPhase::Rollback
+        })
+        .unwrap();
+    assert_eq!(
+        record.release, original,
+        "undeploy audit must not substitute the current Driver's capabilities for the frozen source reference"
+    );
+    assert_eq!(record.expected_current.as_ref(), Some(&current.version));
+    assert_eq!(record.target, None);
+    assert_eq!(record.observed, RemoteAuditObserved::NotDeployed);
+    assert_eq!(record.healthy, None);
+}
+
+async fn validate_driver_inventory(
+    planned: &shipforge::application::PlannedComponent,
+    package: &shipforge::drivers::ReleasePackage,
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) {
+    use shipforge::drivers::audit::{RemoteAuditOutcome, RemoteAuditPhase};
+    let inventory = planned.driver.inventory(&planned.context).await.unwrap();
+    let found = inventory
+        .releases
+        .releases
+        .iter()
+        .find(|entry| entry.manifest.version == package.release().version)
+        .unwrap();
+    assert_eq!(&found.manifest, package.manifest());
+    assert_eq!(found.sha256, package.sha256());
+    assert_eq!(found.size, package.size());
+    assert!(found.extracted);
+    assert_eq!(
+        inventory.releases.current,
+        Ok(Some(package.release().version.clone()))
+    );
+    assert!(inventory.audit.records.iter().any(|record| {
+        record.phase == RemoteAuditPhase::Prepare
+            && record
+                .package
+                .as_ref()
+                .is_some_and(|metadata| metadata.sha256 == package.sha256())
+    }));
+    assert!(
+        inventory
+            .audit
+            .records
+            .iter()
+            .any(|record| record.phase == RemoteAuditPhase::Activate
+                && record.outcome == RemoteAuditOutcome::Succeeded
+                && record.healthy == Some(true))
+    );
+    let root = protocol_target().root;
+    let paths = [
+        format!("{root}/metadata/releases.jsonl"),
+        format!("{root}/metadata/deployments.jsonl"),
+    ];
+    let saved = {
+        let mut state = transfer.lock().await;
+        paths
+            .iter()
+            .map(|path| state.files.remove(path).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let without_audit = planned.driver.inventory(&planned.context).await.unwrap();
+    assert_eq!(
+        without_audit.releases, inventory.releases,
+        "archive facts do not depend on auxiliary audit history"
+    );
+    assert!(without_audit.audit.records.is_empty());
+    assert!(without_audit.audit.incomplete);
+    {
+        let mut state = transfer.lock().await;
+        for (path, bytes) in paths.iter().zip(saved) {
+            state.files.insert(path.clone(), bytes);
+        }
+        state
+            .files
+            .get_mut(&paths[1])
+            .unwrap()
+            .extend_from_slice(b"{\"torn");
+    }
+    let torn = planned.driver.inventory(&planned.context).await.unwrap();
+    assert_eq!(torn.releases, inventory.releases);
+    assert_eq!(torn.audit.records, inventory.audit.records);
+    assert!(torn.audit.incomplete);
+    let archive_path = format!("{root}/archives/{}.tar.gz", package.release().version);
+    let bytes = transfer
+        .lock()
+        .await
+        .files
+        .insert(archive_path.clone(), b"invalid gzip".to_vec())
+        .unwrap();
+    let corrupt = planned.driver.inventory(&planned.context).await.unwrap();
+    assert!(
+        !corrupt
+            .releases
+            .releases
+            .iter()
+            .any(|entry| entry.manifest.version == package.release().version)
+    );
+    assert!(
+        corrupt
+            .releases
+            .issues
+            .iter()
+            .any(|issue| issue.version.as_ref() == Some(&package.release().version))
+    );
+    transfer.lock().await.files.insert(archive_path, bytes);
 }
 
 #[tokio::test(flavor = "multi_thread")]

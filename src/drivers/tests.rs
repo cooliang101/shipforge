@@ -161,6 +161,7 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current: Some(release.clone()),
             healthy: true,
+            warnings: Vec::new(),
         })
     }
 
@@ -175,6 +176,7 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current: release.cloned(),
             healthy: true,
+            warnings: Vec::new(),
         })
     }
 

@@ -11,6 +11,11 @@ pub fn reply(command: &str) -> Option<(u32, &'static [u8])> {
         "'tar' '--help'" => Some((0, b"--extract --gzip --directory --no-same-owner\n")),
         "'ln' '--help'" => Some((0, b"--symbolic\n")),
         "'mv' '--help'" => Some((0, b"--no-clobber --no-target-directory\n")),
+        "'timeout' '--help'" => Some((0, b"--kill-after --signal\n")),
+        "'dd' '--help'" => Some((0, b"oflag= conv= status= append notrunc none\n")),
+        "'sh' '-c' 'exec 3< /proc/self/status; test -f /proc/self/fd/3 && test -r /proc/self/fd/3 && head -c 1 /proc/self/fd/3 >/dev/null' 'shipforge-preflight'" => {
+            Some((0, b""))
+        }
         "'curl' '--version'" => Some((0, b"curl 8\nProtocols: http https\n")),
         _ if command.starts_with("'stat' '--file-system' '--format=%a:%S:%c:%d' '--'") => {
             Some((0, b"1048576:4096:131072:65536\n"))

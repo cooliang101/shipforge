@@ -6,6 +6,8 @@ The default suite includes schema v1–v5 migration/reopen tests, frozen Compone
 
 ## Two disposable Linux deployment targets
 
+HIS-02 extends the default tests with bounded inventory/manifest validation, typed audit records, torn/duplicate/unsupported JSONL handling and post-effect warning propagation. The protocol server checks exact supported command forms; it does not execute the audit Shell script. Actual Shell, descriptor, permission and link behavior is exercised by the disposable Linux suite below. See [HIS-02 evidence and limits](../docs/validation/his-02.md).
+
 On Windows with PowerShell 7, WSL Docker, `ssh-keygen`, Git and the repository's Rust toolchain available, run:
 
 ```powershell
@@ -14,7 +16,7 @@ On Windows with PowerShell 7, WSL Docker, `ssh-keygen`, Git and the repository's
 
 The runner builds `tests/fixtures/openssh`, starts two independent Debian/OpenSSH containers without `--privileged`, with random loopback-only ports and temporary keys, obtains Host Key fingerprints through Docker, and runs the explicitly ignored `linux_ssh_deployment.rs` test. SSH deployment uses the `deploy` account; this is not a rootless container setup. A foreground WSL input pipe keeps the Docker runtime available while Windows cargo runs. It does not modify WSL settings, existing containers, saved Destinations, or real project configurations. Cleanup checks per-run container labels and the exact temporary directory before deleting its containers, image tag, and test identity; ordinary Docker build cache can remain. Cleanup errors fail the runner, while still attempting to restore environment variables and release its WSL helper.
 
-The test refuses to write without the explicit opt-in, two distinct ports/Host Keys, and a fixture marker checked over pinned SSH. It exercises single-Component deployment, joint deployment, explicit rollback to an earlier version/undeployed state, actual destination-side HTTP failure compensation, and cancellation after one activation. Remote commands, SFTP, files, hashes, links, and HTTP are real; test payloads are precreated files and the build command is `rustc --version`. This suite does **not** run systemd or prove the full M1 service-stability gate.
+The test refuses to write without the explicit opt-in, two distinct ports/Host Keys, and a fixture marker checked over pinned SSH. It exercises single-Component deployment, joint deployment, explicit rollback to an earlier version/undeployed state, actual destination-side HTTP failure compensation, and cancellation after one activation. It also queries archive metadata and original audit attribution, rejects wrong manifests and links, distinguishes archive-only/directory-only entries, tolerates missing/torn audit, and preserves successful rollback when audit permissions deny append. Remote commands, SFTP, files, hashes, links, and HTTP are real; test payloads are precreated files and the build command is `rustc --version`. This suite does **not** run systemd or prove the full M1 service-stability gate.
 
 The async acceptance scenario has a ten-minute deadline. Run `./tests/run-linux-acceptance-cleanup-tests.ps1` to check the runner's cleanup paths with in-memory doubles; it needs only PowerShell 7 and never starts WSL/Docker or deletes files. This separate regression checks native exit-code handling, aggregated cleanup failures, ownership/path refusal, environment restoration, and helper-process disposal.
 

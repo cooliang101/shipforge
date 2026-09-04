@@ -21,7 +21,11 @@ use shipforge::{
     drivers::{
         ComponentExecutionContext, DeploymentDriver, DriverLog, DriverRegistry, EventSink,
         ReleaseRef,
-        linux_ssh::{LinuxSshDestination, LinuxSshDriver, connect_authenticated},
+        audit::{RemoteAuditOutcome, RemoteAuditPhase},
+        linux_ssh::{
+            AuthenticatedSession, DeploymentMarker, LinuxSshDestination, LinuxSshDriver,
+            LinuxSshTarget, connect_authenticated,
+        },
     },
     history::HistoryStore,
     telemetry::{CommandArgument, CommandSpec, Redactor},
@@ -182,6 +186,43 @@ impl Fixture {
         }
     }
 
+    async fn session(&self, name: &str) -> AuthenticatedSession {
+        let context = self.context(name);
+        let destination = context
+            .destination_settings
+            .as_any()
+            .downcast_ref::<LinuxSshDestination>()
+            .unwrap();
+        connect_authenticated(
+            destination,
+            &SshCredential::IdentityFile {
+                path: PathBuf::from(required_env("SHIPFORGE_TEST_KEY")),
+            },
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn remote(&self, name: &str, program: &str, args: &[&str]) -> Vec<u8> {
+        let session = self.session(name).await;
+        let command =
+            CommandSpec::structured(program, args.iter().map(|arg| CommandArgument::plain(*arg)))
+                .unwrap();
+        let output = session
+            .execute(&command, Duration::from_secs(15), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            output.exit_status, 0,
+            "disposable fixture mutation failed: {output:?}"
+        );
+        assert!(!output.stdout_truncated);
+        session.disconnect().await.unwrap();
+        output.stdout
+    }
+
     async fn observed(&self) -> BTreeMap<ComponentName, Option<ReleaseRef>> {
         let mut releases = BTreeMap::new();
         for name in ["frontend", "backend"] {
@@ -332,6 +373,347 @@ async fn run_real_linux_acceptance() {
     assert!(cancelled.compensation_failures.is_empty());
     assert_eq!(fixture.observed().await, healthy);
     assert_history(&fixture.history);
+    verify_inventory_and_audit(
+        &fixture,
+        &baseline.deployment.id,
+        &first,
+        &failure.deployment.id,
+    )
+    .await;
+}
+
+async fn verify_inventory_and_audit(
+    fixture: &Fixture,
+    source: &DeploymentId,
+    first: &BTreeMap<ComponentName, Option<ReleaseRef>>,
+    failed: &DeploymentId,
+) {
+    for name in ["frontend", "backend"] {
+        let context = fixture.context(name);
+        let inventory = fixture.driver.inventory(&context).await.unwrap();
+        assert!(inventory.releases.issues.is_empty(), "{inventory:#?}");
+        assert!(inventory.releases.releases.len() >= 3);
+        assert!(!inventory.audit.incomplete, "{inventory:#?}");
+        assert!(!inventory.audit.records.is_empty());
+        for entry in &inventory.releases.releases {
+            assert!(entry.extracted);
+            assert_eq!(entry.manifest.component, component(name));
+            assert!(inventory.audit.records.iter().any(|record| {
+                record.phase == RemoteAuditPhase::Prepare
+                    && record.package.as_ref().is_some_and(|package| {
+                        package.manifest == entry.manifest
+                            && package.sha256 == entry.sha256
+                            && package.size == entry.size
+                    })
+            }));
+        }
+        if name == "backend" {
+            let failure = inventory
+                .audit
+                .records
+                .iter()
+                .find(|record| {
+                    &record.deployment == failed && record.phase == RemoteAuditPhase::Activate
+                })
+                .unwrap();
+            assert_eq!(failure.outcome, RemoteAuditOutcome::Failed);
+            assert_eq!(
+                failure.healthy, None,
+                "a restored link is not a fresh health check"
+            );
+        }
+        // Historical attribution remains what was recorded, not the caller's new revision.
+        let mut revised = context.clone();
+        revised.destination_revision = serde_json::from_str("2").unwrap();
+        let observed = fixture.driver.inventory(&revised).await.unwrap();
+        assert_eq!(observed.audit.records, inventory.audit.records);
+        assert!(
+            observed
+                .audit
+                .records
+                .iter()
+                .all(|record| record.release.destination_revision == context.destination_revision)
+        );
+    }
+
+    verify_audit_failure_preserves_rollback(fixture, source, first).await;
+    verify_audit_loss_and_links(fixture).await;
+}
+
+async fn verify_audit_failure_preserves_rollback(
+    fixture: &Fixture,
+    source: &DeploymentId,
+    first: &BTreeMap<ComponentName, Option<ReleaseRef>>,
+) {
+    let name = "frontend";
+    let context = fixture.context(name);
+    let target = context
+        .target
+        .as_any()
+        .downcast_ref::<LinuxSshTarget>()
+        .unwrap();
+    assert_eq!(target.root, "/srv/shipforge-acceptance/frontend");
+    let audit_file = format!("{}/metadata/deployments.jsonl", target.root);
+    // A post-effect audit permission failure must not turn a successful rollback into a failure.
+    fixture
+        .remote(name, "chmod", &["400", "--", &audit_file])
+        .await;
+    let expected = fixture.driver.current(&context).await.unwrap().unwrap();
+    let desired = first[&component(name)].clone();
+    let history = HistoryStore::open(&fixture.history).unwrap();
+    let report = RollbackOrchestrator::new(&history, Redactor::default())
+        .rollback(
+            source,
+            vec![RollbackComponent {
+                driver: fixture.driver.clone(),
+                context: context.clone(),
+                expected_current: expected,
+                target: desired.clone(),
+            }],
+            &[component(name)],
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.deployment.state,
+        DeploymentState::Succeeded,
+        "{report:#?}"
+    );
+    assert_eq!(report.warnings.len(), 1, "{report:#?}");
+    assert!(report.warnings[0].contains("remote audit was not saved"));
+    assert_eq!(fixture.driver.current(&context).await.unwrap(), desired);
+    fixture
+        .remote(name, "chmod", &["600", "--", &audit_file])
+        .await;
+}
+
+async fn verify_audit_loss_and_links(fixture: &Fixture) {
+    let name = "frontend";
+    let context = fixture.context(name);
+    let target = context
+        .target
+        .as_any()
+        .downcast_ref::<LinuxSshTarget>()
+        .unwrap();
+    let audit_file = format!("{}/metadata/deployments.jsonl", target.root);
+    let before = fixture.driver.inventory(&context).await.unwrap();
+    let repeated = before
+        .audit
+        .records
+        .iter()
+        .find(|record| record.phase == RemoteAuditPhase::Activate)
+        .unwrap();
+    fixture
+        .remote(
+            name,
+            "sh",
+            &[
+                "-c",
+                "printf '%s' '{truncated' >> \"$1\"",
+                "fixture-audit-tail",
+                &audit_file,
+            ],
+        )
+        .await;
+    let session = fixture.session(name).await;
+    session
+        .append_audit(
+            target,
+            &DeploymentMarker::for_context(&context),
+            repeated,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    session.disconnect().await.unwrap();
+    let after = fixture.driver.inventory(&context).await.unwrap();
+    assert!(after.audit.incomplete);
+    assert_eq!(
+        after.audit.records, before.audit.records,
+        "identical retry deduplicates; torn tail is not evidence"
+    );
+    assert_eq!(after.releases, before.releases);
+
+    // Missing audit files do not remove independently verified archive inventory.
+    for file in ["deployments.jsonl", "releases.jsonl"] {
+        let path = format!("{}/metadata/{file}", target.root);
+        fixture
+            .remote(
+                name,
+                "mv",
+                &["--", &path, &format!("{path}.fixture-backup")],
+            )
+            .await;
+    }
+    let missing = fixture.driver.inventory(&context).await.unwrap();
+    assert_eq!(missing.releases, before.releases);
+    assert!(missing.audit.records.is_empty());
+    assert!(missing.audit.incomplete);
+
+    verify_audit_unsafe_paths(fixture, repeated).await;
+    verify_partial_inventory(fixture, &before).await;
+}
+
+async fn verify_audit_unsafe_paths(
+    fixture: &Fixture,
+    repeated: &shipforge::drivers::audit::RemoteAuditRecord,
+) {
+    let name = "frontend";
+    let context = fixture.context(name);
+    let target = context
+        .target
+        .as_any()
+        .downcast_ref::<LinuxSshTarget>()
+        .unwrap();
+    let audit_file = format!("{}/metadata/deployments.jsonl", target.root);
+    // Unsafe audit links cannot redirect a write into another fixture file.
+    let sentinel = format!("{}/metadata/sentinel", target.root);
+    fixture
+        .remote(
+            name,
+            "sh",
+            &[
+                "-c",
+                "printf '%s' sentinel > \"$1\"",
+                "fixture-sentinel",
+                &sentinel,
+            ],
+        )
+        .await;
+    fixture
+        .remote(name, "ln", &["-s", "--", &sentinel, &audit_file])
+        .await;
+    let session = fixture.session(name).await;
+    assert!(
+        session
+            .append_audit(
+                target,
+                &DeploymentMarker::for_context(&context),
+                repeated,
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    session.disconnect().await.unwrap();
+    assert_eq!(
+        fixture.remote(name, "cat", &["--", &sentinel]).await,
+        b"sentinel"
+    );
+
+    fixture
+        .remote(
+            name,
+            "mv",
+            &["--", &audit_file, &format!("{audit_file}.fixture-link")],
+        )
+        .await;
+    fixture
+        .remote(name, "ln", &["--", &sentinel, &audit_file])
+        .await;
+    let session = fixture.session(name).await;
+    assert!(
+        session
+            .append_audit(
+                target,
+                &DeploymentMarker::for_context(&context),
+                repeated,
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    session.disconnect().await.unwrap();
+    assert_eq!(
+        fixture.remote(name, "cat", &["--", &sentinel]).await,
+        b"sentinel"
+    );
+}
+
+async fn verify_partial_inventory(
+    fixture: &Fixture,
+    before: &shipforge::drivers::ComponentInventory,
+) {
+    let name = "frontend";
+    let context = fixture.context(name);
+    let target = context
+        .target
+        .as_any()
+        .downcast_ref::<LinuxSshTarget>()
+        .unwrap();
+    // Filename and archive manifest must agree; links and directory-only remnants are explicit issues.
+    let source_archive = format!(
+        "{}/archives/{}.tar.gz",
+        target.root, before.releases.releases[0].manifest.version
+    );
+    fixture
+        .remote(
+            name,
+            "cp",
+            &[
+                "--",
+                &source_archive,
+                &format!("{}/archives/wrong-manifest.tar.gz", target.root),
+            ],
+        )
+        .await;
+    fixture
+        .remote(
+            name,
+            "ln",
+            &[
+                "-s",
+                "--",
+                &source_archive,
+                &format!("{}/archives/linked.tar.gz", target.root),
+            ],
+        )
+        .await;
+    fixture
+        .remote(
+            name,
+            "mkdir",
+            &["--", &format!("{}/releases/directory-only", target.root)],
+        )
+        .await;
+    let partial = fixture.driver.inventory(&context).await.unwrap();
+    assert_eq!(partial.releases.releases, before.releases.releases);
+    for version in ["wrong-manifest", "linked", "directory-only"] {
+        assert!(
+            partial.releases.issues.iter().any(|issue| issue
+                .version
+                .as_ref()
+                .is_some_and(|found| found.as_str() == version)),
+            "{partial:#?}"
+        );
+    }
+    let detached = before
+        .releases
+        .releases
+        .iter()
+        .find(|entry| {
+            before.releases.current.as_ref().unwrap().as_ref() != Some(&entry.manifest.version)
+        })
+        .unwrap();
+    let directory = format!("{}/releases/{}", target.root, detached.manifest.version);
+    let backup = format!("{}/temporary/fixture-extracted-backup", target.root);
+    fixture
+        .remote(name, "mv", &["--", &directory, &backup])
+        .await;
+    let archive_only = fixture.driver.inventory(&context).await.unwrap();
+    let entry = archive_only
+        .releases
+        .releases
+        .iter()
+        .find(|entry| entry.manifest.version == detached.manifest.version)
+        .unwrap();
+    assert!(!entry.extracted);
+    assert_eq!(entry.sha256, detached.sha256);
+    assert_eq!(archive_only.releases.current, before.releases.current);
+    fixture
+        .remote(name, "mv", &["--", &backup, &directory])
+        .await;
 }
 
 fn assert_history(path: &std::path::Path) {

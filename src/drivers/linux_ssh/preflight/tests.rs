@@ -6,6 +6,7 @@ use crate::drivers::DriverTargetInput;
 struct FakeRemote {
     responses: Mutex<VecDeque<RemoteCommandOutput>>,
     commands: Mutex<Vec<String>>,
+    missing_tool: Option<&'static str>,
 }
 
 impl FakeRemote {
@@ -13,6 +14,7 @@ impl FakeRemote {
         Self {
             responses: Mutex::new(responses.into()),
             commands: Mutex::new(Vec::new()),
+            missing_tool: None,
         }
     }
 }
@@ -30,6 +32,15 @@ impl PreflightRemote for FakeRemote {
             .lock()
             .unwrap()
             .push(command.render_posix().unwrap());
+        if let Some(missing) = self.missing_tool
+            && command.program == "sh"
+            && command
+                .args
+                .iter()
+                .any(|argument| argument.expose_for_execution() == missing)
+        {
+            return Ok(output(127, ""));
+        }
         Ok(self
             .responses
             .lock()
@@ -55,6 +66,9 @@ fn responses() -> Vec<RemoteCommandOutput> {
         output(0, "--extract --gzip --directory --no-same-owner"),
         output(0, "--symbolic"),
         output(0, "--no-clobber --no-target-directory"),
+        output(0, "--kill-after=DURATION --signal=SIGNAL"),
+        output(0, "oflag=FLAGS conv=CONVS status=LEVEL append notrunc none"),
+        output(0, ""),
         output(0, "/srv\n"),
         output(0, "1048576:4096:131072:65536\n"),
     ]
@@ -91,15 +105,19 @@ async fn files_only_preflight_checks_tools_features_parent_and_disk_without_muta
     );
     assert!(notices.iter().any(|notice| notice.contains("sha256sum")));
     let commands = remote.commands.lock().unwrap();
-    assert_eq!(commands.len(), 6);
+    assert_eq!(commands.len(), 9);
     assert!(commands[0].starts_with("'sh' '-c'"));
     assert!(!commands[0].contains("'systemctl'"));
     assert!(!commands[0].contains("'curl'"));
     assert!(commands[1].starts_with("'tar' '--help'"));
     assert!(commands[2].starts_with("'ln' '--help'"));
     assert!(commands[3].starts_with("'mv' '--help'"));
-    assert!(commands[4].ends_with("'shipforge-preflight' '/srv/app'"));
-    assert!(commands[5].starts_with("'stat' '--file-system'"));
+    assert!(commands[0].contains("'timeout' 'dd'"));
+    assert_eq!(commands[4], "'timeout' '--help'");
+    assert_eq!(commands[5], "'dd' '--help'");
+    assert!(commands[6].contains(DESCRIPTOR_CHECK));
+    assert!(commands[7].ends_with("'shipforge-preflight' '/srv/app'"));
+    assert!(commands[8].starts_with("'stat' '--file-system'"));
 }
 
 #[tokio::test]
@@ -122,10 +140,10 @@ async fn configured_service_and_https_are_checked_without_restarting_or_requesti
     let commands = remote.commands.lock().unwrap();
     assert!(commands[0].contains("'systemctl' 'curl'"));
     assert_eq!(
-        commands[6],
+        commands[9],
         "'systemctl' 'show' '--property=LoadState' '--' 'worker.service'"
     );
-    assert_eq!(commands[7], "'curl' '--version'");
+    assert_eq!(commands[10], "'curl' '--version'");
     assert!(!commands.join("\n").contains("secret=value"));
 }
 
@@ -151,16 +169,72 @@ async fn missing_commands_or_required_options_stop_before_filesystem_checks() {
 }
 
 #[tokio::test]
+async fn missing_audit_or_timeout_tool_stops_before_feature_or_filesystem_checks() {
+    for tool in ["timeout", "dd"] {
+        let mut remote = FakeRemote::new(Vec::new());
+        remote.missing_tool = Some(tool);
+        assert!(matches!(
+            check(&remote, &target(None, None)).await,
+            Err(PreflightError::Failed {
+                stage: "required commands",
+                status: 127
+            })
+        ));
+        assert_eq!(remote.commands.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn every_required_timeout_and_append_flag_is_checked_before_filesystem_checks() {
+    for (index, tool, options) in [
+        (4, "timeout", &["--kill-after", "--signal"][..]),
+        (
+            5,
+            "dd",
+            &["oflag=", "conv=", "status=", "append", "notrunc", "none"][..],
+        ),
+    ] {
+        for option in options {
+            let mut replies = responses();
+            let incomplete = String::from_utf8(replies[index].stdout.clone())
+                .unwrap()
+                .replace(option, "");
+            replies[index] = output(0, &incomplete);
+            let remote = FakeRemote::new(replies);
+            assert!(
+                matches!(check(&remote,&target(None,None)).await,Err(PreflightError::UnsupportedOption{tool:actual,option:absent}) if actual==tool && absent==*option)
+            );
+            assert_eq!(remote.commands.lock().unwrap().len(), index + 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn descriptor_filesystem_requires_successful_empty_read_only_probe() {
+    for reply in [output(1, ""), output(0, "unexpected output")] {
+        let mut replies = responses();
+        replies[6] = reply;
+        let remote = FakeRemote::new(replies);
+        assert!(check(&remote, &target(None, None)).await.is_err());
+        let commands = remote.commands.lock().unwrap();
+        assert_eq!(commands.len(), 7);
+        assert!(commands[6].contains("exec 3< /proc/self/status"));
+        assert!(commands[6].contains("head -c 1 /proc/self/fd/3 >/dev/null"));
+        assert!(!commands[6].contains("mkdir"));
+    }
+}
+
+#[tokio::test]
 async fn rejects_unwritable_parent_zero_space_and_malformed_capacity() {
     let mut replies = responses();
-    replies[4] = output(1, "");
+    replies[7] = output(1, "");
     assert!(matches!(
         check(&FakeRemote::new(replies), &target(None, None)).await,
         Err(PreflightError::Failed { .. })
     ));
     for capacity in ["0:4096:100:100\n", "100:4096:100:0\n"] {
         let mut replies = responses();
-        replies[5] = output(0, capacity);
+        replies[8] = output(0, capacity);
         assert!(matches!(
             check(&FakeRemote::new(replies), &target(None, None)).await,
             Err(PreflightError::NoSpace)
@@ -173,7 +247,7 @@ async fn rejects_unwritable_parent_zero_space_and_malformed_capacity() {
         "1:1:1:1:1",
     ] {
         let mut replies = responses();
-        replies[5] = output(0, capacity);
+        replies[8] = output(0, capacity);
         assert!(matches!(
             check(&FakeRemote::new(replies), &target(None, None)).await,
             Err(PreflightError::InvalidOutput(_))
@@ -184,7 +258,7 @@ async fn rejects_unwritable_parent_zero_space_and_malformed_capacity() {
 #[tokio::test]
 async fn filesystem_without_inode_accounting_keeps_the_space_check() {
     let mut replies = responses();
-    replies[5] = output(0, "1:4096:0:0\n");
+    replies[8] = output(0, "1:4096:0:0\n");
     let notices = check(&FakeRemote::new(replies), &target(None, None))
         .await
         .unwrap();
@@ -254,6 +328,6 @@ async fn root_is_passed_as_one_quoted_argument_not_inserted_into_shell_source() 
     target.root = "/srv/app'; touch bad".into();
     check(&remote, &target).await.unwrap();
     let commands = remote.commands.lock().unwrap();
-    assert!(commands[4].contains("'shipforge-preflight' '/srv/app'\\''; touch bad'"));
+    assert!(commands[7].contains("'shipforge-preflight' '/srv/app'\\''; touch bad'"));
     assert!(!ROOT_CHECK.contains("touch"));
 }

@@ -387,6 +387,7 @@ impl<'a> RollbackOrchestrator<'a> {
                 component.target.as_ref(),
             )
             .await;
+        self.driver_warnings(warnings, &result);
         let valid = result
             .as_ref()
             .is_ok_and(|receipt| receipt.current == component.target && receipt.healthy);
@@ -619,6 +620,7 @@ impl<'a> RollbackOrchestrator<'a> {
                 Some(&applied.original),
             )
             .await;
+        self.driver_warnings(warnings, &result);
         let valid = result.as_ref().is_ok_and(|receipt| {
             receipt.current.as_ref() == Some(&applied.original) && receipt.healthy
         });
@@ -769,6 +771,19 @@ impl<'a> RollbackOrchestrator<'a> {
             false
         } else {
             true
+        }
+    }
+
+    fn driver_warnings(
+        &self,
+        warnings: &mut Vec<String>,
+        result: &Result<ActivationReceipt, DriverError>,
+    ) {
+        if let Ok(receipt) = result {
+            warnings.extend(receipt.warnings.iter().take(16).map(|warning| {
+                self.redactor
+                    .redact(&warning.chars().take(2048).collect::<String>())
+            }));
         }
     }
 

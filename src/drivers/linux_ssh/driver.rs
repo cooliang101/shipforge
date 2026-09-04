@@ -13,10 +13,12 @@ use crate::{
         ReleaseVersion,
     },
     drivers::{
-        ActivationReceipt, CleanupReport, ComponentExecutionContext, ComponentPlan,
-        ComponentRequest, DeploymentDriver, DriverDestinationInput, DriverError, DriverKind,
-        DriverLog, DriverTargetInput, EventSink, PreflightReport, PreparedRelease, ReleasePackage,
-        ReleaseRef, RetentionPolicy, ValidatedDestinationSettings, ValidatedTargetSettings,
+        ActivationReceipt, CleanupReport, ComponentExecutionContext, ComponentInventory,
+        ComponentPlan, ComponentRequest, DeploymentDriver, DriverDestinationInput, DriverError,
+        DriverKind, DriverLog, DriverTargetInput, EventSink, PreflightReport, PreparedRelease,
+        ReleasePackage, ReleaseRef, RetentionPolicy, ValidatedDestinationSettings,
+        ValidatedTargetSettings,
+        audit::{RemoteAuditHistory, RemoteAuditPhase},
     },
 };
 
@@ -249,6 +251,45 @@ impl DeploymentDriver for LinuxSshDriver {
         Ok(observed.map(|version| Self::release_ref(context, version)))
     }
 
+    async fn inventory(
+        &self,
+        context: &ComponentExecutionContext,
+    ) -> Result<ComponentInventory, DriverError> {
+        let (destination, target, credential) = self.settings(context)?;
+        let session = connect_authenticated(
+            destination,
+            &credential,
+            CONNECTION_TIMEOUT,
+            &context.cancellation,
+        )
+        .await
+        .map_err(|source| operation_error("connect", context, source))?;
+        let marker = super::DeploymentMarker::for_context(context);
+        let releases = session
+            .release_inventory(target, &marker, &context.cancellation)
+            .await
+            .map_err(|source| operation_error("inventory", context, source))?;
+        // Damaged or missing auxiliary audit must not erase verified file facts.
+        let audit = session
+            .read_audit(target, &marker, &context.cancellation)
+            .await
+            .unwrap_or_else(|_| RemoteAuditHistory {
+                records: Vec::new(),
+                notices: vec![
+                    "remote audit could not be read; historical outcomes are unknown".into(),
+                ],
+                incomplete: true,
+            });
+        if context.cancellation.is_cancelled() {
+            return Err(error(
+                "inventory",
+                &context.component,
+                "inventory cancelled",
+            ));
+        }
+        Ok(ComponentInventory { releases, audit })
+    }
+
     async fn prepare(
         &self,
         deployment: &DeploymentId,
@@ -306,6 +347,18 @@ impl DeploymentDriver for LinuxSshDriver {
             .await
             .map_err(|source| operation_error("prepare", context, source))?;
         let release = Self::release_ref(context, package.release().version.clone());
+        let phase = super::driver_audit::AuditPhase {
+            deployment,
+            context,
+            release: &release,
+            phase: RemoteAuditPhase::Prepare,
+            expected_current: plan
+                .expected_current
+                .as_ref()
+                .map(|release| release.version.clone()),
+            target: Some(release.version.clone()),
+        };
+        super::driver_audit::record_prepared(&session, target, &phase, package).await?;
         let key = Self::prepared_key(deployment, context, &release.version);
         self.prepared
             .lock()
@@ -368,32 +421,45 @@ impl DeploymentDriver for LinuxSshDriver {
         .await
         .map_err(|source| operation_error("connect", context, source))?;
         check_marker(&session, target, context, false).await?;
-        let activation = session
-            .activate_release(
-                target,
-                &prepared.receipt,
-                prepared.expected_current.as_ref(),
-                deployment,
-                ActivationOptions::default(),
-                &context.cancellation,
-            )
-            .await
-            .map_err(|source| operation_error("activate", context, source))?;
-        session
-            .verify_activation_health(
-                target,
-                &activation,
-                deployment,
-                HealthCheckOptions::default(),
-                ActivationOptions::default(),
-                &context.cancellation,
-            )
-            .await
-            .map_err(|source| operation_error("health", context, source))?;
-        Ok(ActivationReceipt {
-            current: Some(release.clone()),
-            healthy: true,
-        })
+        let phase = super::driver_audit::AuditPhase {
+            deployment,
+            context,
+            release,
+            phase: RemoteAuditPhase::Activate,
+            expected_current: prepared.expected_current.clone(),
+            target: Some(release.version.clone()),
+        };
+        let result = async {
+            let activation = session
+                .activate_release(
+                    target,
+                    &prepared.receipt,
+                    prepared.expected_current.as_ref(),
+                    deployment,
+                    ActivationOptions::default(),
+                    &context.cancellation,
+                )
+                .await
+                .map_err(|source| operation_error("activate", context, source))?;
+            session
+                .verify_activation_health(
+                    target,
+                    &activation,
+                    deployment,
+                    HealthCheckOptions::default(),
+                    ActivationOptions::default(),
+                    &context.cancellation,
+                )
+                .await
+                .map_err(|source| operation_error("health", context, source))?;
+            Ok(ActivationReceipt {
+                current: Some(release.clone()),
+                healthy: true,
+                warnings: Vec::new(),
+            })
+        }
+        .await;
+        super::driver_audit::record_phase_result(&session, target, &phase, result).await
     }
 
     async fn rollback(
@@ -419,27 +485,13 @@ impl DeploymentDriver for LinuxSshDriver {
         .await
         .map_err(|source| operation_error("connect", context, source))?;
         check_marker(&session, target, context, false).await?;
-        let current = session
-            .observe_current(target, ActivationOptions::default(), &context.cancellation)
-            .await
-            .map_err(|source| operation_error("observe", context, source))?;
+        let current = observe_validated_current(&session, target, context).await?;
         if current.as_ref() != expected_current.map(|release| &release.version) {
             return Err(error(
                 "rollback",
                 &context.component,
                 "current changed since the rollback was planned; inspect the external change before retrying",
             ));
-        }
-        if let Some(version) = &current {
-            session
-                .check_release_manifest(
-                    target,
-                    &super::DeploymentMarker::for_context(context),
-                    version,
-                    &context.cancellation,
-                )
-                .await
-                .map_err(|source| operation_error("observe", context, source))?;
         }
         let version = current
             .clone()
@@ -462,40 +514,60 @@ impl DeploymentDriver for LinuxSshDriver {
             destination_revision: context.destination_revision,
         };
         let desired = release.map(|release| &release.version);
-        if current_is_absent {
-            session
-                .restore_undeployed_release(
-                    target,
-                    &current,
-                    deployment,
-                    ActivationOptions::default(),
-                    &context.cancellation,
-                )
-                .await
-                .map_err(|source| operation_error("rollback", context, source))?;
-        } else {
-            session
-                .rollback_release(
-                    target,
-                    &current,
-                    desired,
-                    deployment,
-                    ActivationOptions::default(),
-                    &context.cancellation,
-                )
-                .await
-                .map_err(|source| operation_error("rollback", context, source))?;
+        let audit_release = release.or(expected_current).ok_or_else(|| {
+            error(
+                "rollback",
+                &context.component,
+                "rollback has no source or target Release",
+            )
+        })?;
+        let phase = super::driver_audit::AuditPhase {
+            deployment,
+            context,
+            release: audit_release,
+            phase: RemoteAuditPhase::Rollback,
+            expected_current: expected_current.map(|release| release.version.clone()),
+            target: desired.cloned(),
+        };
+        let result = async {
+            if current_is_absent {
+                session
+                    .restore_undeployed_release(
+                        target,
+                        &current,
+                        deployment,
+                        ActivationOptions::default(),
+                        &context.cancellation,
+                    )
+                    .await
+                    .map_err(|source| operation_error("rollback", context, source))?;
+            } else {
+                session
+                    .rollback_release(
+                        target,
+                        &current,
+                        desired,
+                        deployment,
+                        ActivationOptions::default(),
+                        &context.cancellation,
+                    )
+                    .await
+                    .map_err(|source| operation_error("rollback", context, source))?;
+            }
+            if release.is_some() {
+                session
+                    .check_health(target, HealthCheckOptions::default(), &context.cancellation)
+                    .await
+                    .map_err(|source| operation_error("health", context, source))?;
+            }
+            Ok(ActivationReceipt {
+                current: release.cloned(),
+                healthy: true,
+                warnings: Vec::new(),
+            })
         }
-        if release.is_some() {
-            session
-                .check_health(target, HealthCheckOptions::default(), &context.cancellation)
-                .await
-                .map_err(|source| operation_error("health", context, source))?;
-        }
-        Ok(ActivationReceipt {
-            current: release.cloned(),
-            healthy: true,
-        })
+        .await;
+        super::driver_audit::record_phase_result(&session, target, &phase, result).await
     }
 
     async fn logs(
@@ -523,11 +595,35 @@ impl DeploymentDriver for LinuxSshDriver {
     }
 }
 
+async fn observe_validated_current(
+    session: &super::AuthenticatedSession,
+    target: &LinuxSshTarget,
+    context: &ComponentExecutionContext,
+) -> Result<Option<ReleaseVersion>, DriverError> {
+    let current = session
+        .observe_current(target, ActivationOptions::default(), &context.cancellation)
+        .await
+        .map_err(|source| operation_error("observe", context, source))?;
+    if let Some(version) = &current {
+        session
+            .check_release_manifest(
+                target,
+                &super::DeploymentMarker::for_context(context),
+                version,
+                &context.cancellation,
+            )
+            .await
+            .map_err(|source| operation_error("observe", context, source))?;
+    }
+    Ok(current)
+}
+
 fn capabilities() -> DriverCapabilities {
     DriverCapabilities::new([
         Capability::StagedDeployment,
         Capability::ExplicitActivation,
         Capability::Observe,
+        Capability::Inventory,
         Capability::Rollback,
         Capability::Cancellation,
     ])

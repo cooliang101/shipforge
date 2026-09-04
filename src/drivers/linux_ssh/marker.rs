@@ -32,7 +32,7 @@ impl super::AuthenticatedSession {
             }
             ancestor = parent;
         }
-        for child in ["temporary", "archives", "releases"] {
+        for child in ["temporary", "archives", "releases", "metadata"] {
             check_optional_directory(self, &format!("{}/{child}", target.root), cancellation)
                 .await?;
         }

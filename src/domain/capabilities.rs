@@ -10,6 +10,7 @@ pub enum Capability {
     StagedDeployment,
     ExplicitActivation,
     Observe,
+    Inventory,
     Rollback,
     PreviewUrl,
     RemoteLogs,

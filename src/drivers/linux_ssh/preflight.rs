@@ -12,6 +12,7 @@ use super::{AuthenticatedSession, LinuxSshTarget, RemoteCommandOutput, SshConnec
 
 const TOOL_CHECK: &str = "for tool do command -v \"$tool\" >/dev/null || exit 1; done";
 const ROOT_CHECK: &str = "path=$1; while ! test -e \"$path\"; do test ! -L \"$path\" || exit 1; path=${path%/*}; test -n \"$path\" || path=/; done; test -d \"$path\" && test -w \"$path\" && test -x \"$path\" || exit 1; printf '%s\\n' \"$path\"";
+const DESCRIPTOR_CHECK: &str = "exec 3< /proc/self/status; test -f /proc/self/fd/3 && test -r /proc/self/fd/3 && head -c 1 /proc/self/fd/3 >/dev/null";
 const TOOLS: &[&str] = &[
     "test",
     "printf",
@@ -26,6 +27,8 @@ const TOOLS: &[&str] = &[
     "readlink",
     "find",
     "head",
+    "timeout",
+    "dd",
 ];
 
 /// Checks tools, filesystem capacity, and configured service/health clients.
@@ -87,6 +90,18 @@ async fn check_with_remote<R: PreflightRemote>(
     )
     .await?;
     check_features(remote, timeout, cancellation).await?;
+    let descriptor = run(
+        remote,
+        "Linux descriptor filesystem",
+        "sh",
+        &["-c", DESCRIPTOR_CHECK, "shipforge-preflight"],
+        timeout,
+        cancellation,
+    )
+    .await?;
+    if !descriptor.is_empty() {
+        return Err(PreflightError::InvalidOutput("Linux descriptor filesystem"));
+    }
     let capacity = probe_capacity(remote, target, timeout, cancellation).await?;
     if capacity.available_bytes == 0 || capacity.available_inodes == Some(0) {
         return Err(PreflightError::NoSpace);
@@ -100,6 +115,7 @@ async fn check_with_remote<R: PreflightRemote>(
         format!("Remote commands: sh; {}", tools.join(", ")),
         format!("Remote filesystem at {}: {} bytes available; {inodes} (planning snapshot; archive size is not yet known)", capacity.parent, capacity.available_bytes),
         "GNU tar extraction, ln symlinks and mv no-clobber/no-target-directory options checked; same-filesystem atomic switching is checked again before activation".into(),
+        "Bounded remote timeout, append-only dd and readable Linux descriptor paths checked without creating files".into(),
     ])
 }
 
@@ -159,6 +175,11 @@ async fn check_features<R: PreflightRemote>(
         ),
         ("ln", &["--symbolic"][..]),
         ("mv", &["--no-clobber", "--no-target-directory"][..]),
+        ("timeout", &["--kill-after", "--signal"][..]),
+        (
+            "dd",
+            &["oflag=", "conv=", "status=", "append", "notrunc", "none"][..],
+        ),
     ] {
         let output = run(remote, tool, tool, &["--help"], timeout, cancellation).await?;
         for option in options {

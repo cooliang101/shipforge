@@ -168,6 +168,7 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current: Some(release.clone()),
             healthy: true,
+            warnings: Vec::new(),
         })
     }
     async fn rollback(
@@ -191,6 +192,7 @@ impl DeploymentDriver for FakeDriver {
         Ok(ActivationReceipt {
             current: release.cloned(),
             healthy: true,
+            warnings: Vec::new(),
         })
     }
     async fn logs(

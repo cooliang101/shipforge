@@ -90,6 +90,7 @@ pub struct DeploymentOrchestrator<'a> {
     redactor: Redactor,
     clock: MonotonicClock,
     history_warnings: RefCell<Vec<String>>,
+    driver_warnings: RefCell<Vec<String>>,
 }
 
 impl<'a> DeploymentOrchestrator<'a> {
@@ -104,6 +105,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             redactor,
             clock: MonotonicClock::default(),
             history_warnings: RefCell::new(Vec::new()),
+            driver_warnings: RefCell::new(Vec::new()),
         }
     }
 
@@ -247,7 +249,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             deployment,
             failure: None,
             compensation_failures: BTreeMap::new(),
-            warnings: self.history_warnings.take(),
+            warnings: self.take_warnings(),
         })
     }
 
@@ -268,6 +270,7 @@ impl<'a> DeploymentOrchestrator<'a> {
         context: &ComponentExecutionContext,
     ) -> Result<Deployment, OrchestrationError> {
         self.history_warnings.borrow_mut().clear();
+        self.driver_warnings.borrow_mut().clear();
         let mut deployment = Deployment::new();
         self.history.create_deployment(
             &deployment.id,
@@ -652,6 +655,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                 &prepared.release,
             )
             .await;
+        self.remember_driver_warnings(&result);
         let outcome = match &result {
             Ok(receipt)
                 if receipt.current.as_ref() == Some(&prepared.release) && receipt.healthy =>
@@ -791,7 +795,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             deployment,
             failure: Some(failure),
             compensation_failures,
-            warnings: self.history_warnings.take(),
+            warnings: self.take_warnings(),
         })
     }
 
@@ -842,6 +846,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                     activated.previous.as_ref(),
                 )
                 .await;
+            self.remember_driver_warnings(&rollback);
             let rollback = rollback.and_then(|receipt| {
                 if receipt.current == activated.previous && receipt.healthy {
                     Ok(receipt)
@@ -892,6 +897,23 @@ impl<'a> DeploymentOrchestrator<'a> {
             );
         }
         Ok(failures)
+    }
+
+    fn take_warnings(&self) -> Vec<String> {
+        let mut warnings = self.history_warnings.take();
+        warnings.extend(self.driver_warnings.take());
+        warnings
+    }
+
+    fn remember_driver_warnings(&self, result: &Result<ActivationReceipt, DriverError>) {
+        if let Ok(receipt) = result {
+            self.driver_warnings
+                .borrow_mut()
+                .extend(receipt.warnings.iter().take(16).map(|warning| {
+                    self.redactor
+                        .redact(&warning.chars().take(2048).collect::<String>())
+                }));
+        }
     }
 
     fn compensation_observation(

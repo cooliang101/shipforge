@@ -70,6 +70,7 @@ trait DeploymentDriver {
     async fn plan(&self, ctx: &ComponentExecutionContext,
         request: &ComponentRequest) -> ComponentPlan;
     async fn current(&self, ctx: &ComponentExecutionContext) -> Option<ReleaseRef>;
+    async fn inventory(&self, ctx: &ComponentExecutionContext) -> ComponentInventory;
     async fn prepare(&self, deployment: &DeploymentId,
         ctx: &ComponentExecutionContext, plan: &ComponentPlan,
         package: &ReleasePackage, events: &dyn EventSink)
@@ -89,7 +90,7 @@ Transport and SDK types—SSH sessions, SFTP handles, protocol errors, and provi
 
 This boundary also applies to presentation and project configuration. The TUI says “SSH connection” and “deployment target”; `shipforge.yaml` contains no Driver field, capability identifier, transport option, or provider object. The user-level registry retains a private implementation tag so the program can select compiled code. Internal type names and diagnostic step IDs may identify a Driver, but ordinary TUI labels and Project YAML do not.
 
-MVP Driver capabilities cover staged deployment, explicit activation, rollback, remote logs, retention, and cancellation. Local build and Release packaging are common application services, not Driver capabilities. Static capabilities are narrowed by preflight for the resolved Component target, and planning fails early when a required capability is absent. Provider build, preview URLs, promotion, and traffic splitting are designed only when the first managed-platform Driver is implemented.
+The implemented Driver advertises staged deployment, explicit activation, observation, inventory, rollback, and cancellation. Remote logs and retention remain separate roadmap work and are not advertised yet. Local build and Release packaging are common application services, not Driver capabilities. Static capabilities are narrowed by preflight for the resolved Component target, and planning fails early when a required capability is absent. Provider build, preview URLs, promotion, and traffic splitting are designed only when the first managed-platform Driver is implemented.
 
 Drivers are compiled into the executable and selected by the referenced Destination kind. Dynamic plugins and external Driver processes are outside the MVP and have no reserved protocol.
 
@@ -262,6 +263,20 @@ For `linux-ssh`, health execution remains inside the Driver boundary. A configur
 Every effect has a durable intent record before execution and an outcome afterward. Each Component activation remembers its prior `current` link, including absence. Restart or health failure invokes compensation inside the current Deployment. An explicit rollback uses a linked Rollback Deployment. The active TUI session refuses to start a second Deployment while one is running. Separate ShipForge processes are outside the supported operating model. Before an effect, the Driver verifies that the observed Destination revision, endpoint fingerprint, Component generation, and current version still match the plan; a mismatch stops the operation and asks the user to refresh.
 
 ## Persistence and Recovery
+
+### Remote inventory and audit
+
+HIS-02 adds the read-only `inventory` SPI. `ComponentInventory` separates verified archive metadata from auxiliary audit records. The query requires the existing Project identity and resolved Component context; it never creates directories, repairs metadata, rebuilds YAML, or consults the local history database. Missing/empty unmarked roots yield no versions; nonempty unmarked or conflicting roots are rejected.
+
+The SSH implementation scans archive and extracted-directory names, verifies canonical versions, regular non-link files, stable file identity, remote SHA-256 and gzip integrity, and the first bounded tar manifest. Existing extracted manifests must agree. Valid archive-only entries remain visible with `extracted=false` and an issue; directory-only, corrupt and unsafe entries are diagnosed. `current` explicitly distinguishes a version, confirmed absence and failed observation. None of these facts proves health or payload activation safety. Archive bytes stay on the server; only metadata is transferred. Scans are bounded to 1,024 combined namespace entries, 64 KiB per listing, 1 GiB per archive, 4 GiB aggregate archive bytes and 120 seconds. A limit, truncated listing, archive-command timeout or overall deadline fails the scan rather than returning an apparently complete subset. A failed current-only observation may return verified archive entries with explicitly unknown current.
+
+`metadata/releases.jsonl` records successful preparations with manifest, digest and size. `metadata/deployments.jsonl` records Component activation and rollback phase outcomes, expected/target/observed versions, optional health evidence, Deployment ID, timestamp and the original non-secret Release reference. The rollback SPI is also used for compensation; these are Component events, not assertions that a whole multi-Component Deployment succeeded. A failed health check followed by internal restoration does not assert a new healthy observation. Historical Destination revisions, endpoint fingerprints and capabilities come only from actual records, never from today's context or the manifest.
+
+Append validates the marker and path ancestry, rejects symlink/shared-hardlink files, pins a verified file descriptor and uses append-only writes without truncation or locks. A leading newline isolates an earlier torn tail. Reads accept a bounded prefix (48 KiB per file, 8 KiB per line, 128 records total); identical event IDs deduplicate, conflicting IDs are excluded, and missing, malformed, unsupported or omitted evidence makes history explicitly incomplete. Missing audit never removes verified archive inventory. Audit data contains no connection settings, credentials, remote paths, URLs or raw command output. Preflight checks GNU `timeout`/`dd` features and read-only `/proc/self/fd` access before building or uploading; there is no new server runtime.
+
+A Prepare audit failure stops before activation. After activation or rollback has taken effect, an audit failure adds a bounded, redacted warning without replacing the known receipt, suppressing compensation or triggering the local-durability failure policy below. Remote audit operations have a 30-second local deadline and a 25-second server deadline with a two-second kill grace. This auxiliary history is not a transaction log for recovery decisions; reconciliation, safe retention and TUI history management remain subsequent work packages.
+
+### Local journal
 
 SQLite is authoritative for local Deployment intent, Steps, per-Component Release receipts and observations, logs, and recovery progress. Numbered migrations run transactionally and reject newer schemas. Deployment state updates use compare-and-set semantics; each external effect requires a pending intent row before execution and exactly one redacted outcome afterward. SQLite uses foreign keys, WAL, and full synchronous durability. Raw sanitized output drains into per-Deployment bounded rolling files; Unix database and log files use mode `0600`. UI notifications use bounded channels and may coalesce progress; terminal states and errors are never dropped.
 

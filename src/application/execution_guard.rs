@@ -167,6 +167,13 @@ impl DeploymentDriver for GuardedDriver {
         self.inner.current(context).await
     }
 
+    async fn inventory(
+        &self,
+        context: &ComponentExecutionContext,
+    ) -> Result<crate::drivers::ComponentInventory, DriverError> {
+        self.inner.inventory(context).await
+    }
+
     async fn prepare(
         &self,
         deployment: &DeploymentId,
