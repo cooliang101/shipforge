@@ -863,7 +863,7 @@ async fn initialization_and_cancellation_persistence_failures_retain_both_errors
     assert!(
         persistence
             .unwrap()
-            .contains("cancellation persistence failure")
+            .contains("initialization cancellation could not be persisted")
     );
     let recorded = fixture.history.deployment(&deployment).unwrap().unwrap();
     assert_eq!(recorded.state, DeploymentState::Created);
@@ -1029,7 +1029,7 @@ async fn auxiliary_compensation_write_failures_do_not_interrupt_other_recovery()
 #[tokio::test]
 async fn terminal_persistence_failure_retains_known_successful_rollback_report() {
     let fixture = Fixture::new();
-    fixture.inject_history_failure("CREATE TRIGGER fail_results BEFORE INSERT ON component_results BEGIN SELECT RAISE(FAIL,'result failure'); END; CREATE TRIGGER fail_terminal BEFORE UPDATE OF state ON deployments WHEN OLD.kind='rollback' AND NEW.state='succeeded' BEGIN SELECT RAISE(FAIL,'terminal failure'); END;");
+    fixture.inject_history_failure("CREATE TRIGGER fail_results BEFORE INSERT ON component_results BEGIN SELECT RAISE(FAIL,'UNREGISTERED_SQL_SECRET /private/history.sqlite3 result failure'); END; CREATE TRIGGER fail_terminal BEFORE UPDATE OF state ON deployments WHEN OLD.kind='rollback' AND NEW.state='succeeded' BEGIN SELECT RAISE(FAIL,'UNREGISTERED_SQL_SECRET /private/history.sqlite3 terminal failure'); END;");
     let report = fixture.rollback().await;
     assert_eq!(report.deployment.state, DeploymentState::Succeeded);
     assert!(report.failure.is_none());
@@ -1042,6 +1042,101 @@ async fn terminal_persistence_failure_retains_known_successful_rollback_report()
             .all(|result| result.outcome == ComponentOutcome::Succeeded)
     );
     assert_eq!(report.warnings.len(), 4);
+    assert_safe_history_warnings(&report);
+    assert_eq!(
+        fixture
+            .history
+            .deployment(&report.deployment.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DeploymentState::Running
+    );
+}
+
+fn assert_safe_history_warnings(report: &RollbackReport) {
+    assert!(!report.warnings.is_empty());
+    for warning in &report.warnings {
+        assert!(warning.contains("local history persistence failed"));
+        assert!(warning.contains("inspect durable history before retrying"));
+        assert!(!warning.contains("UNREGISTERED_SQL_SECRET"));
+        assert!(!warning.contains("/private/history.sqlite3"));
+    }
+    let diagnostic = format!("{report:?}");
+    assert!(!diagnostic.contains("UNREGISTERED_SQL_SECRET"));
+    assert!(!diagnostic.contains("/private/history.sqlite3"));
+}
+
+#[tokio::test]
+async fn sqlite_error_details_never_leak_while_compensation_and_pending_evidence_are_retained() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure(
+        "CREATE TRIGGER fail_completion BEFORE UPDATE OF status ON operation_intents
+         BEGIN SELECT RAISE(FAIL,'UNREGISTERED_SQL_SECRET /private/history.sqlite3 completion'); END;
+         CREATE TRIGGER fail_compensation_observation BEFORE INSERT ON deployment_observations
+         WHEN NEW.stage LIKE 'compensation-%'
+         BEGIN SELECT RAISE(FAIL,'UNREGISTERED_SQL_SECRET /private/history.sqlite3 observation'); END;
+         CREATE TRIGGER fail_results BEFORE INSERT ON component_results
+         BEGIN SELECT RAISE(FAIL,'UNREGISTERED_SQL_SECRET /private/history.sqlite3 results'); END;
+         CREATE TRIGGER fail_terminal BEFORE UPDATE OF state ON deployments
+         WHEN OLD.kind='rollback' AND NEW.state='failed'
+         BEGIN SELECT RAISE(FAIL,'UNREGISTERED_SQL_SECRET /private/history.sqlite3 terminal'); END;",
+    );
+    let report = fixture.rollback().await;
+    assert_eq!(
+        fixture.actions(),
+        ["rollback:worker->not_deployed", "rollback:worker->v3"]
+    );
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert!(report.failure.is_some());
+    assert!(report.compensation_failures.is_empty());
+    let worker = ComponentName::parse("worker").unwrap();
+    let result = &report.deployment.components[&worker];
+    assert_eq!(result.outcome, ComponentOutcome::Compensated);
+    assert_eq!(result.observed_release.as_ref().unwrap().as_str(), "v3");
+    assert_eq!(
+        fixture.state.lock().unwrap().current[&worker]
+            .version
+            .as_str(),
+        "v3"
+    );
+    assert_eq!(report.warnings.len(), 8);
+    assert_safe_history_warnings(&report);
+    for operation in [
+        "complete Rollback intent",
+        "compensation-before-mutation",
+        "compensation-receipt",
+        "complete Rollback compensation intent",
+        "persist Rollback Component result",
+        "persist Rollback terminal state",
+    ] {
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(operation))
+        );
+    }
+    let pending = fixture
+        .history
+        .pending_intents(&report.deployment.id)
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|intent| intent.component == worker));
+    assert_eq!(
+        pending
+            .iter()
+            .map(|intent| intent.stage.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["compensate", "rollback"])
+    );
+    assert!(
+        fixture
+            .history
+            .component_results(&report.deployment.id)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         fixture
             .history

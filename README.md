@@ -4,7 +4,9 @@ ShipForge is a Rust TUI for building local project Components and deploying thei
 
 ## Development status
 
-M1's safe deployment loop has passed acceptance, but this is not a production-ready release. Setup, deployment planning, live logs, cancellation, and the core rollback service are implemented. Real two-Destination deployment and [WSL systemd lifecycle tests](docs/validation/systemd-acceptance.md) pass. M2 now provides [local detailed history](docs/validation/his-01.md), [remote Release inventory and audit](docs/validation/his-02.md), [read-only reconciliation with startup attention](docs/validation/rec-01.md), and [automatic Release retention](docs/validation/ret-01.md). History/recovery management screens, final TUI hardening, and the complete platform matrix remain on the [roadmap](docs/roadmap.md).
+M1's safe deployment loop and M2's history/recovery management have passed their scoped acceptance, but this is not a production-ready release. Setup, deployment planning, live logs, cancellation, and rollback are implemented. Real two-Destination deployment and [WSL systemd lifecycle tests](docs/validation/systemd-acceptance.md) pass. M2 provides [detailed history](docs/validation/his-01.md), [remote inventory and audit](docs/validation/his-02.md), [read-only reconciliation](docs/validation/rec-01.md), [Release retention](docs/validation/ret-01.md), and [project/connection and history management](docs/validation/tui-mgt-01.md).
+
+An early real SSH connection timeout and a separate unknown current observation remain unexplained despite passing subsequent tests; a common cause is unproven. Their evidence and diagnostics are retained for platform validation. M3 TUI hardening and M4 security, platform, packaging and final MVP acceptance remain on the [roadmap](docs/roadmap.md).
 
 ## Run locally
 
@@ -30,5 +32,6 @@ Run `cargo audit` separately with the cargo-audit tool installed. Default tests 
 ## Reference
 
 - [Configuration guide](docs/configuration-guide.md) — canonical, TUI-managed configuration.
+- [TUI guide](docs/tui-guide.md) — project editing, connections, history, inspection, and explicit rollback.
 - [Requirements](docs/requirements.md) and [architecture](docs/architecture.md) — MVP scope and boundaries.
 - [Contributor guide](AGENTS.md) — style, safety, testing, and per-work-package commits.

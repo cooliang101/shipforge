@@ -91,7 +91,7 @@ environments:
 
 ## 默认值
 
-- Component 工作目录默认为 `./<component-name>`。
+- Component 工作目录默认为 `./<component-name>`；`artifact` 相对于该工作目录，而非固定相对于 Project 根目录。
 - `artifact: dist` 始终只是一个构建输出路径；构建后自动识别文件或目录，不存在或为空时报错。用户无需填写产物类型。
 - Destination ID 由系统生成且不可变，例如 `dst_…0002`；TUI 直接显示 `deploy@app.example.com:22` 等端点摘要，不要求填写连接名称，也不提供别名字段。
 - Project、Environment、Component 使用配置名称；Destination 在项目 YAML 中只使用系统 ID，TUI 自动显示 `user@host:port` 摘要。
@@ -115,7 +115,10 @@ environments:
 - 选择 SSH Key 只更新用户级凭据引用，不得把 Key 路径复制到项目配置。
 - 通过 TUI 修改某 Component 的 Destination ID 或 root 时，由系统增加该 Environment/Component 的 generation。
 - Project 或 Environment 重命名应保留稳定 ID 和已固化 root。
+- 编辑已有目标时，root 留空表示继续使用原固化 root；只有新增目标使用默认 root。要迁移部署目录必须显式填写新 root，并由系统更新 generation。
 - Component 名称就是其配置身份；重命名按删除旧 Component、增加新 Component 处理，不继承旧 Release。
 - 新增 Environment 时，只配置该环境确实需要部署的 Component。
 - 版本控制应保留 `_shipforge`，但绝不提交用户级 Destination 注册表或凭据。
 - 计划必须展示所选 Component、Destination、root、服务、健康检查及依赖顺序，供用户在远端副作用前确认。
+
+已有项目从概览的 `e` 进入草稿编辑；逐层 Apply 后按 `p` 预览完整 YAML，再以 `c` 确认保存。保存前会复核原文件和连接快照，检测到变化则停止。保存期间避免其他编辑器同时写入，不承诺外部并发写入的原子隔离。操作与取消说明见 [TUI 使用指南](tui-guide.md)。

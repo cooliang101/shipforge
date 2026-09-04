@@ -1,11 +1,12 @@
 #requires -Version 7.0
 param(
     [string]$Distribution = 'Ubuntu-22.04',
-    [ValidateSet('All', 'Deployment', 'Retention', 'AutomaticRetention')]
+    [ValidateSet('All', 'Deployment', 'Retention', 'AutomaticRetention', 'Management', 'ConnectionStability')]
     [string]$Suite = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'run-linux-acceptance-diagnostics.ps1')
 $runId = [guid]::NewGuid().ToString('N')
 $image = "shipforge-m1-fixture:$runId"
 $imageBuilt = $false
@@ -155,6 +156,12 @@ try {
         if ($Suite -in @('All', 'AutomaticRetention')) {
             $cases += 'real_linux_automatic_retention_keeps_latest_five'
         }
+        if ($Suite -in @('All', 'Management')) {
+            $cases += 'management_acceptance::real_linux_management_history_rollback_and_connections'
+        }
+        if ($Suite -eq 'ConnectionStability') {
+            $cases += 'connection_stability::real_linux_fresh_connection_drop_stability'
+        }
         foreach ($case in $cases) {
             Invoke-FixtureCase -Case $case
         }
@@ -162,7 +169,7 @@ try {
 } catch {
     $operationError = $_
     foreach ($container in $containers) {
-        try { & wsl.exe -d $Distribution --exec docker -H unix:///var/run/docker.sock logs --tail 60 $container 2>&1 | Out-Host }
+        try { Get-FixtureDiagnostics -Container $container -RunId $runId -Distribution $Distribution | Out-Host }
         catch { Write-Warning "Could not read diagnostics for $container" }
     }
 } finally {

@@ -20,6 +20,10 @@ mod recovery;
 pub use recovery::*;
 mod retention;
 pub use retention::RetentionHistory;
+mod read_only;
+pub use read_only::DeploymentDetails;
+mod destination_references;
+pub use destination_references::DestinationReferenceSummary;
 
 const LATEST_SCHEMA_VERSION: u32 = 6;
 const MIGRATION_1: &str = r"

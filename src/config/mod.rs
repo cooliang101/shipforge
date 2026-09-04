@@ -29,8 +29,8 @@ pub use model::{
 use model::{ManagedEnvironment, RawEnvironment, RawProjectConfig};
 pub use setup::{
     ComponentSetup, EnvironmentRename, EnvironmentSetup, PreparedProjectInitialization,
-    ProjectSetup, ReinitializeConfirmation, TargetSetup, default_remote_root, initialize,
-    prepare_initialize, reinitialize, update,
+    PreparedProjectUpdate, ProjectSetup, ReinitializeConfirmation, TargetSetup,
+    default_remote_root, initialize, prepare_initialize, prepare_update, reinitialize, update,
 };
 use thiserror::Error;
 
@@ -159,10 +159,22 @@ pub fn load(project_root: &Path) -> Result<ProjectConfigState, ConfigError> {
         Err(source) => return Err(ConfigError::Read { path, source }),
     };
 
-    crate::telemetry::detect_sensitive_config(&contents)?;
+    parse_contents(project_root, &contents).map(ProjectConfigState::Loaded)
+}
+
+/// Validates one already-read configuration snapshot without reopening the file.
+///
+/// # Errors
+/// Returns the same validation errors as [`load`]. Never writes configuration.
+pub(crate) fn parse_contents(
+    project_root: &Path,
+    contents: &str,
+) -> Result<ProjectConfig, ConfigError> {
+    let path = project_root.join(PROJECT_FILE);
+    crate::telemetry::detect_sensitive_config(contents)?;
     let raw: RawProjectConfig =
-        serde_yaml_ng::from_str(&contents).map_err(|source| ConfigError::Yaml { path, source })?;
-    normalize(raw).map(ProjectConfigState::Loaded)
+        serde_yaml_ng::from_str(contents).map_err(|source| ConfigError::Yaml { path, source })?;
+    normalize(raw)
 }
 
 fn normalize(raw: RawProjectConfig) -> Result<ProjectConfig, ConfigError> {

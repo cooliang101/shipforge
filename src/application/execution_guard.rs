@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::{
     config::{DestinationRegistry, DestinationRevisionRecord, ProjectConfig, ProjectConfigState},
-    domain::{DeploymentId, DestinationKey, DriverCapabilities},
+    domain::{DeploymentId, DestinationKey, DestinationRevision, DriverCapabilities},
     drivers::{
         ActivationReceipt, CleanupReport, ComponentExecutionContext, ComponentPlan,
         ComponentRequest, DeploymentDriver, DriverDestinationInput, DriverError, DriverKind,
@@ -23,6 +23,7 @@ pub(super) struct ExecutionGuard {
     project: ProjectConfig,
     destinations_path: PathBuf,
     destinations: BTreeMap<DestinationKey, DestinationRevisionRecord>,
+    historical: BTreeMap<(DestinationKey, DestinationRevision), DestinationRevisionRecord>,
 }
 
 impl ExecutionGuard {
@@ -37,6 +38,25 @@ impl ExecutionGuard {
             project,
             destinations_path,
             destinations,
+            historical: BTreeMap::new(),
+        }
+    }
+
+    /// Historical rollback still freezes the latest registry choices, and also
+    /// pins every actually used revision without rewriting old Release refs.
+    pub(super) fn new_historical(
+        project_root: PathBuf,
+        project: ProjectConfig,
+        destinations_path: PathBuf,
+        destinations: BTreeMap<DestinationKey, DestinationRevisionRecord>,
+        historical: BTreeMap<(DestinationKey, DestinationRevision), DestinationRevisionRecord>,
+    ) -> Self {
+        Self {
+            project_root,
+            project,
+            destinations_path,
+            destinations,
+            historical,
         }
     }
 
@@ -66,6 +86,11 @@ impl ExecutionGuard {
             .any(|(key, record)| registry.resolve(key) != Some(record))
         {
             return Err("A selected Destination changed or disappeared");
+        }
+        if self.historical.iter().any(|((key, revision), record)| {
+            registry.resolve_revision(key, *revision) != Some(record)
+        }) {
+            return Err("A selected historical Destination revision changed or disappeared");
         }
         Ok(())
     }

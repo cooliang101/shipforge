@@ -14,7 +14,7 @@
 
 `TUI-DEP-01` 已实现并通过自动化工作包验收：Environment/Component 选择、只读预检、含 Git 和目标信息的计划预览、显式确认、后台构建和发布、实时脱敏日志、安全取消、逐 Component 结果及人工恢复指引均已接通。构建与远端操作共用 Deployment ID；每次 Driver 写操作前复核配置，上传前检查实际解压容量及远端状态。日志故障触发安全取消，但不覆盖已知部署结果；终端错误退出也等待恢复边界。验证范围和已知限制见 [TUI-DEP-01 验收记录](validation/tui-dep-01.md)。
 
-**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；下一阶段为 M2，M2/M3/M4 尚未完成。
+**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；M2 已验收，下一阶段为 M3，完整 MVP 尚未完成。
 
 WSL Linux 客户端已通过原生单测（含 Unix 继承管道回归）、协议测试、编译及正常启动/退出冒烟；范围见 [Linux 客户端验证](validation/linux-client.md)。这不等于真实 systemd 验收或全部平台支持。
 
@@ -79,7 +79,9 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 `REC-01` 已完成只读对账应用服务、独立不可变报告、历史修订校验、远端暂存残留诊断及 TUI 启动本地待核实提示。不重放旧意图、不改写原结果，也不从远端重建 YAML。独立审查、426 项单测、6 项协议测试、15 个真实子进程退出/模拟副作用场景和 486.50 秒双 Linux 验收通过；完整范围见 [REC-01 记录](validation/rec-01.md)。
 
-`RET-01` 已实现并验收：成功部署后默认保留最新 5 个版本及受保护引用，以原始包证据和逐版本持久意图授权精确清理；部分失败保留路径事实，未知结果保持 pending，不补偿成功部署。独立审查、Windows/Linux 全量门禁、原生删除脚本、真实权限失败/重试及六次经正式应用流程的测试发布触发默认清理均通过；完整范围见 [RET-01 记录](validation/ret-01.md)。下一工作包是 `TUI-MGT-01`；完整历史/恢复管理界面仍待实施，M2 和完整 MVP 尚未完成。
+`RET-01` 已实现并验收：成功部署后默认保留最新 5 个版本及受保护引用，以原始包证据和逐版本持久意图授权精确清理；部分失败保留路径事实，未知结果保持 pending，不补偿成功部署。独立审查、Windows/Linux 全量门禁、原生删除脚本、真实权限失败/重试及六次经正式应用流程的测试发布触发默认清理均通过；完整范围见 [RET-01 记录](validation/ret-01.md)。
+
+`TUI-MGT-01` 已实现并验收项目配置编辑、连接管理、本地历史/日志、显式库存检查、检查报告和所选 Component 回滚入口，包含已删除 Environment 的只读历史入口。交叉审查、Windows 597 / Linux 609 项单测、各 8 项协议与 1 项中断父用例、双平台 Clippy/格式/release 构建，以及阶段诊断补强后的四轮真实 Management 用例均通过。独立百次连接用例提供额外基线，早期连接超时根因仍未知，保留为 QA-01 发行风险，不宣称已定位修复。范围与证据见 [管理功能验收记录](validation/tui-mgt-01.md)，使用方式见 [TUI 指南](tui-guide.md)。M2 已完成，M3、M4 和完整 MVP 尚未完成。
 
 - `HIS-01`：扩展 SQLite Deployment、Step、逐 Component Release Receipt、Environment Observation、Component generation、能力快照及日志索引模型。
 - `HIS-02`：实现 `linux-ssh` Release 库存重建和追加式远端 JSONL 审计记录；Release manifest 由 `ART-01` 创建，由 `REL-01` 和恢复流程读取。
@@ -92,7 +94,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 ## M3：Ratatui 交互加固
 
 - `TUI-01`：统一项目、Environment、Component、Destination、目标可用操作和生产环境确认的呈现与导航；不向用户暴露 Driver 名称或能力标识符。
-- `TUI-02`：完善选择优先的候选列表、空状态、加载状态、可恢复错误、键盘帮助和无障碍配色。
+- `TUI-02`：完善选择优先的候选列表、空状态、加载状态、可恢复错误、键盘帮助和无障碍配色；补齐损坏 `_shipforge` 经明确确认后重新初始化的 TUI 入口，复用已有底层 API，不从远端恢复配置。
 - `TUI-03`：完善步骤进度、耗时、有界日志窗口、历史加载、搜索、筛选、复制和导出体验。
 - `TUI-04`：完善发布历史、回滚、环境检查和恢复页面的一致性。
 - `TUI-05`：加固运行中退出对话框、安全取消和中断处理。
@@ -102,7 +104,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ## M4：发布加固
 
-- `QA-01`：完成确认后的 Windows、macOS、Linux 编译及 smoke test 矩阵。
+- `QA-01`：完成确认后的 Windows、macOS、Linux 编译及 smoke test 矩阵；复核 TUI-MGT-01 早期未定位 SSH 连接超时，在阶段化诊断证据基础上给出支持条件与发行结论，不把单次复跑通过当作根因修复。
 - `QA-02`：对路径穿越、Shell 注入、Host Key、凭据、日志和归档权限做安全审查。
 - `QA-03`：验证 Driver SPI 契约、Project/Environment ID、Destination ID/revision、Component generation、配置兼容、远端元数据前向兼容和安装升级。
 - `REL-03`：生成 ShipForge 单文件可执行程序与 SHA-256，编写安装、升级、回滚和排障文档。

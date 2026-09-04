@@ -116,15 +116,26 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(frame.area());
     render_screen(frame, areas[0], app);
-    let help = if app.deployment_session.is_active() {
+    let help = if app.deployment_session.is_active()
+        && !matches!(
+            app.screen,
+            Screen::Management(_) | Screen::Connections(_) | Screen::ProjectEdit(_)
+        ) {
         "Deployment active   return to progress or cancel safely"
     } else {
         match &app.screen {
-            Screen::Projects => "↑/↓ select   Enter open   o browse   q quit",
+            Screen::Management(screen) => screen.help(),
+            Screen::Connections(screen) => screen.help(),
+            Screen::ProjectEdit(screen) => screen.help(),
+            Screen::Projects => {
+                "↑/↓ select   Enter open   o browse   c connections   x unregister project   q quit"
+            }
             Screen::Browser(_) => {
                 "↑/↓ select   Enter enter directory   Backspace parent   s select root   Esc back"
             }
-            Screen::Overview { .. } => "d deploy   Esc projects   q quit",
+            Screen::Overview { .. } => {
+                "d deploy   m history / Releases   e edit configuration   Esc projects   q quit"
+            }
             Screen::DeploySelection(_) => {
                 "←/→ Environment   ↑/↓ Component   Space toggle   Enter check   Esc overview"
             }
@@ -171,8 +182,10 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         |message| {
             Line::from(vec![
                 Span::styled(
-                    "Error: ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    "Message: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(message),
             ])
@@ -183,34 +196,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
 fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     match &app.screen {
+        Screen::Management(screen) => screen.render(frame, area),
+        Screen::Connections(screen) => screen.render(frame, area),
+        Screen::ProjectEdit(screen) => screen.render(frame, area),
         Screen::Projects => render_projects(frame, area, app),
-        Screen::Browser(browser) => {
-            let mut lines = vec![Line::from(format!(
-                "Current: {}",
-                browser.directory.display()
-            ))];
-            if browser.children.is_empty() {
-                lines.push(Line::from("  No child directories"));
-            } else {
-                lines.extend(browser.children.iter().enumerate().map(|(index, path)| {
-                    selected_line(
-                        index == browser.selected,
-                        &path.file_name().map_or_else(
-                            || path.display().to_string(),
-                            |name| name.to_string_lossy().into(),
-                        ),
-                    )
-                }));
-            }
-            let content = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title(" Select project directory ")
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: false });
-            frame.render_widget(content, area);
-        }
+        Screen::Browser(browser) => render_project_browser(frame, area, browser),
         Screen::Overview { root, config } => {
             let mut content = format!(
                 "Project: {}\nRoot: {}\nComponents: {}\nEnvironments: {}\n\nConfiguration loaded successfully.",
@@ -280,6 +270,38 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             );
         }
     }
+}
+
+fn render_project_browser(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    browser: &app::DirectoryBrowser,
+) {
+    let mut lines = vec![Line::from(format!(
+        "Current: {}",
+        browser.directory.display()
+    ))];
+    if browser.children.is_empty() {
+        lines.push(Line::from("  No child directories"));
+    } else {
+        lines.extend(browser.children.iter().enumerate().map(|(index, path)| {
+            selected_line(
+                index == browser.selected,
+                &path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into(),
+                ),
+            )
+        }));
+    }
+    let content = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Select project directory ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(content, area);
 }
 
 fn render_deploy_selection(

@@ -5,12 +5,13 @@ mod store;
 
 pub use logs::{RollingLogError, RollingLogWriter};
 pub use store::{
-    CurrentAlignment, DeploymentComponentSnapshot, DeploymentKind, DeploymentLogRecord,
-    DeploymentMetadata, DeploymentQuery, DeploymentRecord, GitWorktree, HistoryError, HistoryStore,
-    InspectionScope, IntentId, IntentRecord, IntentStatus, LocalAttentionSummary,
-    ObservationRecord, PackageAlignment, PersistedComponentResult, RecoveryBasis,
-    RecoveryComponentReport, RecoveryQuery, RecoveryReport, ReleasePackageRecord,
-    ReleaseReceiptRecord, RetentionHistory, StepRecord, StepStatus,
+    CurrentAlignment, DeploymentComponentSnapshot, DeploymentDetails, DeploymentKind,
+    DeploymentLogRecord, DeploymentMetadata, DeploymentQuery, DeploymentRecord,
+    DestinationReferenceSummary, GitWorktree, HistoryError, HistoryStore, InspectionScope,
+    IntentId, IntentRecord, IntentStatus, LocalAttentionSummary, ObservationRecord,
+    PackageAlignment, PersistedComponentResult, RecoveryBasis, RecoveryComponentReport,
+    RecoveryQuery, RecoveryReport, ReleasePackageRecord, ReleaseReceiptRecord, RetentionHistory,
+    StepRecord, StepStatus,
 };
 
 /// Returns the platform-local history database path.

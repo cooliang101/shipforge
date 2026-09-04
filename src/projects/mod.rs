@@ -74,8 +74,12 @@ impl ProjectRegistry {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(source) => return Err(ProjectRegistryError::io(path, source)),
         };
+        Self::from_yaml(path, &contents)
+    }
+
+    pub(crate) fn from_yaml(path: &Path, contents: &str) -> Result<Self, ProjectRegistryError> {
         let registry: Self =
-            serde_yaml_ng::from_str(&contents).map_err(|source| ProjectRegistryError::Yaml {
+            serde_yaml_ng::from_str(contents).map_err(|source| ProjectRegistryError::Yaml {
                 path: path.to_owned(),
                 source,
             })?;
@@ -113,6 +117,14 @@ impl ProjectRegistry {
                 project,
             })
             .collect()
+    }
+
+    /// Removes only this exact recent-project registration, including unavailable roots.
+    /// Does not inspect or modify the Project directory, YAML, or deployment history.
+    pub fn unregister(&mut self, root: &Path) -> bool {
+        let count = self.projects.len();
+        self.projects.retain(|project| project.root != root);
+        self.projects.len() != count
     }
 
     fn touch(&mut self, root: PathBuf, opened_at_unix_ms: u64) {

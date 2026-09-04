@@ -243,6 +243,76 @@ struct Fixture {
     guard: Arc<ExecutionGuard>,
 }
 
+fn historical_guard(fixture: &mut Fixture) -> (ExecutionGuard, DestinationKey) {
+    let key = fixture.project.environments["production"].components
+        [&ComponentName::parse("frontend").unwrap()]
+        .destination
+        .clone();
+    let old = fixture.registry.resolve(&key).unwrap().clone();
+    let mut settings = old.settings.clone();
+    let DestinationSettings::LinuxSsh { host, .. } = &mut settings;
+    *host = "new-target.invalid".into();
+    let latest = fixture.registry.revise(&key, settings).unwrap().clone();
+    fixture.registry.save(&fixture.registry_path).unwrap();
+    let guard = ExecutionGuard::new_historical(
+        fixture.directory.path().to_owned(),
+        fixture.project.clone(),
+        fixture.registry_path.clone(),
+        BTreeMap::from([(key.clone(), latest.clone())]),
+        BTreeMap::from([
+            ((key.clone(), old.revision), old),
+            ((key.clone(), latest.revision), latest),
+        ]),
+    );
+    (guard, key)
+}
+
+#[test]
+fn historical_guard_pins_multiple_used_revisions_without_weakening_latest_guard() {
+    let mut fixture = Fixture::new();
+    let (guard, key) = historical_guard(&mut fixture);
+    assert!(
+        fixture.guard.validate().is_err(),
+        "ordinary deployment still rejects latest drift"
+    );
+    assert!(guard.validate().is_ok());
+    assert_eq!(guard.historical.len(), 2);
+    let mut changed = fixture.registry.resolve(&key).unwrap().settings.clone();
+    let DestinationSettings::LinuxSsh { port, .. } = &mut changed;
+    *port = 2222;
+    fixture.registry.revise(&key, changed).unwrap();
+    fixture.registry.save(&fixture.registry_path).unwrap();
+    assert!(guard.validate().is_err());
+}
+
+#[test]
+fn historical_guard_rejects_used_revision_removal_or_replacement() {
+    for remove in [false, true] {
+        let mut fixture = Fixture::new();
+        let (guard, key) = historical_guard(&mut fixture);
+        let mut value = serde_yaml_ng::to_value(&fixture.registry).unwrap();
+        let revisions = value["destinations"][key.as_str()]["revisions"]
+            .as_sequence_mut()
+            .unwrap();
+        if remove {
+            revisions.remove(0);
+        } else {
+            let latest = revisions[1].clone();
+            revisions[0] = latest;
+            revisions[0]["revision"] = serde_yaml_ng::Value::Number(1.into());
+        }
+        std::fs::write(
+            &fixture.registry_path,
+            serde_yaml_ng::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            guard.validate().is_err(),
+            "old revision must never fall back to latest"
+        );
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();

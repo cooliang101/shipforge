@@ -257,12 +257,15 @@ impl DestinationRegistry {
                 });
             }
         };
-        let registry: Self = serde_yaml_ng::from_str(&contents).map_err(|source| {
-            DestinationRegistryError::Yaml {
+        Self::from_yaml(path, &contents)
+    }
+
+    pub(crate) fn from_yaml(path: &Path, contents: &str) -> Result<Self, DestinationRegistryError> {
+        let registry: Self =
+            serde_yaml_ng::from_str(contents).map_err(|source| DestinationRegistryError::Yaml {
                 path: path.to_owned(),
                 source,
-            }
-        })?;
+            })?;
         registry.validate()?;
         Ok(registry)
     }

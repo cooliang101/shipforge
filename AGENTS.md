@@ -44,4 +44,6 @@ Use imperative Conventional Commits, such as `feat: validate release paths`; the
 
 Never store secrets in `shipforge.yaml`. Validate SSH host keys, separate arguments from Shell text, redact Driver data, and preserve protected Component Releases.
 
+History browsing must not create or migrate storage. Public errors must not echo raw parser/SQLite diagnostics; retain operation context and known outcomes. Require unmodified confirmation keys, and wait for tracked workers before leaving or exiting.
+
 History rules are in `docs/architecture.md`: distinguish unknown from absent and retain known outcomes on persistence failures. Keep `recovery_reports`/`recovery_report_components` and `deployment_revisions` separate from original outcomes; never complete old intents or reconstruct missing YAML/history. Inventory is not health or historical endpoint proof; auxiliary JSONL must not prevent compensation. Cleanup needs original package evidence and a fresh per-version intent; unknown outcomes stay pending, and cleanup failure never compensates a successful deployment.

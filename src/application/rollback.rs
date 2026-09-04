@@ -179,7 +179,7 @@ impl<'a> RollbackOrchestrator<'a> {
                         .map_err(Into::into)
                 })
                 .err()
-                .map(|error| self.redactor.redact(&error.to_string()));
+                .map(|_| "Rollback initialization cancellation could not be persisted; inspect durable history before retrying".to_owned());
             return Err(OrchestrationError::Execution {
                 deployment: deployment.id,
                 source: Box::new(source),
@@ -370,12 +370,9 @@ impl<'a> RollbackOrchestrator<'a> {
                 timestamp,
             )?)
         });
-        let intent = match intent {
-            Ok(intent) => intent,
-            Err(error) => {
-                self.warning(warnings, "record Rollback intent", &error);
-                return Some(history_failure(component, OrchestrationStage::Rollback));
-            }
+        let Ok(intent) = intent else {
+            self.warning(warnings, "record Rollback intent");
+            return Some(history_failure(component, OrchestrationStage::Rollback));
         };
         let context = execution_context(&component.context, cancellation.clone());
         let result = component
@@ -420,12 +417,15 @@ impl<'a> RollbackOrchestrator<'a> {
             );
             Some(failure)
         };
-        if let Err(error) = self.complete_intent(
-            intent,
-            result.as_ref().map(|_| ()).map_err(Clone::clone),
-            valid,
-        ) {
-            self.warning(warnings, "complete Rollback intent", &error);
+        if self
+            .complete_intent(
+                intent,
+                result.as_ref().map(|_| ()).map_err(Clone::clone),
+                valid,
+            )
+            .is_err()
+        {
+            self.warning(warnings, "complete Rollback intent");
             failure.get_or_insert_with(|| history_failure(component, OrchestrationStage::Rollback));
         }
         failure
@@ -569,27 +569,24 @@ impl<'a> RollbackOrchestrator<'a> {
                     timestamp,
                 )?)
             });
-            let intent = match intent {
-                Ok(intent) => intent,
-                Err(error) => {
-                    self.warning(warnings, "record Rollback compensation intent", &error);
-                    failures.insert(
-                        applied.name.clone(),
-                        contract_error(
-                            &applied.name,
-                            "could not persist compensation intent; no mutation attempted",
-                        ),
-                    );
-                    results.insert(
-                        applied.name.clone(),
-                        ComponentDeploymentResult {
-                            outcome: ComponentOutcome::CompensationFailed,
-                            attempted_release: target_version(component),
-                            observed_release: observed_version,
-                        },
-                    );
-                    continue;
-                }
+            let Ok(intent) = intent else {
+                self.warning(warnings, "record Rollback compensation intent");
+                failures.insert(
+                    applied.name.clone(),
+                    contract_error(
+                        &applied.name,
+                        "could not persist compensation intent; no mutation attempted",
+                    ),
+                );
+                results.insert(
+                    applied.name.clone(),
+                    ComponentDeploymentResult {
+                        outcome: ComponentOutcome::CompensationFailed,
+                        attempted_release: target_version(component),
+                        observed_release: observed_version,
+                    },
+                );
+                continue;
             };
             let (result, failure) = self
                 .compensate_one(deployment, component, applied, intent, warnings)
@@ -675,8 +672,8 @@ impl<'a> RollbackOrchestrator<'a> {
         };
         // Preserve the known result even if completing the durable intent
         // fails, and continue attempting other safely journaled recovery.
-        if let Err(error) = self.complete_intent(intent, driver_result, valid) {
-            self.warning(warnings, "complete Rollback compensation intent", &error);
+        if self.complete_intent(intent, driver_result, valid).is_err() {
+            self.warning(warnings, "complete Rollback compensation intent");
         }
         (result, failure)
     }
@@ -695,14 +692,12 @@ impl<'a> RollbackOrchestrator<'a> {
                     .then_some(default_error)
                     .flatten()
             });
-            if let Err(error) = self.history.record_component_result(
-                &deployment.id,
-                name,
-                result,
-                error,
-                &self.redactor,
-            ) {
-                self.warning(warnings, "persist Rollback Component result", &error);
+            if self
+                .history
+                .record_component_result(&deployment.id, name, result, error, &self.redactor)
+                .is_err()
+            {
+                self.warning(warnings, "persist Rollback Component result");
             }
         }
     }
@@ -713,15 +708,20 @@ impl<'a> RollbackOrchestrator<'a> {
         terminal: DeploymentState,
         warnings: &mut Vec<String>,
     ) -> Result<(), OrchestrationError> {
-        if let Err(error) = self.clock.timestamp().and_then(|timestamp| {
-            Ok(self.history.transition_deployment(
-                &deployment.id,
-                DeploymentState::Running,
-                terminal,
-                timestamp,
-            )?)
-        }) {
-            self.warning(warnings, "persist Rollback terminal state", &error);
+        if self
+            .clock
+            .timestamp()
+            .and_then(|timestamp| {
+                Ok(self.history.transition_deployment(
+                    &deployment.id,
+                    DeploymentState::Running,
+                    terminal,
+                    timestamp,
+                )?)
+            })
+            .is_err()
+        {
+            self.warning(warnings, "persist Rollback terminal state");
         }
         match terminal {
             DeploymentState::Succeeded => deployment.succeed()?,
@@ -759,14 +759,13 @@ impl<'a> RollbackOrchestrator<'a> {
                 )
                 .map_err(OrchestrationError::History)
         });
-        if let Err(error) = recorded {
+        if recorded.is_err() {
             self.warning(
                 warnings,
                 &format!(
                     "persist {stage} observation for {}",
                     component.context.component
                 ),
-                &error,
             );
             false
         } else {
@@ -787,9 +786,11 @@ impl<'a> RollbackOrchestrator<'a> {
         }
     }
 
-    fn warning(&self, warnings: &mut Vec<String>, operation: &str, error: &dyn std::fmt::Display) {
+    fn warning(&self, warnings: &mut Vec<String>, operation: &str) {
+        // SQLite triggers and filesystem errors may contain arbitrary, unregistered
+        // secrets. Only controlled operation context is safe for a public report.
         warnings.push(self.redactor.redact(&format!(
-            "{operation}: {error}; inspect durable history before retrying"
+            "{operation}: local history persistence failed; inspect durable history before retrying"
         )));
     }
 }

@@ -1,4 +1,10 @@
-//! Opt-in writes to two independently pinned disposable Linux containers only.
+//! Opt-in tests against two independently pinned disposable Linux containers only.
+
+#[path = "linux_ssh_deployment/connection_stability.rs"]
+mod connection_stability;
+
+#[path = "linux_ssh_deployment/management_acceptance.rs"]
+mod management_acceptance;
 
 use std::{
     collections::BTreeMap,
@@ -37,7 +43,7 @@ use shipforge::{
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
-    _scratch: tempfile::TempDir,
+    scratch: tempfile::TempDir,
     project: PathBuf,
     config: ProjectConfig,
     destinations: DestinationRegistry,
@@ -110,7 +116,7 @@ impl Fixture {
         let destinations_path = scratch.path().join("destinations.yaml");
         destinations.save(&destinations_path).unwrap();
         let fixture = Self {
-            _scratch: scratch,
+            scratch,
             project,
             config,
             destinations,

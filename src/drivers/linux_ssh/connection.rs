@@ -59,7 +59,7 @@ impl AuthenticatedSession {
         tokio::select! {
             () = cancellation.cancelled() => Err(SshConnectionError::Cancelled),
             result = tokio::time::timeout(timeout, operation) => {
-                result.map_err(|_| SshConnectionError::Timeout { timeout })?
+                result.map_err(|_| SshConnectionError::Timeout { timeout, phase: "remote command" })?
             }
         }
     }
@@ -166,28 +166,71 @@ pub async fn connect_authenticated(
     if cancellation.is_cancelled() {
         return Err(SshConnectionError::Cancelled);
     }
-    let operation = connect_and_authenticate(destination, credential);
+    let operation = connect_and_authenticate(destination, credential, timeout);
     tokio::select! {
         () = cancellation.cancelled() => Err(SshConnectionError::Cancelled),
-        result = tokio::time::timeout(timeout, operation) => {
-            result.map_err(|_| SshConnectionError::Timeout { timeout })?
-        }
+        result = operation => result,
     }
 }
 
 async fn connect_and_authenticate(
     destination: &LinuxSshDestination,
     credential: &SshCredential,
+    timeout: Duration,
 ) -> Result<AuthenticatedSession, SshConnectionError> {
-    let mut handle = client::connect(
-        client_config(),
-        (destination.host.as_str(), destination.port),
-        HostKeyVerifier::strict(destination.host_key.clone()),
+    // One deadline covers all stages. Diagnostics must not grant authentication
+    // a fresh timeout or weaken the confirmed Host Key check.
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
+    let mut handle = connection_phase(
+        deadline,
+        timeout,
+        "network connection and SSH handshake",
+        async {
+            client::connect(
+                client_config(),
+                (destination.host.as_str(), destination.port),
+                HostKeyVerifier::strict(destination.host_key.clone()),
+            )
+            .await
+            .map_err(|error| SshConnectionError::Protocol(error.to_string()))
+        },
     )
-    .await
-    .map_err(|error| SshConnectionError::Protocol(error.to_string()))?;
+    .await?;
+    let authenticated = connection_phase(
+        deadline,
+        timeout,
+        "credential loading and authentication",
+        authenticate(&mut handle, destination, credential),
+    )
+    .await?;
+    if !authenticated {
+        return Err(SshConnectionError::Rejected);
+    }
+    Ok(AuthenticatedSession { handle })
+}
 
-    let authenticated = match credential {
+async fn connection_phase<T>(
+    deadline: Option<tokio::time::Instant>,
+    timeout: Duration,
+    phase: &'static str,
+    operation: impl std::future::Future<Output = Result<T, SshConnectionError>>,
+) -> Result<T, SshConnectionError> {
+    // Match Tokio's effectively unbounded timeout for an unrepresentable
+    // deadline rather than panicking on a caller-provided Duration.
+    let Some(deadline) = deadline else {
+        return operation.await;
+    };
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| SshConnectionError::Timeout { timeout, phase })?
+}
+
+async fn authenticate(
+    handle: &mut client::Handle<HostKeyVerifier>,
+    destination: &LinuxSshDestination,
+    credential: &SshCredential,
+) -> Result<bool, SshConnectionError> {
+    Ok(match credential {
         SshCredential::IdentityFile { path } => {
             let path = path.clone();
             let key = tokio::task::spawn_blocking(move || russh::keys::load_secret_key(path, None))
@@ -236,11 +279,7 @@ async fn connect_and_authenticate(
                 .map_err(|error| SshConnectionError::Agent(error.to_string()))?
                 .success()
         }
-    };
-    if !authenticated {
-        return Err(SshConnectionError::Rejected);
-    }
-    Ok(AuthenticatedSession { handle })
+    })
 }
 
 fn ensure_supported_algorithm(algorithm: &Algorithm) -> Result<(), SshConnectionError> {
@@ -267,8 +306,11 @@ pub(super) fn supported_algorithm(algorithm: &Algorithm) -> bool {
 pub enum SshConnectionError {
     #[error("SSH connection was cancelled")]
     Cancelled,
-    #[error("SSH connection timed out after {timeout:?}")]
-    Timeout { timeout: Duration },
+    #[error("SSH operation timed out after {timeout:?} during {phase}")]
+    Timeout {
+        timeout: Duration,
+        phase: &'static str,
+    },
     #[error("SSH protocol or Host Key verification failed: {0}")]
     Protocol(String),
     #[error("SSH private key could not be loaded; use an unencrypted modern key or SSH Agent: {0}")]
@@ -345,5 +387,88 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(SshConnectionError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn authentication_uses_existing_deadline_instead_of_a_fresh_timeout() {
+        let timeout = Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            connection_phase::<()>(
+                Some(deadline),
+                timeout,
+                "credential loading and authentication",
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("an exhausted shared deadline must not grant another 15 seconds");
+        assert!(matches!(
+            result,
+            Err(SshConnectionError::Timeout {
+                timeout: budget,
+                phase: "credential loading and authentication",
+            }) if budget == timeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_loopback_handshake_reports_stage_without_loading_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = LinuxSshDestination {
+            driver: crate::drivers::DriverKind::linux_ssh(),
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            user: "deploy".into(),
+            host_key: crate::config::HostKeyFingerprint::parse("SHA256:test").unwrap(),
+        };
+        let credential = SshCredential::IdentityFile {
+            path: std::path::PathBuf::from("private-key-sentinel-must-not-be-loaded"),
+        };
+        let cancellation = CancellationToken::new();
+        let (result, ()) = tokio::join!(
+            connect_authenticated(
+                &destination,
+                &credential,
+                Duration::from_millis(100),
+                &cancellation,
+            ),
+            async {
+                if let Ok(Ok((socket, _))) =
+                    tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    drop(socket);
+                }
+            }
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            SshConnectionError::Timeout {
+                phase: "network connection and SSH handshake",
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("private-key-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_deadline_does_not_panic_or_discard_result() {
+        let timeout = Duration::MAX;
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
+        assert!(deadline.is_none());
+        assert_eq!(
+            connection_phase(
+                deadline,
+                timeout,
+                "network connection and SSH handshake",
+                async { Ok(42) }
+            )
+            .await
+            .unwrap(),
+            42
+        );
     }
 }

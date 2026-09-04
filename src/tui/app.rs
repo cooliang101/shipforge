@@ -13,6 +13,9 @@ use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod attention;
+mod connections;
+mod management;
+mod project_edit;
 use attention::{AttentionRequest, AttentionState, LocalAttentionGateway, TuiAttentionGateway};
 
 use crate::{
@@ -38,6 +41,9 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(super) enum Screen {
     Projects,
+    Management(management::ManagementScreen),
+    Connections(connections::ConnectionsScreen),
+    ProjectEdit(project_edit::ProjectEditScreen),
     Browser(DirectoryBrowser),
     Overview {
         root: PathBuf,
@@ -242,6 +248,9 @@ impl NewSshDestinationState {
 
 #[derive(Debug)]
 enum BackgroundEvent {
+    Management(uuid::Uuid, Result<management::ManagementPage, String>),
+    Connections(uuid::Uuid, Result<connections::ConnectionsPage, String>),
+    ProjectEdit(uuid::Uuid, Result<project_edit::ProjectEditPage, String>),
     LocalAttention(
         AttentionRequest,
         Result<crate::application::LocalAttentionSummary, String>,
@@ -380,6 +389,11 @@ pub(super) struct App {
     deployment_gateway: Arc<dyn TuiDeploymentGateway>,
     attention_gateway: Arc<dyn TuiAttentionGateway>,
     attention: AttentionState,
+    management_gateway: Arc<dyn management::ManagementGateway>,
+    management_task: Option<management::ManagementTask>,
+    connections_task: Option<connections::ConnectionsTask>,
+    project_edit_gateway: Arc<dyn project_edit::ProjectEditGateway>,
+    project_edit_task: Option<project_edit::ProjectEditTask>,
 }
 
 impl App {
@@ -434,12 +448,23 @@ impl App {
         let recent = ProjectRegistry::load(&registry_path)?.statuses();
         let credential_registry_path = destination_registry_path.with_file_name("credentials.yaml");
         let (background_sender, background_receiver) = mpsc::sync_channel(256);
+        let deployment_session = Arc::new(DeploymentSession::default());
+        let management_gateway = Arc::new(management::LocalManagementGateway {
+            destinations: destination_registry_path.clone(),
+            credentials: credential_registry_path.clone(),
+            history: destination_registry_path.with_file_name("history.sqlite3"),
+            session: Arc::clone(&deployment_session),
+        });
+        let project_edit_gateway = Arc::new(project_edit::LocalProjectEditGateway {
+            destinations: destination_registry_path.clone(),
+            session: Arc::clone(&deployment_session),
+        });
         let mut app = Self {
             screen: Screen::Projects,
             recent,
             selected_recent: 0,
             message: None,
-            deployment_session: Arc::new(DeploymentSession::default()),
+            deployment_session,
             registry_path,
             destination_registry_path,
             credential_registry_path,
@@ -452,6 +477,11 @@ impl App {
             deployment_gateway,
             attention_gateway,
             attention: AttentionState::default(),
+            management_gateway,
+            management_task: None,
+            connections_task: None,
+            project_edit_gateway,
+            project_edit_task: None,
         };
         app.refresh_attention(None);
         Ok(app)
@@ -463,6 +493,9 @@ impl App {
                 break;
             };
             match event {
+                BackgroundEvent::Management(id, result) => self.finish_management(id, result),
+                BackgroundEvent::Connections(id, result) => self.finish_connections(id, result),
+                BackgroundEvent::ProjectEdit(id, result) => self.finish_project_edit(id, result),
                 BackgroundEvent::LocalAttention(request, result) => {
                     self.finish_attention(&request, result);
                 }
@@ -579,14 +612,14 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         // In raw mode Ctrl+C is an input event, not a process signal. Never
         // let modified shortcuts fall through to plain confirmation keys.
-        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                self.request_deployment_cancellation();
-            }
+        if self.guard_key(key) {
             return false;
         }
         self.message = None;
         match self.screen.clone() {
+            Screen::Management(screen) => self.handle_management(key.code, screen),
+            Screen::Connections(screen) => self.handle_connections(key.code, screen),
+            Screen::ProjectEdit(screen) => self.handle_project_edit(key.code, screen),
             Screen::Projects => {
                 if key.code == KeyCode::Char('q') {
                     return true;
@@ -636,6 +669,8 @@ impl App {
                 KeyCode::Esc => self.show_projects(),
                 KeyCode::Char('q') => return true,
                 KeyCode::Char('d') => self.open_deployment(root, config),
+                KeyCode::Char('m') => self.open_management(root, config),
+                KeyCode::Char('e') => self.open_project_edit(root),
                 _ => {}
             },
             Screen::DeploySelection(selection) => {
@@ -676,7 +711,45 @@ impl App {
         false
     }
 
+    fn guard_key(&mut self, key: KeyEvent) -> bool {
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                self.request_deployment_cancellation();
+            }
+            return true;
+        }
+        // Shift remains available for text fields, never for confirmation.
+        if !key.modifiers.is_empty() && self.requires_plain_confirmation() {
+            return true;
+        }
+        if self.management_task.is_some()
+            || self.connections_task.is_some()
+            || self.project_edit_task.is_some()
+        {
+            if key.code == KeyCode::Esc {
+                self.request_deployment_cancellation();
+            }
+            return true;
+        }
+        false
+    }
+
+    fn requires_plain_confirmation(&self) -> bool {
+        match &self.screen {
+            Screen::SetupReview { .. }
+            | Screen::DeploymentReview { .. }
+            | Screen::HostKeyConfirm { .. } => true,
+            Screen::Management(screen) => screen.requires_plain_confirmation(),
+            Screen::Connections(screen) => screen.requires_plain_confirmation(),
+            Screen::ProjectEdit(screen) => screen.requires_plain_confirmation(),
+            _ => false,
+        }
+    }
+
     fn request_deployment_cancellation(&mut self) {
+        self.cancel_management();
+        self.cancel_connections();
+        self.cancel_project_edit();
         if let Screen::DeploymentRunning {
             cancellation,
             cancellation_requested,
@@ -698,7 +771,11 @@ impl App {
         self.request_deployment_cancellation();
         // The Running screen is set before the worker acquires its session
         // permit, so waiting on is_active alone would introduce an exit race.
-        while matches!(self.screen, Screen::DeploymentRunning { .. }) {
+        while matches!(self.screen, Screen::DeploymentRunning { .. })
+            || self.management_task.is_some()
+            || self.connections_task.is_some()
+            || self.project_edit_task.is_some()
+        {
             self.poll_background();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1579,6 +1656,8 @@ impl App {
     fn handle_projects(&mut self, key: KeyCode) {
         let item_count = self.recent.len() + 1;
         match key {
+            KeyCode::Char('c') => self.open_connections(),
+            KeyCode::Char('x') => self.preview_recent_removal(),
             KeyCode::Up => self.selected_recent = self.selected_recent.saturating_sub(1),
             KeyCode::Down => {
                 self.selected_recent = (self.selected_recent + 1).min(item_count - 1);

@@ -71,6 +71,40 @@ pub struct PreparedProjectInitialization {
     config: ProjectConfig,
 }
 
+/// Exact normalized edit bytes and identities, generated once before confirmation.
+#[derive(Clone, Debug)]
+pub struct PreparedProjectUpdate {
+    contents: String,
+    config: ProjectConfig,
+}
+
+impl PreparedProjectUpdate {
+    #[must_use]
+    pub fn preview(&self) -> &str {
+        &self.contents
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &ProjectConfig {
+        &self.config
+    }
+}
+
+/// Prepares an existing Project edit without reading or writing any files.
+/// New Environment identities are generated here, never again at confirmation.
+///
+/// # Errors
+/// Rejects invalid intent, ambiguous renames, generation overflow and sensitive data.
+pub fn prepare_update(
+    current: &ProjectConfig,
+    setup: ProjectSetup,
+    environment_renames: &[EnvironmentRename],
+) -> Result<PreparedProjectUpdate, ConfigError> {
+    let generated = GeneratedProject::from_update(setup, current, environment_renames)?;
+    let (contents, config) = prepare_generated(&generated)?;
+    Ok(PreparedProjectUpdate { contents, config })
+}
+
 impl PreparedProjectInitialization {
     #[must_use]
     pub fn preview(&self) -> &str {

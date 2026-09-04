@@ -56,6 +56,9 @@ impl App {
 
     fn attention_suppressed(&self) -> bool {
         self.deployment_session.is_active()
+            || self.management_task.is_some()
+            || self.connections_task.is_some()
+            || self.project_edit_task.is_some()
             || matches!(self.screen, Screen::DeploymentRunning { .. })
     }
 

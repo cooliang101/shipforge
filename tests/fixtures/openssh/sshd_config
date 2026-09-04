@@ -14,4 +14,4 @@ AllowTcpForwarding no
 X11Forwarding no
 PermitTunnel no
 Subsystem sftp internal-sftp
-LogLevel ERROR
+LogLevel VERBOSE
