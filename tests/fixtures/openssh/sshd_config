@@ -1,0 +1,17 @@
+Port 22
+ListenAddress 0.0.0.0
+HostKey /fixture/host_ed25519
+PidFile /run/sshd/shipforge.pid
+AuthorizedKeysFile /home/deploy/.ssh/authorized_keys
+AllowUsers deploy
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+UsePAM no
+StrictModes yes
+AllowTcpForwarding no
+X11Forwarding no
+PermitTunnel no
+Subsystem sftp internal-sftp
+LogLevel ERROR

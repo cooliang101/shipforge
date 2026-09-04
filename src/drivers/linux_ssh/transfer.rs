@@ -362,14 +362,29 @@ async fn open_sftp(session: &AuthenticatedSession) -> Result<SftpSession, String
         .handle
         .channel_open_session()
         .await
-        .map_err(|error| sanitize_remote_error(&error.to_string()))?;
+        .map_err(|error| {
+            format!(
+                "open SFTP channel: {}",
+                sanitize_remote_error(&error.to_string())
+            )
+        })?;
     channel
         .request_subsystem(true, "sftp")
         .await
-        .map_err(|error| sanitize_remote_error(&error.to_string()))?;
+        .map_err(|error| {
+            format!(
+                "request SFTP subsystem: {}",
+                sanitize_remote_error(&error.to_string())
+            )
+        })?;
     SftpSession::new(channel.into_stream())
         .await
-        .map_err(|error| sanitize_remote_error(&error.to_string()))
+        .map_err(|error| {
+            format!(
+                "initialize SFTP: {}",
+                sanitize_remote_error(&error.to_string())
+            )
+        })
 }
 
 async fn cleanup_if_created(

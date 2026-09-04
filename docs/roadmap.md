@@ -4,7 +4,7 @@
 
 本路线图覆盖 `docs/requirements.md` 的 MVP：本地 Rust 单文件程序以 Ratatui TUI 作为唯一用户入口，通过统一 Deployment Driver SPI 发布，首个且唯一交付的 Driver 是 `linux-ssh`。MVP 包含稳定身份与 Component generation、可复用 Destination、统一的带版本号 `tar.gz` Component Release、多 Component 编排及补偿回滚；无头 CLI、CI 和 AI Agent 调用不进入 MVP，不预留适配器、配置、协议或工作包。以 1 名全职开发者估算，基线为 10 周，合理范围为 8～12 周。
 
-当前状态：核心架构已收敛，M0 主体及 M1 的 `HIS-00`、`BLD-01`、`ART-01`、`SSH-02`、`REL-01`、`REL-02`、`ORC-01`、`HLT-00` 已实施。工程骨架、核心领域模型、配置加载/初始化及 generation 更新、Destination 与最近 Project 注册表、Driver SPI、应用层规划器与安全边界已有代码和测试。本地构建已覆盖 Git 预检、结构化子进程、双流排空、输出上限、超时和进程树取消；单一路径 `artifact` 会自动识别文件或目录，并由通用归档层确定性地生成一次带 manifest、大小和 SHA-256 的不可变 `tar.gz` Release。Driver `prepare` 契约只能接收核心创建且字段封装的 `ReleasePackage`。`linux-ssh` 使用 64 KiB SFTP 流式上传、单次进度、最多五次有限重试、远端 SHA-256、硬链接 no-clobber 归档、Deployment 专属暂存解压和 no-clobber 版本目录提交；随后严格观察规范 `current`，校验准备凭证与 Deployment、真实目录类型及同文件系统条件，以临时软链接加原子重命名逐 Component 激活。切换前漂移会停止且只清理本次临时链接；切换后取消或 systemd 重启失败会用独立超时恢复原版本，首次部署则移除新链接并停止服务；补偿前再次观察，拒绝覆盖外部漂移。驱动无关编排器会先持久化副作用意图并完成所有选中 Component 的 Prepare，再按所选子图拓扑顺序 Activate；失败或取消后观察失败点，将确认生效的 Component 按实际顺序逆序补偿，并把逐 Component 结果和人工恢复错误写入 SQLite。`HLT-00` 已实现 Destination 端 HTTP/HTTPS、systemd 稳定窗口和健康失败补偿。TUI 已支持最近列表、键盘目录浏览、有效 Project 直接打开、Component 发现与勾选、逐 Component 分配 Destination、滚动预览及确认写入；首次设置也已接入简单 SSH config 候选、SSH Agent/IdentityFile/文件选择、后台 Host Key 获取、显式指纹确认、严格 Host Key 下的身份认证和 Destination 自动分配。认证后会通过受限、限长、可取消的只读远端命令探测默认目录状态和 systemd unit，并在 TUI 中选择可选服务。SSH 设置通过应用服务隔离 transport 类型；root、systemd 和 Host Key 等概念明确属于 `linux-ssh`，不提升为通用 Driver 契约。真实 loopback SSH/SFTP 协议测试已覆盖握手、Host Key、公钥认证、exec、部分写入失败后的清理重试、进度、冲突、上传中取消、远端 SHA-256 成功与不匹配、完整 Release Prepare、原子激活、最终观察、远端 HTTP 健康检查、失败补偿及远端探测；外部 disposable OpenSSH 和跨平台验证保留为 `QA-01` 发布门禁。SSH 高级配置、Shared Content 和 AI Agent 控制均已移出 MVP。工作包状态应在项目跟踪系统维护，本文只定义顺序、范围和门禁。
+当前状态：核心架构已收敛，M0 主体及 M1 的 `HIS-00`、`BLD-01`、`ART-01`、`SSH-02`、`REL-01`、`REL-02`、`ORC-01`、`HLT-00` 已实施。工程骨架、核心领域模型、配置加载/初始化及 generation 更新、Destination 与最近 Project 注册表、Driver SPI、应用层规划器与安全边界已有代码和测试。本地构建已覆盖 Git 预检、结构化子进程、双流排空、输出上限、超时和进程树取消；单一路径 `artifact` 会自动识别文件或目录，并由通用归档层确定性地生成一次带 manifest、大小和 SHA-256 的不可变 `tar.gz` Release。Driver `prepare` 契约只能接收核心创建且字段封装的 `ReleasePackage`。`linux-ssh` 使用 64 KiB SFTP 流式上传、单次进度、最多五次有限重试、远端 SHA-256、硬链接 no-clobber 归档、Deployment 专属暂存解压和 no-clobber 版本目录提交；随后严格观察规范 `current`，校验准备凭证与 Deployment、真实目录类型及同文件系统条件，以临时软链接加原子重命名逐 Component 激活。切换前漂移会停止且只清理本次临时链接；切换后取消或 systemd 重启失败会用独立超时恢复原版本，首次部署则移除新链接并停止服务；补偿前再次观察，拒绝覆盖外部漂移。驱动无关编排器会先持久化副作用意图并完成所有选中 Component 的 Prepare，再按所选子图拓扑顺序 Activate；失败或取消后观察失败点，将确认生效的 Component 按实际顺序逆序补偿，并把逐 Component 结果和人工恢复错误写入 SQLite。`HLT-00` 已实现 Destination 端 HTTP/HTTPS、systemd 稳定窗口和健康失败补偿。TUI 已支持最近列表、键盘目录浏览、有效 Project 直接打开、Component 发现与勾选、逐 Component 分配 Destination、滚动预览及确认写入；首次设置也已接入简单 SSH config 候选、SSH Agent/IdentityFile/文件选择、后台 Host Key 获取、显式指纹确认、严格 Host Key 下的身份认证和 Destination 自动分配。认证后会通过受限、限长、可取消的只读远端命令探测默认目录状态和 systemd unit，并在 TUI 中选择可选服务。SSH 设置通过应用服务隔离 transport 类型；root、systemd 和 Host Key 等概念明确属于 `linux-ssh`，不提升为通用 Driver 契约。真实 loopback SSH/SFTP 协议测试已覆盖握手、Host Key、公钥认证、exec、部分写入失败后的清理重试、进度、冲突、上传中取消、远端 SHA-256 成功与不匹配、完整 Release Prepare、原子激活、最终观察、远端 HTTP 健康检查、失败补偿及远端探测；剩余外部 OpenSSH 认证、传输/命令取消、Host Key 轮换及跨平台矩阵保留为 `QA-01` 发布门禁。SSH 高级配置、Shared Content 和 AI Agent 控制均已移出 MVP。工作包状态应在项目跟踪系统维护，本文只定义顺序、范围和门禁。
 
 `HLT-00` 现已实现：`linux-ssh` 可在 Destination 端执行带重试和限时的 HTTP/HTTPS 检查，建立 systemd `NRestarts` 基线并验证稳定窗口，健康失败可使用激活凭证进入独立令牌补偿。配置采用内置默认值，不增加必填项。
 
@@ -14,7 +14,7 @@
 
 `TUI-DEP-01` 已实现并通过自动化工作包验收：Environment/Component 选择、只读预检、含 Git 和目标信息的计划预览、显式确认、后台构建和发布、实时脱敏日志、安全取消、逐 Component 结果及人工恢复指引均已接通。构建与远端操作共用 Deployment ID；每次 Driver 写操作前复核配置，上传前检查实际解压容量及远端状态。日志故障触发安全取消，但不覆盖已知部署结果；终端错误退出也等待恢复边界。验证范围和已知限制见 [TUI-DEP-01 验收记录](validation/tui-dep-01.md)。
 
-**M1 整体尚未验收**：两台一次性真实 Linux Destination 的联合发布、指定版本回滚和失败补偿仍须实际执行。Loopback 协议测试使用模拟远端文件系统，不替代真实 Linux 验收；M2/M3/M4 不因此视为完成。
+**M1 整体尚未验收**：两台一次性 Debian/OpenSSH Destination 的单 Component 发布、联合发布、指定版本/未部署状态回滚、HTTP 健康失败补偿及取消已实际执行通过；真实 systemd 服务激活与无端口 Worker 稳定性检查仍待验收。完整范围及复现入口见 [真实 Linux 验收记录](validation/linux-ssh-acceptance.md)。默认 Loopback 协议测试的模拟远端文件系统不替代真实 Linux 验收；M2/M3/M4 不因此视为完成。
 
 ```text
 TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux SSH 闭环 → 恢复与查询 → 交互加固
@@ -121,7 +121,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 - Git 脏工作区默认警告并确认；禁止策略留作环境配置。
 - 本地 SQLite 保存执行意图和历史；实际状态由 Driver 观察。`linux-ssh` 的远端文件系统描述远端事实，JSONL 仅作审计和灾难恢复辅助。
 - MVP 不支持后台脱离运行。活动 Deployment 退出时只能返回或安全取消。
-- 本地命令默认使用程序与参数数组；Shell 必须显式启用。
+- 本地构建命令只使用程序与参数数组；MVP 不提供 Shell 字符串配置。
 - 当前 TUI 会话只运行一个 Deployment；MVP 不实现多进程部署协调，每个远端副作用前校验计划所依赖的远端状态。
 
 ## 已延期能力
