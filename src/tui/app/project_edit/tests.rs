@@ -27,12 +27,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_hosts(["one.invalid", "two.invalid"]).await
+    }
+
+    async fn with_hosts(hosts: [&str; 2]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let destination = DestinationKey::new();
         let mut registry = DestinationRegistry::new();
         for (key, host) in [
-            (destination.clone(), "one.invalid"),
-            (DestinationKey::new(), "two.invalid"),
+            (destination.clone(), hosts[0]),
+            (DestinationKey::new(), hosts[1]),
         ] {
             registry
                 .create(
@@ -125,6 +129,153 @@ impl Fixture {
 
 fn name(value: &str) -> ComponentName {
     ComponentName::parse(value).unwrap()
+}
+
+fn small_editor_text(screen: &ProjectEditScreen) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+    terminal
+        .draw(|frame| {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(screen.context_label()),
+                ratatui::layout::Rect::new(0, 0, 80, 1),
+            );
+            screen.render(frame, ratatui::layout::Rect::new(0, 1, 80, 9));
+        })
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn target_children_and_text_preserve_project_environment_and_component_context() {
+    let mut fixture = Fixture::new().await;
+    let environment = environment(&fixture.app, "production");
+    let form = TargetForm {
+        target: environment.targets[&name("worker")].clone(),
+        environment,
+        component: name("worker"),
+    };
+    let pages = [
+        ProjectEditPage::Target {
+            form: form.clone(),
+            cursor: 1,
+        },
+        ProjectEditPage::Destination {
+            form: form.clone(),
+            cursor: 0,
+        },
+        ProjectEditPage::Dependencies {
+            form: form.clone(),
+            names: vec![name("backend")],
+            selected: BTreeSet::new(),
+            cursor: 0,
+        },
+        ProjectEditPage::Text(TextEdit {
+            field: forms::TextField::Root,
+            value: "UNCOMMITTED-FIELD-SENTINEL".into(),
+            back: Box::new(ProjectEditPage::Target { form, cursor: 1 }),
+            cancel: None,
+        }),
+    ];
+    for page in pages {
+        set_page(&mut fixture.app, page);
+        let screen = screen(&fixture.app);
+        let context = screen.context_label();
+        assert!(
+            context.starts_with("[PRODUCTION] demo / production / worker"),
+            "{context}"
+        );
+        assert!(!context.contains("UNCOMMITTED-FIELD"));
+        assert!(small_editor_text(&screen).contains("[PRODUCTION] demo / production / worker"));
+    }
+    let origin = screen(&fixture.app);
+    fixture.app.project_edit_task = Some(ProjectEditTask {
+        id: uuid::Uuid::now_v7(),
+        origin,
+        cancellation: CancellationToken::new(),
+    });
+    set_page(
+        &mut fixture.app,
+        ProjectEditPage::Loading {
+            label: "Preparing preview",
+            started: Instant::now(),
+            cancelling: false,
+        },
+    );
+    let context = fixture
+        .app
+        .project_edit_context_label(&screen(&fixture.app));
+    assert!(context.starts_with("[PRODUCTION] demo / production / worker"));
+    assert!(context.ends_with(" · Working"));
+    fixture.app.project_edit_task = None;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_long_endpoint_choices_keep_both_full_system_ids_visible() {
+    let host = format!("{}.example", "long-host".repeat(40));
+    let mut fixture = Fixture::with_hosts([&host, &host]).await;
+    let current = screen(&fixture.app);
+    let choices = current.draft.as_ref().unwrap().destinations();
+    assert_eq!(choices[0].endpoint, choices[1].endpoint);
+    assert_eq!(choices[0].revision, choices[1].revision);
+    let first = choices[0].key.to_string();
+    let second = choices[1].key.to_string();
+    let environment = environment(&fixture.app, "production");
+    let form = TargetForm {
+        target: environment.targets[&name("backend")].clone(),
+        environment,
+        component: name("backend"),
+    };
+    set_page(
+        &mut fixture.app,
+        ProjectEditPage::Destination { form, cursor: 1 },
+    );
+    let text = small_editor_text(&screen(&fixture.app));
+    assert!(text.contains(&format!("  ID {first}")));
+    assert!(text.contains(&format!("> ID {second}")));
+    assert!(text.contains("[PRODUCTION] demo / production / backend"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn component_argv_text_and_environment_rename_keep_safe_draft_context() {
+    let mut fixture = Fixture::new().await;
+    let mut current = screen(&fixture.app);
+    Arc::make_mut(current.draft.as_mut().unwrap()).setup.project = "de\u{202e}mo".into();
+    let component = name("worker");
+    let form = ComponentForm::new(
+        Some(component.clone()),
+        component.to_string(),
+        &current.draft.as_ref().unwrap().setup.components[&component],
+    );
+    current.page = forms::text_page(
+        forms::TextField::Argument(0, 0),
+        "secret-value".into(),
+        ProjectEditPage::Command {
+            form,
+            command: 0,
+            cursor: 0,
+        },
+    );
+    let context = current.context_label();
+    assert!(context.starts_with("demo / worker"));
+    assert!(!context.contains("secret-value"));
+    assert!(!context.contains('\u{202e}'));
+    fixture.app.screen = Screen::ProjectEdit(current);
+    let mut form = environment(&fixture.app, "production");
+    form.name = "PrOd-eu".into();
+    set_page(
+        &mut fixture.app,
+        ProjectEditPage::Environment { form, cursor: 0 },
+    );
+    let text = small_editor_text(&screen(&fixture.app));
+    assert!(text.contains("[PRODUCTION] demo / PrOd-eu"));
+    assert!(text.contains("PrOd-eu [PRODUCTION]"));
+    assert!(render::safe_text(&"界".repeat(5000)).ends_with(" [display truncated]"));
 }
 
 fn screen(app: &App) -> ProjectEditScreen {

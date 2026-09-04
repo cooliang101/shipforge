@@ -30,6 +30,7 @@ pub(super) use gateway::{LocalManagementGateway, ManagementGateway};
 
 const PAGE_SIZE: u32 = 20;
 const HISTORICAL_READ_ONLY: &str = "Historical Environment browsing is read-only and local-only; return to a current Environment before remote operations.";
+const MISSING_FROZEN_CONTEXT: &str = "Remote actions are unavailable: this record has no frozen Component context. Local history and logs remain readable.";
 
 #[derive(Clone, Debug)]
 pub(in crate::tui) struct ManagementScreen {
@@ -118,6 +119,7 @@ pub(super) enum ManagementPage {
     },
     InspectSelection {
         source: Option<DeploymentId>,
+        historical_releases: Vec<ReleaseRef>,
         names: Vec<ComponentName>,
         selected: BTreeSet<ComponentName>,
         cursor: usize,
@@ -203,10 +205,12 @@ impl ManagementScreen {
 
 impl App {
     pub(super) fn open_management(&mut self, root: PathBuf, config: ProjectConfig) {
-        let Some(environment) = config.environments.keys().next().cloned() else {
+        self.refresh_destination_labels();
+        let Some(environment) = self.preferred_environment(&config) else {
             self.message = Some("This Project has no Environment to manage.".into());
             return;
         };
+        self.remember_environment(&config, &environment);
         self.screen = Screen::Management(ManagementScreen {
             scope: Arc::new(ManagementScope {
                 root,
@@ -264,6 +268,7 @@ impl App {
                 names,
                 selected,
                 cursor,
+                ..
             } => {
                 selection_key(key, names, selected, cursor);
                 (key == KeyCode::Enter && !selected.is_empty()).then(|| {
@@ -356,6 +361,11 @@ impl App {
         mut screen: ManagementScreen,
         details: &Arc<DeploymentDetails>,
     ) {
+        if details.snapshots.is_empty() && matches!(key, KeyCode::Char('i' | 'r')) {
+            self.message = Some(MISSING_FROZEN_CONTEXT.into());
+            self.screen = Screen::Management(screen);
+            return;
+        }
         let request = match key {
             KeyCode::Char('l') => Some(ManagementRequest::Logs {
                 details: Arc::clone(details),
@@ -375,6 +385,11 @@ impl App {
             KeyCode::Char('i') => {
                 screen.page = ManagementPage::InspectSelection {
                     source: Some(details.record.deployment.clone()),
+                    historical_releases: details
+                        .snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.release.clone())
+                        .collect(),
                     names: details
                         .snapshots
                         .iter()
@@ -432,6 +447,7 @@ impl App {
             KeyCode::Char('i') if screen.scope.historical_environment.is_none() => {
                 screen.page = ManagementPage::InspectSelection {
                     source: None,
+                    historical_releases: Vec::new(),
                     names: screen.scope.components(),
                     selected: screen.scope.components().into_iter().collect(),
                     cursor: 0,
@@ -452,6 +468,7 @@ impl App {
                 Arc::make_mut(&mut screen.scope)
                     .environment
                     .clone_from(&names[next]);
+                self.remember_environment(&screen.scope.config, &screen.scope.environment);
                 None
             }
             KeyCode::Esc if screen.scope.historical_environment.is_some() => {

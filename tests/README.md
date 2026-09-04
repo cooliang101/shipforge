@@ -42,6 +42,12 @@ This case uses the same application services as the TUI, not terminal input auto
 
 Implementation, review evidence and unresolved real-test failures are tracked in [TUI-MGT-01 acceptance](../docs/validation/tui-mgt-01.md). A successful individual run does not establish that intermittent connection timeouts are resolved.
 
+## TUI navigation and control diagnostics
+
+`cargo test --locked --lib tui::` runs keyboard/state tests and Ratatui `TestBackend` rendering regressions without a real interactive terminal. TUI-01 covers stable-ID Environment selection across views and renames, fixed production context while scrolling, long target lists, empty selections, historical read-only scope, identical-endpoint connection IDs, IPv6 display, and actual session cancellation help. A boundary-arrow regression ensures the current Component subset is not silently reselected.
+
+Control-error tests exercise the actual local planning gateway with malformed temporary registry/credential files. Separate typed diagnostic-projection tests inject real SQLite failures and build/Driver errors. Secret sentinels must not appear in displayed diagnostics; Deployment IDs, known results and persistence/log warnings must survive. These use isolated fixtures, not saved user connections. Metadata-label tests leave user names, versions and log bodies untouched. This is automated rendering/behavior coverage, not manual usability, terminal recovery or high-throughput performance acceptance. See [TUI-01 evidence and limits](../docs/validation/tui-01.md).
+
 ## Read-only connection troubleshooting
 
 `./tests/run-linux-acceptance.ps1 -Suite ConnectionStability` selects one separate ignored diagnostic; it is **not included in `All`**. After the same two pinned, disposable endpoint attestations, it opens 100 fresh connections alternating A/B. Each connection retains the production 15-second timeout; a structured `cat` must return the exact fixture marker within a separate 15-second command timeout. Each session is dropped before the next connection, without explicit disconnect, matching the Driver's normal lifetime. No package build, deployment or remote write is performed.

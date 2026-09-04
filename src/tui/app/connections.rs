@@ -364,7 +364,7 @@ impl App {
         }
     }
 
-    fn connection_service(&self) -> ConnectionManagementService {
+    pub(super) fn connection_service(&self) -> ConnectionManagementService {
         ConnectionManagementService::new(
             ManagementPaths {
                 projects: self.registry_path.clone(),

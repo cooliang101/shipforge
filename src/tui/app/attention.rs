@@ -110,6 +110,11 @@ impl App {
     }
 
     pub(super) fn show_overview(&mut self, root: PathBuf, config: crate::config::ProjectConfig) {
+        self.reset_overview_scroll();
+        self.refresh_destination_labels();
+        if let Some(environment) = self.preferred_environment(&config) {
+            self.remember_environment(&config, &environment);
+        }
         let project = config.project_id.clone();
         self.screen = Screen::Overview { root, config };
         self.refresh_attention(Some(project));

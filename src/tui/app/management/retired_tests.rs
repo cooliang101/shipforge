@@ -38,7 +38,7 @@ fn rendered(app: &App, width: u16, height: u16) -> String {
     let screen = screen(app);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
-        .draw(|frame| screen.render(frame, frame.area()))
+        .draw(|frame| screen.render(frame, frame.area(), app))
         .unwrap();
     terminal
         .backend()

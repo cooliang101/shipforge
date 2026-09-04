@@ -200,6 +200,12 @@ async fn cancellation_and_late_results_do_not_allow_navigation_or_save() {
     form(&mut app).await;
     press(&mut app, KeyCode::Enter);
     assert!(app.connections_task.is_some());
+    let Screen::Connections(current) = &app.screen else {
+        panic!("connection screen expected");
+    };
+    let context = app.connections_context_label(current);
+    assert!(context.contains("New connection"));
+    assert!(context.ends_with(" · Working"));
     app.finish_connections(
         uuid::Uuid::now_v7(),
         Ok(ConnectionsPage::List {
@@ -246,6 +252,11 @@ async fn blocked_delete_is_visible_and_confirmation_cannot_bypass_unknown_histor
     let text = screen_text(&app);
     assert!(text.contains("UNKNOWN"));
     assert!(text.contains("Removal blocked"));
+    let Screen::Connections(screen) = &app.screen else {
+        panic!("removal screen expected");
+    };
+    assert!(screen.help().contains("Removal blocked"));
+    assert!(!screen.help().contains("c confirm"));
     press(&mut app, KeyCode::Char('c'));
     assert!(app.connections_task.is_none());
     assert_eq!(
@@ -267,6 +278,13 @@ async fn key_browser_selects_a_file_without_reading_or_displaying_private_key_co
     wait(&mut app).await;
     let text = screen_text(&app);
     assert!(!text.contains("PRIVATE KEY SECRET"));
+    let Screen::Connections(screen) = &app.screen else {
+        panic!("key browser expected");
+    };
+    let context = screen.context_label();
+    assert!(context.contains("New connection / Browse SSH identities"));
+    assert!(!context.contains("PRIVATE KEY SECRET"));
+    assert!(!context.contains("test-identity"));
     let Screen::Connections(ConnectionsScreen {
         page:
             ConnectionsPage::Keys {
@@ -334,7 +352,7 @@ fn key_directory_and_rendering_are_bounded_and_strip_terminal_controls() {
         "hello[31mworld"
     );
     let truncated = render::safe_text(&"x".repeat(5000));
-    assert!(truncated.ends_with(" [truncated]"));
+    assert!(truncated.ends_with(" [display truncated]"));
     assert_eq!(render::safe_text("a\n\t\u{202e}b\u{2066}"), "ab");
 }
 
@@ -370,6 +388,7 @@ fn narrow_terminal_keeps_last_long_connection_and_key_selected_rows_visible() {
     let crate::config::DestinationSettings::LinuxSsh { user, .. } =
         &items.last().unwrap().current.settings;
     let expected = user.clone();
+    let selected_id = items.last().unwrap().key.to_string();
     let mut screen = ConnectionsScreen {
         page: ConnectionsPage::List {
             items: Arc::new(items),
@@ -388,7 +407,8 @@ fn narrow_terminal_keeps_last_long_connection_and_key_selected_rows_visible() {
         .iter()
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
-    assert!(text.contains(&format!("> {expected}@")));
+    assert!(text.contains(&format!("> ID {selected_id}")));
+    assert!(text.contains(&format!("{expected}@")));
     let form = Arc::new(ConnectionForm {
         existing: None,
         host: String::new(),
@@ -425,4 +445,111 @@ fn narrow_terminal_keeps_last_long_connection_and_key_selected_rows_visible() {
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
     assert!(text.contains("> key-29-"));
+}
+
+fn saved_connection(host: &str) -> ConnectionDetails {
+    let mut registry = DestinationRegistry::new();
+    let key = DestinationKey::new();
+    registry
+        .create(
+            key.clone(),
+            crate::config::DestinationSettings::LinuxSsh {
+                host: host.into(),
+                port: 22,
+                user: "deploy".into(),
+                credential: crate::drivers::CredentialHandle::new(),
+                host_key: crate::config::HostKeyFingerprint::parse("SHA256:fixture").unwrap(),
+            },
+        )
+        .unwrap();
+    ConnectionDetails {
+        current: registry.resolve(&key).unwrap().clone(),
+        key,
+    }
+}
+
+fn small_screen_text(screen: &ConnectionsScreen) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+    terminal
+        .draw(|frame| screen.render(frame, frame.area()))
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
+}
+
+#[test]
+fn identical_ipv6_endpoints_remain_distinct_by_full_system_id_at_eighty_columns() {
+    let first = saved_connection("2001:db8::1");
+    let second = ConnectionDetails {
+        key: DestinationKey::new(),
+        ..first.clone()
+    };
+    let first_id = first.key.to_string();
+    let second_id = second.key.to_string();
+    let mut screen = ConnectionsScreen {
+        page: ConnectionsPage::List {
+            items: Arc::new(vec![first, second.clone()]),
+            cursor: 1,
+        },
+        scroll: 0,
+    };
+    let text = small_screen_text(&screen);
+    assert!(text.contains(&format!("  ID {first_id}")));
+    assert!(text.contains(&format!("> ID {second_id}")));
+    assert!(text.contains("deploy@[2001:db8::1]:22"));
+    let context = screen.context_label();
+    assert!(context.contains(&second_id));
+    assert!(context.contains("deploy@[2001:db8::1]:22"));
+    screen.page = ConnectionsPage::Detail {
+        connection: Arc::new(second),
+        notice: None,
+    };
+    let text = small_screen_text(&screen);
+    assert!(text.contains("SSH: deploy@[2001:db8::1]:22"));
+}
+
+#[test]
+fn existing_connection_form_and_identity_browser_keep_id_but_not_identity_contents() {
+    let connection = saved_connection("safe\u{202e}.example");
+    let key = connection.key.to_string();
+    let form = Arc::new(ConnectionForm {
+        existing: Some(connection),
+        host: "proposed.example".into(),
+        user: "deploy".into(),
+        port: "22".into(),
+        field: SshField::Credential,
+        credentials: Vec::new(),
+        credential_cursor: 0,
+        hosts: Vec::new(),
+        host_cursor: 0,
+        notices: vec!["PRIVATE KEY BODY SENTINEL".into()],
+    });
+    let mut screen = ConnectionsScreen {
+        page: ConnectionsPage::Form(form.clone()),
+        scroll: 0,
+    };
+    for page in [
+        ConnectionsPage::Form(form.clone()),
+        ConnectionsPage::Keys {
+            form,
+            directory: Arc::new(KeyDirectory {
+                path: "PRIVATE-KEY-PATH".into(),
+                entries: Vec::new(),
+            }),
+            cursor: 0,
+        },
+    ] {
+        screen.page = page;
+        let context = screen.context_label();
+        assert!(context.contains(&key));
+        assert!(context.contains("deploy@safe.example:22"));
+        assert!(!context.contains('\u{202e}'));
+        assert!(!context.contains("PRIVATE"));
+        assert!(!context.contains("New connection"));
+    }
 }

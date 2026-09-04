@@ -10,18 +10,23 @@ use ratatui::{
 use crate::{
     application::history_query::HistoricalLogStatus,
     history::{CurrentAlignment, PackageAlignment},
+    tui::presentation::{context_label, environment_label, is_production, step_label},
 };
 
 use super::{ManagementPage, ManagementScreen, ReleaseRef};
+pub(super) use crate::tui::presentation::safe_text;
 
 impl ManagementScreen {
     pub(in crate::tui) fn help(&self) -> &'static str {
+        if self.historical_remote_page() {
+            return "Esc back  Read-only historical scope; remote operations unavailable";
+        }
         match &self.page {
             ManagementPage::Home if self.scope.historical_environment.is_some() => {
-                "h history   p saved inspections   Esc current Environment management (read-only scope)"
+                "Esc current management  h history  p saved inspections  (read-only)"
             }
             ManagementPage::Home => {
-                "←/→ Environment   h history   i inspect Releases   p saved inspections   a historical Environments   Esc overview"
+                "Esc overview  ←/→ env  h history  i inspect  p reports  a old envs"
             }
             ManagementPage::Loading {
                 cancelling: true, ..
@@ -32,53 +37,123 @@ impl ManagementScreen {
             ManagementPage::Environments { .. }
             | ManagementPage::History { .. }
             | ManagementPage::Reports { .. } => {
-                "↑/↓ select   Enter details   n/b next/previous page   f refresh   Esc back"
+                "Esc back  ↑/↓ select  Enter details  n/b next/previous page  f refresh"
             }
             ManagementPage::Detail(_) if self.scope.historical_environment.is_some() => {
-                "↑/↓ PgUp/PgDn scroll   l logs   Esc back (read-only historical scope)"
+                "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  (read-only historical scope)"
+            }
+            ManagementPage::Detail(details) if details.snapshots.is_empty() => {
+                "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  (no frozen remote context)"
             }
             ManagementPage::Detail(_) => {
-                "↑/↓ PgUp/PgDn scroll   l logs   r rollback   i inspect remote   Esc back"
+                "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  r rollback  i inspect remote"
             }
             ManagementPage::Logs { .. } => {
-                "↑/↓ PgUp/PgDn scroll   n/b next/previous page   ←/→ rotation   f reload   Esc details"
+                "Esc details  ↑/↓ PgUp/PgDn scroll  n/b page  ←/→ rotation  f reload"
+            }
+            ManagementPage::InspectSelection { selected, .. } if selected.is_empty() => {
+                "Esc back  ↑/↓ Component  Space select at least one Component"
             }
             ManagementPage::InspectSelection { .. } => {
-                "↑/↓ Component   Space toggle   Enter inspect selected (read-only)   Esc back"
+                "Esc back  ↑/↓ Component  Space toggle  Enter inspect selected (read-only)"
+            }
+            ManagementPage::RollbackSelection { selected, .. } if selected.is_empty() => {
+                "Esc back  ↑/↓ Component  Space select at least one Component"
             }
             ManagementPage::RollbackSelection { .. } => {
-                "↑/↓ Component   Space toggle   Enter find targets for selected Components   Esc back"
+                "Esc back  ↑/↓ Component  Space toggle  Enter find selected targets"
+            }
+            ManagementPage::RollbackTargets { selected, .. } if selected.is_empty() => {
+                "Esc back  ↑/↓ Component  ←/→ version  Space select an available target"
             }
             ManagementPage::RollbackTargets { .. } => {
-                "↑/↓ Component   ←/→ version   Space select   Enter check selected targets   Esc back"
+                "Esc back  ↑/↓ Component  ←/→ version  Space select  Enter check targets"
             }
             ManagementPage::RollbackReview(_) => {
-                "↑/↓ PgUp/PgDn scroll   c confirm rollback   Esc reject"
+                "Esc reject  ↑/↓ PgUp/PgDn scroll  c confirm rollback"
             }
-            _ => "↑/↓ PgUp/PgDn scroll   Home top   Esc back",
+            _ => "Esc back  ↑/↓ PgUp/PgDn scroll  Home top",
         }
     }
 
-    pub(in crate::tui) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        let (title, body, cursor) = self.content();
+    fn historical_remote_page(&self) -> bool {
+        self.scope.historical_environment.is_some()
+            && matches!(
+                self.page,
+                ManagementPage::InspectSelection { .. }
+                    | ManagementPage::RollbackSelection { .. }
+                    | ManagementPage::RollbackTargets { .. }
+                    | ManagementPage::RollbackReview(_)
+            )
+    }
+
+    pub(in crate::tui) fn context_label(&self) -> String {
+        let page = match &self.page {
+            ManagementPage::Home => "Manage",
+            ManagementPage::Environments { .. } => "Historical Environments",
+            ManagementPage::History { .. } | ManagementPage::Detail(_) => "Deployment history",
+            ManagementPage::Logs { .. } => "Historical logs",
+            ManagementPage::Reports { .. } | ManagementPage::Report { .. } => "Inspections",
+            ManagementPage::InspectSelection { .. } => "Choose inspection targets",
+            ManagementPage::RollbackSelection { .. } | ManagementPage::RollbackTargets { .. } => {
+                "Choose rollback targets"
+            }
+            ManagementPage::RollbackReview(_) => "Confirm rollback",
+            ManagementPage::RollbackFinished(_) => "Rollback result",
+            ManagementPage::Loading { .. } => "Working",
+        };
         let environment = self.scope.historical_environment.as_ref().map_or_else(
-            || self.scope.environment.clone(),
+            || Some(self.scope.environment.as_str()),
+            |id| self.scope.current_name_for(id),
+        );
+        let mut label = context_label(
+            page,
+            Some(&self.scope.config.project),
+            environment,
+            self.context_component(),
+        );
+        if let Some(id) = &self.scope.historical_environment {
+            let _ = write!(label, " · read-only historical {id}");
+        }
+        label
+    }
+
+    fn context_component(&self) -> Option<&str> {
+        match &self.page {
+            ManagementPage::InspectSelection { names, cursor, .. } => {
+                names.get(*cursor).map(crate::domain::ComponentName::as_str)
+            }
+            ManagementPage::RollbackSelection {
+                details, cursor, ..
+            } => details
+                .snapshots
+                .get(*cursor)
+                .map(|snapshot| snapshot.release.component.as_str()),
+            ManagementPage::RollbackTargets {
+                candidates, cursor, ..
+            } => candidates
+                .components
+                .get(*cursor)
+                .map(|component| component.component.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(in crate::tui) fn render(&self, frame: &mut Frame<'_>, area: Rect, app: &super::App) {
+        let (title, body, cursor) = self.content(app);
+        let environment = self.scope.historical_environment.as_ref().map_or_else(
+            || environment_label(&self.scope.environment),
             |id| self.historical_environment_label(id),
         );
         let production = self.scope.historical_environment.as_ref().map_or_else(
-            || self.scope.environment.to_ascii_lowercase().contains("prod"),
-            |id| {
-                self.scope
-                    .current_name_for(id)
-                    .is_some_and(|name| name.to_ascii_lowercase().contains("prod"))
-            },
+            || is_production(&self.scope.environment),
+            |id| self.scope.current_name_for(id).is_some_and(is_production),
         );
         let heading = format!(
-            " {} · {} / {}{} ",
+            " {} · {} / {} ",
             title,
             safe_text(&self.scope.config.project),
             safe_text(&environment),
-            if production { " [PRODUCTION]" } else { "" }
         );
         let scroll = cursor.map_or(self.scroll, |cursor| {
             let visible = usize::from(area.height.saturating_sub(4)).max(1);
@@ -103,7 +178,14 @@ impl ManagementScreen {
         frame.render_widget(paragraph, area);
     }
 
-    fn content(&self) -> (&'static str, String, Option<usize>) {
+    fn content(&self, app: &super::App) -> (&'static str, String, Option<usize>) {
+        if self.historical_remote_page() {
+            return (
+                "Historical Environment · read-only",
+                super::HISTORICAL_READ_ONLY.into(),
+                None,
+            );
+        }
         match &self.page {
             ManagementPage::Home | ManagementPage::Loading { .. } => self.overview_content(),
             ManagementPage::Environments { .. } => self.environments_content(),
@@ -114,7 +196,7 @@ impl ManagementScreen {
                 self.inspection_content()
             }
             ManagementPage::InspectSelection { .. } | ManagementPage::RollbackSelection { .. } => {
-                self.selection_content()
+                self.selection_content(app)
             }
             ManagementPage::RollbackTargets { .. } => self.rollback_targets_content(),
             ManagementPage::RollbackReview(_) | ManagementPage::RollbackFinished(_) => {
@@ -169,7 +251,7 @@ impl ManagementScreen {
     fn historical_environment_label(&self, id: &crate::domain::EnvironmentId) -> String {
         self.scope.current_name_for(id).map_or_else(
             || format!("{id} · removed"),
-            |name| format!("{id} · {} (current configuration)", safe_text(name)),
+            |name| format!("{id} · {} (current configuration)", environment_label(name)),
         )
     }
 
@@ -236,11 +318,13 @@ impl ManagementScreen {
                 }
                 ("Deployment history · local", text, Some(cursor + 2))
             }
-            ManagementPage::Detail(details) => (
-                "Deployment details · original record",
-                deployment_details(details),
-                None,
-            ),
+            ManagementPage::Detail(details) => {
+                let mut text = deployment_details(details);
+                if details.snapshots.is_empty() {
+                    let _ = writeln!(text, "\n{}", super::MISSING_FROZEN_CONTEXT);
+                }
+                ("Deployment details · original record", text, None)
+            }
             ManagementPage::Logs { page, details, .. } => {
                 let status = match page.status {
                     HistoricalLogStatus::Ready => "Sanitized persisted output",
@@ -313,10 +397,11 @@ impl ManagementScreen {
         }
     }
 
-    fn selection_content(&self) -> (&'static str, String, Option<usize>) {
+    fn selection_content(&self, app: &super::App) -> (&'static str, String, Option<usize>) {
         match &self.page {
             ManagementPage::InspectSelection {
                 source,
+                historical_releases,
                 names,
                 selected,
                 cursor,
@@ -329,10 +414,18 @@ impl ManagementScreen {
                     )
                 );
                 for (index, name) in names.iter().enumerate() {
-                    let target = self.scope.config.environments[&self.scope.environment]
-                        .components
-                        .get(name);
-                    let target = target.map_or_else(|| "unavailable in current configuration; inspection will refuse missing context".into(), |target| format!("destination {} · {}", target.destination, safe_text(&target.root)));
+                    let target = if source.is_some() {
+                        historical_releases.iter().find(|release| &release.component == name).map_or_else(
+                            || "Historical target unknown; inspection must validate frozen context".into(),
+                            |release| format!("Historical target {} revision {} generation {}; requires service validation", release.destination, release.destination_revision.get(), release.generation.get()),
+                        )
+                    } else {
+                        self.scope.config.environments[&self.scope.environment]
+                            .components.get(name).map_or_else(
+                                || "unavailable in current configuration; inspection will refuse missing context".into(),
+                                |target| format!("{} · {}", app.destination_label(&target.destination), safe_text(&target.root)),
+                            )
+                    };
                     let _ = writeln!(
                         text,
                         "{} [{}] {} · {}",
@@ -431,9 +524,14 @@ impl ManagementScreen {
         match &self.page {
             ManagementPage::RollbackReview(plan) => {
                 let mut text = format!(
-                    "CONFIRM ROLLBACK — this changes the selected servers.\nSource Deployment: {}\n\n",
+                    "CONFIRM ROLLBACK — this changes the selected servers.\nProject: {}\nEnvironment: {}\nSource Deployment: {}\n\n",
+                    safe_text(&self.scope.config.project),
+                    environment_label(&self.scope.environment),
                     plan.source()
                 );
+                if is_production(&self.scope.environment) {
+                    text.insert_str(0, "[PRODUCTION] This rollback changes the selected live services and may interrupt them.\n");
+                }
                 for entry in plan.entries() {
                     let _ = writeln!(
                         text,
@@ -480,7 +578,7 @@ impl ManagementScreen {
                     let _ = writeln!(
                         text,
                         "MANUAL RECOVERY REQUIRED: {name}: {}",
-                        safe_text(&error.to_string())
+                        crate::tui::deployment_error::driver_error(error)
                     );
                 }
                 for warning in &report.warnings {
@@ -755,19 +853,6 @@ const fn package_alignment(value: PackageAlignment) -> &'static str {
     }
 }
 
-fn step_label(value: &str) -> String {
-    if let Some(version) = value.strip_prefix("cleanup.") {
-        return format!("cleanup {}", safe_text(version));
-    }
-    // Strip only known technical namespaces, never version suffixes or
-    // arbitrary dotted action names from persisted history.
-    let value = value
-        .strip_prefix("linux-ssh.")
-        .or_else(|| value.strip_prefix("build."))
-        .unwrap_or(value);
-    safe_text(value).replace('_', " ")
-}
-
 fn timestamp(millis: u64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000).map_or_else(
         |_| "timestamp outside supported range".into(),
@@ -797,15 +882,6 @@ fn release_label(release: Option<&ReleaseRef>) -> String {
 
 const fn mark(selected: bool) -> &'static str {
     if selected { ">" } else { " " }
-}
-
-pub(super) fn safe_text(value: &str) -> String {
-    let mut characters = value.chars().filter(|character| !character.is_control() && !matches!(*character, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'));
-    let mut output: String = characters.by_ref().take(4096).collect();
-    if characters.next().is_some() {
-        output.push_str(" [display truncated]");
-    }
-    output
 }
 
 #[cfg(test)]
@@ -908,12 +984,117 @@ mod tests {
 
     #[test]
     fn cleanup_step_keeps_its_action_and_complete_dotted_version() {
-        assert_eq!(step_label("cleanup.v1.2"), "cleanup v1.2");
-        assert_eq!(step_label("rollback"), "rollback");
-        assert_eq!(step_label("compensate"), "compensate");
-        assert_eq!(step_label("linux-ssh.uploading"), "uploading");
-        assert_eq!(step_label("build.packaging"), "packaging");
+        assert_eq!(step_label("cleanup.v1.2"), "Cleanup v1.2");
+        assert_eq!(step_label("rollback"), "Rolling back");
+        assert_eq!(step_label("compensate"), "Compensating changes");
+        assert_eq!(step_label("linux-ssh.uploading"), "Uploading");
+        assert_eq!(step_label("build.packaging"), "Packaging");
         assert_eq!(step_label("unknown.action"), "unknown.action");
+    }
+
+    #[test]
+    fn management_help_keeps_escape_visible_in_eighty_columns() {
+        let (_directory, app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        let mut local_only = details();
+        local_only.snapshots.clear();
+        for page in [
+            ManagementPage::Home,
+            ManagementPage::Detail(std::sync::Arc::new(details())),
+            ManagementPage::Detail(std::sync::Arc::new(local_only)),
+        ] {
+            screen.page = page;
+            for historical in [None, Some(crate::domain::EnvironmentId::new())] {
+                std::sync::Arc::make_mut(&mut screen.scope).historical_environment = historical;
+                assert!(screen.help().starts_with("Esc "));
+                assert!(screen.help().chars().count() <= 80, "{}", screen.help());
+            }
+        }
+    }
+
+    #[test]
+    fn historical_inspection_targets_never_borrow_current_connection_labels() {
+        use crate::config::{DestinationRegistry, DestinationSettings, HostKeyFingerprint};
+        let (directory, mut app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        let component = ComponentName::parse("frontend").unwrap();
+        let destination = screen.scope.config.environments[&screen.scope.environment].components
+            [&component]
+            .destination
+            .clone();
+        let mut connections = DestinationRegistry::new();
+        connections
+            .create(
+                destination.clone(),
+                DestinationSettings::LinuxSsh {
+                    host: "current-endpoint.invalid".into(),
+                    user: "deploy".into(),
+                    port: 22,
+                    credential: crate::drivers::CredentialHandle::new(),
+                    host_key: HostKeyFingerprint::parse("SHA256:fixture").unwrap(),
+                },
+            )
+            .unwrap();
+        connections
+            .save(&directory.path().join("destinations.yaml"))
+            .unwrap();
+        app.refresh_destination_labels();
+        let mut release = details().snapshots[0].release.clone();
+        release.component = component.clone();
+        release.destination = destination;
+        screen.page = ManagementPage::InspectSelection {
+            source: None,
+            historical_releases: Vec::new(),
+            names: vec![component.clone()],
+            selected: [component.clone()].into_iter().collect(),
+            cursor: 0,
+        };
+        assert!(
+            screen
+                .selection_content(&app)
+                .1
+                .contains("current-endpoint.invalid")
+        );
+        screen.page = ManagementPage::InspectSelection {
+            source: Some(DeploymentId::new()),
+            historical_releases: vec![release],
+            names: vec![component.clone()],
+            selected: [component].into_iter().collect(),
+            cursor: 0,
+        };
+        let text = screen.selection_content(&app).1;
+        assert!(text.contains("Historical target") && text.contains("requires service validation"));
+        assert!(!text.contains("current-endpoint.invalid"));
+        assert!(screen.context_label().contains("frontend"));
+    }
+
+    #[test]
+    fn historical_context_never_classifies_an_opaque_environment_id_as_production() {
+        let (_directory, app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        Arc::make_mut(&mut screen.scope).historical_environment =
+            Some("env_prodOpaqueId".parse().unwrap());
+        let context = screen.context_label();
+        assert!(context.contains("read-only historical env_prodOpaqueId"));
+        assert!(!context.contains("[PRODUCTION]"));
+    }
+
+    #[test]
+    fn technical_step_metadata_is_translated_without_changing_persisted_records() {
+        let mut details = details();
+        details.observations.push(ObservationRecord {
+            sequence: 1,
+            component: ComponentName::parse("api").unwrap(),
+            stage: "linux-ssh.upload".into(),
+            observed: Ok(None),
+            healthy: None,
+            observed_at_ms: 1,
+        });
+        let original = details.clone();
+        let text = deployment_details(&details);
+        assert!(text.contains("Uploading"));
+        assert!(!text.contains("linux-ssh"));
+        assert_eq!(details, original);
     }
 
     #[test]
@@ -933,7 +1114,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
-            .draw(|frame| screen.render(frame, frame.area()))
+            .draw(|frame| screen.render(frame, frame.area(), &app))
             .unwrap();
         let buffer: String = terminal
             .backend()

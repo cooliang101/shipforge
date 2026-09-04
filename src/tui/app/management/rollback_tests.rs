@@ -388,8 +388,10 @@ impl Fixture {
         assert_eq!(plan.entries()[0].target.as_ref(), Some(&self.target));
         assert_eq!(plan.execution_order(), [name("frontend")]);
         assert!(self.driver.0.lock().unwrap().mutations.is_empty());
-        let text = rendered(&screen);
+        let text = rendered(&screen, &self.app);
         assert!(text.contains("CONFIRM ROLLBACK"));
+        assert!(text.contains("[PRODUCTION] This rollback changes the selected live services"));
+        assert!(screen.context_label().starts_with("[PRODUCTION]"));
         assert!(text.contains("rollback-ui.invalid"));
         assert!(text.contains("frontend"));
         assert!(text.contains("production"));
@@ -519,10 +521,10 @@ async fn finished(app: &mut App) {
     .expect("keyboard operation must finish");
 }
 
-fn rendered(screen: &ManagementScreen) -> String {
+fn rendered(screen: &ManagementScreen, app: &App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
     terminal
-        .draw(|frame| screen.render(frame, frame.area()))
+        .draw(|frame| screen.render(frame, frame.area(), app))
         .unwrap();
     terminal
         .backend()
@@ -593,6 +595,10 @@ async fn historical_scope_cannot_execute_even_a_valid_sealed_rollback_plan() {
     Arc::make_mut(&mut screen.scope).historical_environment =
         Some(crate::domain::EnvironmentId::new());
     let scope = Arc::clone(&screen.scope);
+    assert!(!screen.help().contains("c confirm"));
+    let text = rendered(&screen, &fixture.app);
+    assert!(text.contains("read-only"));
+    assert!(!text.contains("CONFIRM ROLLBACK"));
     fixture.app.screen = Screen::Management(screen);
     let request_count = fixture.gateway.requests.lock().unwrap().len();
     press(&mut fixture.app, KeyCode::Char('c'));
@@ -665,7 +671,7 @@ fn assert_completed(fixture: &Fixture, screen: &ManagementScreen) {
         *fixture.details,
         "rollback must preserve the original Deployment evidence"
     );
-    let text = rendered(screen);
+    let text = rendered(screen, &fixture.app);
     assert!(text.contains("Rollback result"));
     assert!(text.contains("Succeeded"));
     assert!(text.contains("frontend"));

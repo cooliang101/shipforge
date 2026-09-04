@@ -106,10 +106,10 @@ async fn finished(app: &mut App) {
     .expect("management worker should finish");
 }
 
-fn render_screen(screen: &ManagementScreen) -> String {
+fn render_screen(screen: &ManagementScreen, app: &App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
     terminal
-        .draw(|frame| screen.render(frame, frame.area()))
+        .draw(|frame| screen.render(frame, frame.area(), app))
         .unwrap();
     terminal
         .backend()
@@ -136,7 +136,7 @@ async fn history_entry_uses_local_query_without_creating_missing_files() {
     assert!(!directory.path().join("history.sqlite3").exists());
     assert!(!directory.path().join("credentials.yaml").exists());
     assert!(!directory.path().join("destinations.yaml").exists());
-    assert!(render_screen(&screen(&app)).contains("historical outcomes are unknown"));
+    assert!(render_screen(&screen(&app), &app).contains("historical outcomes are unknown"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -292,7 +292,81 @@ fn empty_inspection_selection_never_starts_a_worker() {
     }
     app.handle_key(key(KeyCode::Enter));
     assert!(app.management_task.is_none());
-    assert!(render_screen(&screen(&app)).contains("Select at least one Component"));
+    assert!(render_screen(&screen(&app), &app).contains("Select at least one Component"));
+    assert!(!screen(&app).help().contains("Enter inspect"));
+}
+
+#[test]
+fn management_remembers_current_environment_by_id_without_historical_override() {
+    let (directory, mut app) = fixture();
+    let original = screen(&app).scope;
+    let mut config = original.config.clone();
+    let mut extra = config.environments[&original.environment].clone();
+    extra.id = EnvironmentId::new();
+    config.environments.insert("alpha".into(), extra);
+    app.remember_environment(&config, &original.environment);
+    app.open_management(directory.path().to_owned(), config.clone());
+    assert_eq!(screen(&app).scope.environment, original.environment);
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.preferred_environment(&config).as_deref(), Some("alpha"));
+    let renamed = config.environments.remove("alpha").unwrap();
+    let remembered_id = renamed.id.clone();
+    config.environments.insert("z-renamed".into(), renamed);
+    app.open_management(directory.path().to_owned(), config.clone());
+    assert_eq!(screen(&app).scope.environment, "z-renamed");
+    let mut historical = screen(&app);
+    Arc::make_mut(&mut historical.scope).historical_environment =
+        Some(config.environments[&original.environment].id.clone());
+    app.screen = Screen::Management(historical);
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(
+        app.preferred_environment(&config).as_deref(),
+        Some("z-renamed")
+    );
+    app.handle_key(key(KeyCode::Esc));
+    app.open_management(directory.path().to_owned(), config);
+    assert_eq!(screen(&app).scope.environment_id(), Some(&remembered_id));
+    assert!(screen(&app).scope.historical_environment.is_none());
+}
+
+#[test]
+fn records_without_frozen_context_offer_only_local_actions() {
+    use crate::{
+        application::history_query::HistoryQueryService, history::HistoryStore, telemetry::Redactor,
+    };
+    let (directory, mut app) = fixture();
+    let mut current = screen(&app);
+    let history = directory.path().join("context-history.sqlite3");
+    let store = HistoryStore::open(&history).unwrap();
+    let id = DeploymentId::new();
+    store
+        .create_deployment(
+            &id,
+            &current.scope.config.project_id,
+            current.scope.environment_id().unwrap(),
+            1,
+        )
+        .unwrap();
+    let details = HistoryQueryService::new(history, Redactor::default())
+        .deployment(
+            &current.scope.config.project_id,
+            current.scope.environment_id().unwrap(),
+            &id,
+        )
+        .unwrap();
+    assert!(details.snapshots.is_empty());
+    current.page = ManagementPage::Detail(Arc::new(details));
+    app.screen = Screen::Management(current);
+    for code in [KeyCode::Char('i'), KeyCode::Char('r')] {
+        app.handle_key(key(code));
+        assert!(app.management_task.is_none());
+        assert!(matches!(screen(&app).page, ManagementPage::Detail(_)));
+        assert_eq!(app.message.as_deref(), Some(MISSING_FROZEN_CONTEXT));
+    }
+    let current = screen(&app);
+    assert!(!current.help().contains("r rollback") && !current.help().contains("i inspect"));
+    assert!(current.help().contains("l logs"));
+    assert!(render_screen(&current, &app).contains("no frozen Component context"));
 }
 
 #[test]
@@ -320,8 +394,8 @@ fn terminal_controls_are_filtered_and_home_does_not_expose_driver_identifiers() 
         "host[2Jevil"
     );
     let (_directory, app) = fixture();
-    assert!(render_screen(&screen(&app)).contains("Opening history never connects"));
-    assert!(!render_screen(&screen(&app)).contains("linux-ssh"));
+    assert!(render_screen(&screen(&app), &app).contains("Opening history never connects"));
+    assert!(!render_screen(&screen(&app), &app).contains("linux-ssh"));
 }
 
 #[test]

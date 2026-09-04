@@ -329,10 +329,9 @@ impl RollbackService {
                 "historical endpoint identity differs; no fallback is permitted",
             ));
         }
-        let driver = self
-            .drivers
-            .get(&scope.driver)
-            .ok_or_else(|| component_error(name, "Driver is unavailable"))?;
+        let driver = self.drivers.get(&scope.driver).ok_or_else(|| {
+            component_error(name, "this connection is not supported by this build")
+        })?;
         let capabilities = driver.static_capabilities();
         if !required_capabilities()
             .iter()
@@ -340,7 +339,7 @@ impl RollbackService {
         {
             return Err(component_error(
                 name,
-                "Driver lacks rollback, observation or inventory capability",
+                "this connection cannot roll back, observe current state, or list Releases",
             ));
         }
         let destination_settings = driver
@@ -661,7 +660,7 @@ fn options(evidence: &Evidence, name: &ComponentName) -> Vec<RollbackOption> {
             .effective_capabilities
             .contains(Capability::Rollback)
         {
-            Some("historical Release did not record rollback capability")
+            Some("historical Release did not record support for rollback")
         } else if !history.healthy.iter().any(|observation| {
             observation.healthy == Some(true)
                 && observation.observed.as_ref().ok().and_then(Option::as_ref)
@@ -738,7 +737,7 @@ async fn remote_evidence(
     {
         return Err(component_error(
             name,
-            "remote target does not provide required rollback capabilities",
+            "remote target cannot perform the required rollback checks and operation",
         ));
     }
     let current = execution
@@ -882,14 +881,11 @@ fn load_registry(path: &Path) -> Result<DestinationRegistry, RollbackServiceErro
 }
 
 fn endpoint_label(key: &DestinationKey, record: &DestinationRevisionRecord) -> String {
-    match &record.settings {
-        crate::config::DestinationSettings::LinuxSsh {
-            host, port, user, ..
-        } => format!(
-            "{key} revision {} — {user}@{host}:{port}",
-            record.revision.get()
-        ),
-    }
+    format!(
+        "{key} revision {} — {}",
+        record.revision.get(),
+        record.settings.endpoint_label()
+    )
 }
 
 fn cancelled(token: &CancellationToken) -> Result<(), RollbackServiceError> {

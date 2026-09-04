@@ -1,4 +1,6 @@
 mod app;
+mod deployment_error;
+mod presentation;
 
 use std::{
     fmt::Write as _,
@@ -21,6 +23,7 @@ use ratatui::{
 };
 
 use self::app::{App, Screen};
+use self::presentation::{endpoint_label, environment_label, is_production, safe_text, step_label};
 
 type AppTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
@@ -113,13 +116,30 @@ fn drive_event_loop(app: &mut App, guard: &mut TerminalGuard) -> io::Result<()> 
 fn render(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
         .split(frame.area());
-    render_screen(frame, areas[0], app);
+    let context = app.context_label();
+    let context_style =
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(if context.starts_with("[PRODUCTION]") {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            });
+    frame.render_widget(Paragraph::new(context).style(context_style), areas[0]);
+    render_screen(frame, areas[1], app);
     let help = if app.deployment_session.is_active()
         && !matches!(
             app.screen,
-            Screen::Management(_) | Screen::Connections(_) | Screen::ProjectEdit(_)
+            Screen::Management(_)
+                | Screen::Connections(_)
+                | Screen::ProjectEdit(_)
+                | Screen::DeploymentRunning { .. }
         ) {
         "Deployment active   return to progress or cancel safely"
     } else {
@@ -134,7 +154,10 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 "↑/↓ select   Enter enter directory   Backspace parent   s select root   Esc back"
             }
             Screen::Overview { .. } => {
-                "d deploy   m history / Releases   e edit configuration   Esc projects   q quit"
+                "←/→ env   ↑/↓ scroll   d deploy   m manage   e edit   Esc projects   q quit"
+            }
+            Screen::DeploySelection(selection) if selection.selected.is_empty() => {
+                "↑/↓ Component   Space select (required)   ←/→ Environment   Esc overview"
             }
             Screen::DeploySelection(_) => {
                 "←/→ Environment   ↑/↓ Component   Space toggle   Enter check   Esc overview"
@@ -161,10 +184,10 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 "←/→ Component   ↑/↓ Destination   Space assign   a add SSH   n review   Esc Components"
             }
             Screen::NewSshDestination(_) => {
-                "Tab field   type edit   ↑/↓ identity   f browse key   F2 next host   Enter probe   Esc cancel"
+                "Tab field   ↑/↓ identity   F3 browse key   F2 next host   Enter probe   Esc cancel"
             }
             Screen::HostKeyPending { .. } => "Fetching Host Key…   Esc cancel",
-            Screen::HostKeyConfirm { .. } => "Enter/y trust and save   n/Esc reject",
+            Screen::HostKeyConfirm { .. } => "y trust fingerprint and authenticate   n/Esc reject",
             Screen::SshAuthenticationPending { .. } => "Authenticating and probing…   Esc cancel",
             Screen::RemoteSetupSelection(_) => {
                 "↑/↓ select systemd service   Enter accept   Esc skip service"
@@ -177,44 +200,46 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             }
         }
     };
-    let footer = app.message.as_ref().map_or_else(
-        || Line::from(help),
-        |message| {
-            Line::from(vec![
-                Span::styled(
-                    "Message: ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(message),
-            ])
-        },
-    );
-    frame.render_widget(Paragraph::new(footer), areas[1]);
+    let mut footer = vec![Line::from(help)];
+    if let Some(message) = &app.message {
+        footer.push(Line::from(vec![
+            Span::styled(
+                "Message: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(safe_text(message)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(footer), areas[2]);
 }
 
 fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     match &app.screen {
-        Screen::Management(screen) => screen.render(frame, area),
+        Screen::Management(screen) => screen.render(frame, area, app),
         Screen::Connections(screen) => screen.render(frame, area),
         Screen::ProjectEdit(screen) => screen.render(frame, area),
         Screen::Projects => render_projects(frame, area, app),
         Screen::Browser(browser) => render_project_browser(frame, area, browser),
         Screen::Overview { root, config } => {
             let mut content = format!(
-                "Project: {}\nRoot: {}\nComponents: {}\nEnvironments: {}\n\nConfiguration loaded successfully.",
-                config.project,
-                root.display(),
+                "Project: {}\nRoot: {}\nComponents: {}\nEnvironments: {}\n\n{}",
+                safe_text(&config.project),
+                safe_text(&root.display().to_string()),
                 config.components.len(),
-                config.environments.len()
+                config.environments.len(),
+                app.overview_targets(config)
             );
             if let Some(notice) = app.attention_notice() {
                 let _ = write!(content, "\n\n{notice}");
             }
-            frame.render_widget(panel(" Project overview ", content), area);
+            frame.render_widget(
+                panel(" Project overview ", content).scroll((app.overview_scroll(), 0)),
+                area,
+            );
         }
-        Screen::DeploySelection(selection) => render_deploy_selection(frame, area, selection),
+        Screen::DeploySelection(selection) => render_deploy_selection(frame, area, selection, app),
         Screen::DeploymentPlanning { selection, .. } => {
             render_deployment_planning(frame, area, selection);
         }
@@ -308,6 +333,7 @@ fn render_deploy_selection(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     selection: &app::DeploySelectionState,
+    app: &App,
 ) {
     let environments = app::environment_names(selection);
     let components = app::deployment_components(selection);
@@ -315,8 +341,8 @@ fn render_deploy_selection(
         .get(selection.environment_cursor)
         .map_or("none", String::as_str);
     let mut lines = vec![
-        Line::from(format!("Project: {}", selection.config.project)),
-        Line::from(format!("Environment: {environment}")),
+        Line::from(format!("Project: {}", safe_text(&selection.config.project))),
+        Line::from(format!("Environment: {}", environment_label(environment))),
         Line::from(""),
     ];
     for (index, component) in components.iter().enumerate() {
@@ -329,15 +355,41 @@ fn render_deploy_selection(
             index == selection.component_cursor,
             &format!("{checked} {component}"),
         ));
+        let target = selection
+            .config
+            .environments
+            .get(environment)
+            .and_then(|environment| environment.components.get(component));
+        if let Some(target) = target {
+            lines.push(Line::from(format!(
+                "    {}",
+                app.destination_label(&target.destination)
+            )));
+            lines.push(Line::from(format!("    Root: {}", safe_text(&target.root))));
+        } else {
+            lines.push(Line::from("    Target unavailable; edit configuration"));
+            lines.push(Line::from(""));
+        }
     }
+    let selected_row = selection
+        .component_cursor
+        .saturating_mul(3)
+        .saturating_add(5);
+    let visible = usize::from(area.height.saturating_sub(2)).max(1);
+    let scroll =
+        u16::try_from(selected_row.saturating_sub(visible.saturating_sub(1))).unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" New Deployment · Select Components ")
+                    .title(if is_production(environment) {
+                        " [PRODUCTION] Select Components "
+                    } else {
+                        " Select Components "
+                    })
                     .borders(Borders::ALL),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll, 0)),
         area,
     );
 }
@@ -373,8 +425,9 @@ fn render_deployment_review(
         crate::application::GitWorktreeState::NotRepository => "not a Git repository",
     };
     let mut content = format!(
-        "Project: {}\nEnvironment: {}\nGit: {git}\n\n",
-        plan.selection.config.project, plan.selection.environment
+        "CONFIRM DEPLOYMENT — changes selected servers.\nProject: {}\nEnvironment: {}\nGit: {git}\n\n",
+        safe_text(&plan.selection.config.project),
+        environment_label(&plan.selection.environment)
     );
     let _ = writeln!(
         content,
@@ -403,7 +456,10 @@ fn render_deployment_review(
         let _ = write!(
             content,
             "{}: {current} → {}\n  Destination: {}\n  Root: {}\n",
-            entry.component, entry.release, entry.destination, entry.root
+            entry.component,
+            entry.release,
+            safe_text(&entry.destination),
+            safe_text(&entry.root)
         );
         for notice in &entry.notices {
             let _ = writeln!(content, "  Environment check: {notice}");
@@ -437,7 +493,11 @@ fn render_deployment_review(
         Paragraph::new(content)
             .block(
                 Block::default()
-                    .title(" Deployment plan ")
+                    .title(if is_production(&plan.selection.environment) {
+                        " [PRODUCTION] Confirm deployment "
+                    } else {
+                        " Confirm deployment "
+                    })
                     .borders(Borders::ALL),
             )
             .scroll((scroll, 0))
@@ -489,7 +549,12 @@ fn render_deployment_finished(
 ) {
     let mut content = format!("{summary}\nRecent events:\n");
     for event in logs {
-        let _ = writeln!(content, "[{}] {}", event.namespace, event.message);
+        let _ = writeln!(
+            content,
+            "[{}] {}",
+            step_label(&event.namespace),
+            event.message
+        );
     }
     frame.render_widget(
         panel(" Deployment result ", content).scroll((scroll, 0)),
@@ -510,7 +575,13 @@ fn render_deployment_log(
     let lines: Vec<_> = logs
         .iter()
         .skip(logs.len().saturating_sub(visible))
-        .map(|event| Line::from(format!("[{}] {}", event.namespace, event.message)))
+        .map(|event| {
+            Line::from(format!(
+                "[{}] {}",
+                step_label(&event.namespace),
+                event.message
+            ))
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -531,8 +602,8 @@ fn render_host_key_pending(
         panel(
             " New SSH Destination · Host Key ",
             format!(
-                "Connecting to {}:{}…\n\nOnly the SSH handshake is performed. No authentication or remote command is attempted.",
-                draft.host, draft.port
+                "Connecting to {}…\n\nOnly the SSH handshake is performed. No authentication or remote command is attempted.",
+                setup_endpoint(draft)
             ),
         ),
         area,
@@ -549,10 +620,8 @@ fn render_host_key_confirmation(
         panel(
             " New SSH Destination · Confirm Host Key ",
             format!(
-                "Endpoint: {}@{}:{}\n\nHost Key:\n{}\n\nVerify this fingerprint through a trusted channel before confirming.",
-                draft.user,
-                draft.host,
-                draft.port,
+                "Endpoint: {}\n\nHost Key:\n{}\n\nVerify this fingerprint through a trusted channel before confirming. Only y accepts; Enter does not trust the key.",
+                setup_endpoint(draft),
                 fingerprint.as_str()
             ),
         ),
@@ -569,8 +638,8 @@ fn render_authentication_pending(
         panel(
             " New SSH Destination · Authentication ",
             format!(
-                "Authenticating {}@{}:{}…\n\nAfter authentication, ShipForge runs read-only probes for the default root and systemd service candidates.",
-                draft.user, draft.host, draft.port
+                "Authenticating {}…\n\nAfter authentication, ShipForge runs read-only probes for the default root and systemd service candidates.",
+                setup_endpoint(draft)
             ),
         ),
         area,
@@ -715,6 +784,7 @@ fn render_new_ssh_destination(
 }
 
 fn form_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    let value = safe_text(value);
     let marker = if selected { ">" } else { " " };
     let style = if selected {
         Style::default()
@@ -724,6 +794,20 @@ fn form_line(label: &str, value: &str, selected: bool) -> Line<'static> {
         Style::default()
     };
     Line::from(Span::styled(format!("{marker} {label}: {value}"), style))
+}
+
+fn setup_endpoint(draft: &app::NewSshDestinationState) -> String {
+    draft.port.parse::<u16>().map_or_else(
+        |_| {
+            format!(
+                "{}@{}:{}",
+                safe_text(&draft.user),
+                safe_text(&draft.host),
+                safe_text(&draft.port)
+            )
+        },
+        |port| endpoint_label(&draft.user, &draft.host, port),
+    )
 }
 
 fn render_destination_setup(
@@ -769,7 +853,12 @@ fn render_destination_setup(
     for (index, destination) in setup.destinations.iter().enumerate() {
         lines.push(selected_line(
             index == setup.destination_cursor,
-            &destination.endpoint,
+            &format!(
+                "{} · {} · revision {}",
+                destination.key,
+                safe_text(&destination.endpoint),
+                destination.revision.get()
+            ),
         ));
     }
     frame.render_widget(
@@ -856,6 +945,7 @@ fn render_projects(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App
 }
 
 fn selected_line(selected: bool, text: &str) -> Line<'static> {
+    let text = safe_text(text);
     if selected {
         Line::from(Span::styled(
             format!("> {text}"),

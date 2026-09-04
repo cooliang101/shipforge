@@ -86,6 +86,22 @@ const fn default_ssh_port() -> u16 {
 }
 
 impl DestinationSettings {
+    /// Non-secret display label only; not an endpoint identity or connection URI.
+    #[must_use]
+    pub fn endpoint_label(&self) -> String {
+        match self {
+            Self::LinuxSsh {
+                host, port, user, ..
+            } => {
+                if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+                    format!("{user}@[{host}]:{port}")
+                } else {
+                    format!("{user}@{host}:{port}")
+                }
+            }
+        }
+    }
+
     /// Validates Driver-specific connection fields.
     ///
     /// # Errors
@@ -388,11 +404,7 @@ impl DestinationRegistry {
             .iter()
             .filter_map(|(key, entry)| {
                 entry.current().map(|record| {
-                    let endpoint = match &record.settings {
-                        DestinationSettings::LinuxSsh {
-                            host, port, user, ..
-                        } => format!("{user}@{host}:{port}"),
-                    };
+                    let endpoint = record.settings.endpoint_label();
                     DestinationSummary {
                         key: key.clone(),
                         revision: record.revision,
@@ -856,5 +868,25 @@ Host !blocked *.internal
         assert_eq!(summaries[0].key, key);
         assert_eq!(summaries[0].endpoint, "deploy@app.example.com:22");
         assert!(!format!("{summaries:?}").contains("cred_"));
+    }
+
+    #[test]
+    fn endpoint_display_brackets_ipv6_without_changing_identity_or_settings() {
+        for (host, expected) in [
+            ("example.com", "deploy@example.com:22"),
+            ("127.0.0.1", "deploy@127.0.0.1:22"),
+            ("2001:db8::1", "deploy@[2001:db8::1]:22"),
+            ("[2001:db8::1]", "deploy@[2001:db8::1]:22"),
+        ] {
+            let settings = settings(host);
+            let before = serde_json::to_value(&settings).unwrap();
+            let identity = settings.endpoint_fingerprint();
+            assert_eq!(settings.endpoint_label(), expected);
+            assert_eq!(settings.endpoint_fingerprint(), identity);
+            assert_eq!(serde_json::to_value(&settings).unwrap(), before);
+            let mut registry = DestinationRegistry::new();
+            registry.create(DestinationKey::new(), settings).unwrap();
+            assert_eq!(registry.summaries()[0].endpoint, expected);
+        }
     }
 }

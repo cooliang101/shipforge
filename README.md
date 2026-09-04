@@ -6,7 +6,9 @@ ShipForge is a Rust TUI for building local project Components and deploying thei
 
 M1's safe deployment loop and M2's history/recovery management have passed their scoped acceptance, but this is not a production-ready release. Setup, deployment planning, live logs, cancellation, and rollback are implemented. Real two-Destination deployment and [WSL systemd lifecycle tests](docs/validation/systemd-acceptance.md) pass. M2 provides [detailed history](docs/validation/his-01.md), [remote inventory and audit](docs/validation/his-02.md), [read-only reconciliation](docs/validation/rec-01.md), [Release retention](docs/validation/ret-01.md), and [project/connection and history management](docs/validation/tui-mgt-01.md).
 
-An early real SSH connection timeout and a separate unknown current observation remain unexplained despite passing subsequent tests; a common cause is unproven. Their evidence and diagnostics are retained for platform validation. M3 TUI hardening and M4 security, platform, packaging and final MVP acceptance remain on the [roadmap](docs/roadmap.md).
+[TUI-01](docs/validation/tui-01.md), the first M3 work package, has passed scoped automated acceptance for shared navigation, fixed context, target presentation and deployment confirmations. Remaining M3 interaction/performance work and M4 security, platform, packaging and final MVP acceptance remain on the [roadmap](docs/roadmap.md).
+
+An early real SSH connection timeout and a separate unknown current observation remain unexplained despite passing subsequent tests; a common cause is unproven. Their evidence and diagnostics are retained for platform validation, not treated as resolved by the TUI changes.
 
 ## Run locally
 

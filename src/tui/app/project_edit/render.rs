@@ -7,8 +7,43 @@ use ratatui::{
 };
 
 use super::{DeleteKind, ProjectEditPage, ProjectEditPreview, ProjectEditScreen};
+use crate::tui::presentation::{context_label, environment_label};
+
+pub(super) use crate::tui::presentation::safe_text;
+
+impl super::App {
+    pub(in crate::tui) fn project_edit_context_label(&self, screen: &ProjectEditScreen) -> String {
+        self.project_edit_task.as_ref().map_or_else(
+            || screen.context_label(),
+            |task| format!("{} · Working", task.origin.context_label()),
+        )
+    }
+}
 
 impl ProjectEditScreen {
+    pub(in crate::tui) fn context_label(&self) -> String {
+        let draft = self.draft.as_deref();
+        let mut page = &self.page;
+        // Text inputs retain the form they will return to; never use the input
+        // value itself as an identity or lose its deployment-target context.
+        while let ProjectEditPage::Text(edit) = page {
+            page = &edit.back;
+        }
+        let (label, environment, component) = page_context(page, draft);
+        let project = match &self.page {
+            ProjectEditPage::Loaded(draft) => Some(draft.setup.project.as_str()),
+            ProjectEditPage::Saved(config) => Some(config.project.as_str()),
+            ProjectEditPage::Preview(preview) => Some(preview.config().project.as_str()),
+            _ => draft.map(|draft| draft.setup.project.as_str()),
+        };
+        let label = if matches!(self.page, ProjectEditPage::Text(_)) {
+            "Project editor / Edit value"
+        } else {
+            label
+        };
+        context_label(label, project, environment, component)
+    }
+
     pub(in crate::tui::app) fn requires_plain_confirmation(&self) -> bool {
         matches!(
             self.page,
@@ -149,7 +184,7 @@ impl ProjectEditScreen {
                     text,
                     "{} {} · {} selected Component(s)",
                     mark(index == cursor),
-                    safe_text(name),
+                    environment_label(name),
                     environment.components.len()
                 );
             }
@@ -210,9 +245,10 @@ impl ProjectEditScreen {
                     .iter()
                     .map(|destination| {
                         format!(
-                            "{} · revision {}",
-                            safe_text(&destination.endpoint),
-                            destination.revision.get()
+                            "ID {} · r{} · {}",
+                            destination.key,
+                            destination.revision.get(),
+                            safe_text(&destination.endpoint)
                         )
                     })
                     .collect::<Vec<_>>();
@@ -263,7 +299,7 @@ impl ProjectEditScreen {
     ) -> (&'static str, String, Option<usize>) {
         let mut rows = vec![format!(
             "Environment name: {}{}",
-            safe_text(&form.name),
+            environment_label(&form.name),
             if form.original.is_some() {
                 " (explicit rename preserves ID)"
             } else {
@@ -340,6 +376,70 @@ impl ProjectEditScreen {
     }
 }
 
+fn page_context<'a>(
+    page: &'a ProjectEditPage,
+    draft: Option<&'a super::ProjectEditDraft>,
+) -> (&'static str, Option<&'a str>, Option<&'a str>) {
+    match page {
+        ProjectEditPage::Components { cursor } => (
+            "Project editor / Components",
+            None,
+            draft.and_then(|draft| {
+                draft
+                    .setup
+                    .components
+                    .keys()
+                    .nth(*cursor)
+                    .map(crate::domain::ComponentName::as_str)
+            }),
+        ),
+        ProjectEditPage::Component { form, .. }
+        | ProjectEditPage::Commands { form, .. }
+        | ProjectEditPage::Command { form, .. } => {
+            ("Project editor / Component", None, Some(&form.name))
+        }
+        ProjectEditPage::Environments { cursor } => (
+            "Project editor / Environments",
+            draft.and_then(|draft| {
+                draft
+                    .setup
+                    .environments
+                    .keys()
+                    .nth(*cursor)
+                    .map(String::as_str)
+            }),
+            None,
+        ),
+        ProjectEditPage::Environment { form, .. } => {
+            ("Project editor / Environment", Some(&form.name), None)
+        }
+        ProjectEditPage::Target { form, .. }
+        | ProjectEditPage::Destination { form, .. }
+        | ProjectEditPage::Dependencies { form, .. } => (
+            match page {
+                ProjectEditPage::Destination { .. } => "Project editor / Choose connection",
+                ProjectEditPage::Dependencies { .. } => "Project editor / Dependencies",
+                _ => "Project editor / Target",
+            },
+            Some(&form.environment.name),
+            Some(form.component.as_str()),
+        ),
+        ProjectEditPage::Delete(DeleteKind::Component(name)) => (
+            "Project editor / Remove Component",
+            None,
+            Some(name.as_str()),
+        ),
+        ProjectEditPage::Delete(DeleteKind::Environment(name)) => {
+            ("Project editor / Remove Environment", Some(name), None)
+        }
+        ProjectEditPage::Loading { label, .. } => (label, None, None),
+        ProjectEditPage::Discovery { .. } => ("Project editor / Discovery", None, None),
+        ProjectEditPage::Preview(_) => ("Project editor / Confirm YAML", None, None),
+        ProjectEditPage::Discard => ("Project editor / Discard draft", None, None),
+        _ => ("Project editor", None, None),
+    }
+}
+
 fn destination_label(
     draft: &super::ProjectEditDraft,
     key: &crate::domain::DestinationKey,
@@ -349,8 +449,15 @@ fn destination_label(
         .iter()
         .find(|destination| &destination.key == key)
         .map_or_else(
-            || "unavailable saved connection".into(),
-            |destination| safe_text(&destination.endpoint),
+            || format!("ID {key} · unavailable saved connection"),
+            |destination| {
+                format!(
+                    "ID {} · r{} · {}",
+                    destination.key,
+                    destination.revision.get(),
+                    safe_text(&destination.endpoint)
+                )
+            },
         )
 }
 
@@ -419,7 +526,7 @@ fn delete_text(kind: &DeleteKind) -> String {
         ),
         DeleteKind::Environment(name) => format!(
             "Remove Environment {} and its Component assignments from this draft?\n\nPress c to confirm the draft change. A separate exact-YAML preview and confirmation are still required before saving. Remote resources are untouched.",
-            safe_text(name)
+            environment_label(name)
         ),
     }
 }
@@ -447,7 +554,7 @@ fn preview_summary(preview: &ProjectEditPreview) -> String {
         let _ = writeln!(
             text,
             "\nEnvironment {}: ID {} ({})",
-            safe_text(name),
+            environment_label(name),
             environment.id,
             before.map_or("newly generated", |_| "preserved")
         );
@@ -457,8 +564,8 @@ fn preview_summary(preview: &ProjectEditPreview) -> String {
             let _ = writeln!(
                 text,
                 "Explicit rename: {} -> {}",
-                safe_text(old_name),
-                safe_text(name)
+                environment_label(old_name),
+                environment_label(name)
             );
         }
         for (component, target) in &environment.components {
@@ -506,7 +613,7 @@ fn preview_summary(preview: &ProjectEditPreview) -> String {
             let _ = writeln!(
                 text,
                 "REMOVED Environment: {} (configuration only)",
-                safe_text(name)
+                environment_label(name)
             );
         }
     }
@@ -516,14 +623,6 @@ fn preview_summary(preview: &ProjectEditPreview) -> String {
 
 const fn mark(selected: bool) -> &'static str {
     if selected { ">" } else { " " }
-}
-
-pub(super) fn safe_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| safe_character(*character))
-        .take(4096)
-        .collect()
 }
 
 pub(super) fn safe_character(character: char) -> bool {

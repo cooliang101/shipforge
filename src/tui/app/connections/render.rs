@@ -6,11 +6,55 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::config::DestinationSettings;
+use crate::{
+    config::DestinationSettings,
+    tui::presentation::{context_label, endpoint_label},
+};
 
 use super::{ConnectionDetails, ConnectionForm, ConnectionsPage, ConnectionsScreen, SshField};
 
+pub(super) use crate::tui::presentation::safe_text;
+
+impl super::App {
+    pub(in crate::tui) fn connections_context_label(&self, screen: &ConnectionsScreen) -> String {
+        self.connections_task.as_ref().map_or_else(
+            || screen.context_label(),
+            |task| format!("{} · Working", task.origin.context_label()),
+        )
+    }
+}
+
 impl ConnectionsScreen {
+    pub(in crate::tui) fn context_label(&self) -> String {
+        let label = match &self.page {
+            ConnectionsPage::List { items, cursor } => items.get(*cursor).map_or_else(
+                || "Connections / Saved connections".into(),
+                |connection| connection_context("Connections", connection),
+            ),
+            ConnectionsPage::Detail { connection, .. } => {
+                connection_context("Connections / Details", connection)
+            }
+            ConnectionsPage::Form(form) => form_context("Edit connection", form),
+            ConnectionsPage::Keys { form, .. } => form_context("Browse SSH identities", form),
+            ConnectionsPage::HostKey { confirmation, .. } => {
+                let preview = confirmation.preview();
+                let draft = preview.draft();
+                format!(
+                    "Connections / Confirm Host Key / ID {} / {}",
+                    preview.key(),
+                    endpoint_label(&draft.user, &draft.host, draft.port)
+                )
+            }
+            ConnectionsPage::Remove(preview) => {
+                connection_context("Connections / Remove registration", preview.details())
+            }
+            ConnectionsPage::ProjectRemove(_) => "Projects / Remove recent registration".into(),
+            ConnectionsPage::ProjectRemoved(_) => "Projects / Registration removed".into(),
+            ConnectionsPage::Loading { label, .. } => format!("Connections / {label}"),
+        };
+        context_label(&label, None, None, None)
+    }
+
     pub(in crate::tui) fn help(&self) -> &'static str {
         match &self.page {
             ConnectionsPage::List { .. } => {
@@ -28,8 +72,11 @@ impl ConnectionsScreen {
             ConnectionsPage::HostKey { .. } => {
                 "y explicitly trust this fingerprint, authenticate and save   n / Esc reject"
             }
+            ConnectionsPage::Remove(preview) if !preview.can_remove() => {
+                "Removal blocked   PgUp/PgDn scroll   Esc return"
+            }
             ConnectionsPage::Remove(_) | ConnectionsPage::ProjectRemove(_) => {
-                "PgUp/PgDn scroll   c confirm removal if permitted   Esc reject"
+                "PgUp/PgDn scroll   c confirm removal   Esc reject"
             }
             ConnectionsPage::Loading {
                 cancelling: true, ..
@@ -74,12 +121,11 @@ impl ConnectionsScreen {
                     } = &connection.current.settings;
                     let _ = writeln!(
                         body,
-                        "{} {}@{}:{} · revision {}",
+                        "{} ID {} · r{} · {}",
                         mark(index == *cursor),
-                        safe_text(user),
-                        safe_text(host),
-                        port,
-                        connection.current.revision.get()
+                        connection.key,
+                        connection.current.revision.get(),
+                        endpoint_label(user, host, *port)
                     );
                 }
                 (" Connections ", body, Some(cursor + 2))
@@ -153,6 +199,24 @@ impl ConnectionsScreen {
     }
 }
 
+fn connection_context(page: &str, connection: &ConnectionDetails) -> String {
+    let DestinationSettings::LinuxSsh {
+        host, port, user, ..
+    } = &connection.current.settings;
+    format!(
+        "{page} / ID {} / {}",
+        connection.key,
+        endpoint_label(user, host, *port)
+    )
+}
+
+fn form_context(page: &str, form: &ConnectionForm) -> String {
+    form.existing.as_ref().map_or_else(
+        || format!("Connections / New connection / {page}"),
+        |connection| connection_context(&format!("Connections / {page}"), connection),
+    )
+}
+
 fn form_text(form: &ConnectionForm) -> String {
     let mut body = format!(
         "{}\n\n{} Host: {}\n{} User: {}\n{} Port: {}\n\n{} SSH identity (↑/↓):\n",
@@ -191,10 +255,8 @@ fn host_key_text(confirmation: &crate::application::HostKeyConfirmation) -> Stri
     let preview = confirmation.preview();
     let draft = preview.draft();
     let mut body = format!(
-        "Proposed connection: {}@{}:{}\nConnection ID: {}\n\nCaptured Host Key:\n{}\n\nVerify this fingerprint through a trusted channel.\nPress y only if you trust it. Authentication happens after confirmation.\nNo connection settings have been saved yet.\n",
-        safe_text(&draft.user),
-        safe_text(&draft.host),
-        draft.port,
+        "Proposed connection: {}\nConnection ID: {}\n\nCaptured Host Key:\n{}\n\nVerify this fingerprint through a trusted channel.\nPress y only if you trust it. Authentication happens after confirmation.\nNo connection settings have been saved yet.\n",
+        endpoint_label(&draft.user, &draft.host, draft.port),
         preview.key(),
         safe_text(confirmation.fingerprint())
     );
@@ -257,11 +319,9 @@ fn connection_text(connection: &ConnectionDetails) -> String {
         ..
     } = &connection.current.settings;
     format!(
-        "Connection ID: {}\nSSH: {}@{}:{}\nRevision: {}\nSaved Host Key: {}\n",
+        "Connection ID: {}\nSSH: {}\nRevision: {}\nSaved Host Key: {}\n",
         connection.key,
-        safe_text(user),
-        safe_text(host),
-        port,
+        endpoint_label(user, host, *port),
         connection.current.revision.get(),
         safe_text(host_key.as_str())
     )
@@ -269,16 +329,4 @@ fn connection_text(connection: &ConnectionDetails) -> String {
 
 const fn mark(selected: bool) -> &'static str {
     if selected { ">" } else { " " }
-}
-
-pub(super) fn safe_text(value: &str) -> String {
-    let mut characters = value.chars().filter(|character| {
-        !character.is_control()
-            && !matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-    });
-    let mut text: String = characters.by_ref().take(4096).collect();
-    if characters.next().is_some() {
-        text.push_str(" [truncated]");
-    }
-    text
 }

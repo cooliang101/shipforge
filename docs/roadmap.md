@@ -14,7 +14,7 @@
 
 `TUI-DEP-01` 已实现并通过自动化工作包验收：Environment/Component 选择、只读预检、含 Git 和目标信息的计划预览、显式确认、后台构建和发布、实时脱敏日志、安全取消、逐 Component 结果及人工恢复指引均已接通。构建与远端操作共用 Deployment ID；每次 Driver 写操作前复核配置，上传前检查实际解压容量及远端状态。日志故障触发安全取消，但不覆盖已知部署结果；终端错误退出也等待恢复边界。验证范围和已知限制见 [TUI-DEP-01 验收记录](validation/tui-dep-01.md)。
 
-**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；M2 已验收，下一阶段为 M3，完整 MVP 尚未完成。
+**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；M2 已验收，M3 正在推进，完整 MVP 尚未完成。
 
 WSL Linux 客户端已通过原生单测（含 Unix 继承管道回归）、协议测试、编译及正常启动/退出冒烟；范围见 [Linux 客户端验证](validation/linux-client.md)。这不等于真实 systemd 验收或全部平台支持。
 
@@ -92,6 +92,8 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 完成门槛：进程在每个远端步骤前后中止均能在下次启动解释状态；在 `shipforge.yaml` 完整时，删除本地数据库后可重建远端发布库存，但明确提示本地日志不可恢复。
 
 ## M3：Ratatui 交互加固
+
+`TUI-01` 已实现并通过自动化工作包验收：统一固定上下文、按稳定 ID 共享的会话内环境选择、连接展示、目标可用操作及生产环境确认；步骤元数据采用可读名称，部署控制错误保留结果和恢复信息而不回显底层字符串。独立审查、Windows 634 / Linux 646 项单测、各 8 项协议与 1 项中断父用例、双平台格式/Clippy/release 构建通过，详见 [TUI-01 记录](validation/tui-01.md)。这不等于人工终端体验、完整 M3 或最终 MVP 验收；下一工作包为 `TUI-02`。
 
 - `TUI-01`：统一项目、Environment、Component、Destination、目标可用操作和生产环境确认的呈现与导航；不向用户暴露 Driver 名称或能力标识符。
 - `TUI-02`：完善选择优先的候选列表、空状态、加载状态、可恢复错误、键盘帮助和无障碍配色；补齐损坏 `_shipforge` 经明确确认后重新初始化的 TUI 入口，复用已有底层 API，不从远端恢复配置。

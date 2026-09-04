@@ -15,6 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 mod attention;
 mod connections;
 mod management;
+mod navigation;
 mod project_edit;
 use attention::{AttentionRequest, AttentionState, LocalAttentionGateway, TuiAttentionGateway};
 
@@ -182,17 +183,20 @@ impl TuiDeploymentGateway for LocalDeploymentGateway {
         selection: DeploymentSelection,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<DeploymentPlan, String> {
-        let destinations =
-            DestinationRegistry::load(&self.destinations).map_err(|error| error.to_string())?;
-        let credentials = Arc::new(
-            CredentialRegistry::load(&self.credentials).map_err(|error| error.to_string())?,
-        );
-        let drivers = crate::bootstrap::deployment_driver_registry(credentials)
-            .map_err(|error| error.to_string())?;
+        let destinations = DestinationRegistry::load(&self.destinations).map_err(|_| {
+            "Saved connections could not be loaded. Check Connections and local file permissions.".to_owned()
+        })?;
+        let credentials = Arc::new(CredentialRegistry::load(&self.credentials).map_err(|_| {
+            "SSH identities could not be loaded. Check the selected identity in Connections."
+                .to_owned()
+        })?);
+        let drivers = crate::bootstrap::deployment_driver_registry(credentials).map_err(|_| {
+            "Deployment support is unavailable in this application build.".to_owned()
+        })?;
         DeploymentService::new(Arc::new(drivers), self.history.clone())
             .plan(selection, &destinations, cancellation)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::tui::deployment_error::deployment_error)
     }
 
     async fn execute(
@@ -201,15 +205,17 @@ impl TuiDeploymentGateway for LocalDeploymentGateway {
         events: &dyn EventSink,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<DeploymentReport, String> {
-        let credentials = Arc::new(
-            CredentialRegistry::load(&self.credentials).map_err(|error| error.to_string())?,
-        );
-        let drivers = crate::bootstrap::deployment_driver_registry(credentials)
-            .map_err(|error| error.to_string())?;
+        let credentials = Arc::new(CredentialRegistry::load(&self.credentials).map_err(|_| {
+            "SSH identities could not be loaded. Check the selected identity in Connections."
+                .to_owned()
+        })?);
+        let drivers = crate::bootstrap::deployment_driver_registry(credentials).map_err(|_| {
+            "Deployment support is unavailable in this application build.".to_owned()
+        })?;
         DeploymentService::new(Arc::new(drivers), self.history.clone())
             .execute(plan, &self.destinations, events, cancellation)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::tui::deployment_error::deployment_error)
     }
 }
 
@@ -394,6 +400,7 @@ pub(super) struct App {
     connections_task: Option<connections::ConnectionsTask>,
     project_edit_gateway: Arc<dyn project_edit::ProjectEditGateway>,
     project_edit_task: Option<project_edit::ProjectEditTask>,
+    navigation: navigation::ProjectNavigation,
 }
 
 impl App {
@@ -482,6 +489,7 @@ impl App {
             connections_task: None,
             project_edit_gateway,
             project_edit_task: None,
+            navigation: navigation::ProjectNavigation::default(),
         };
         app.refresh_attention(None);
         Ok(app)
@@ -671,7 +679,10 @@ impl App {
                 KeyCode::Char('d') => self.open_deployment(root, config),
                 KeyCode::Char('m') => self.open_management(root, config),
                 KeyCode::Char('e') => self.open_project_edit(root),
-                _ => {}
+                KeyCode::Left | KeyCode::Right => {
+                    self.move_overview_environment(&config, key.code == KeyCode::Right);
+                }
+                _ => self.scroll_overview(key.code),
             },
             Screen::DeploySelection(selection) => {
                 self.handle_deploy_selection(key.code, &selection);
@@ -782,16 +793,25 @@ impl App {
     }
 
     fn open_deployment(&mut self, root: PathBuf, config: ProjectConfig) {
-        let selected = config
+        self.refresh_destination_labels();
+        let environment = self.preferred_environment(&config);
+        let environment_cursor = config
             .environments
-            .values()
-            .next()
+            .keys()
+            .position(|name| Some(name) == environment.as_ref())
+            .unwrap_or(0);
+        if let Some(environment) = &environment {
+            self.remember_environment(&config, environment);
+        }
+        let selected = environment
+            .as_ref()
+            .and_then(|name| config.environments.get(name))
             .map(|environment| environment.components.keys().cloned().collect())
             .unwrap_or_default();
         self.screen = Screen::DeploySelection(DeploySelectionState {
             root,
             config,
-            environment_cursor: 0,
+            environment_cursor,
             component_cursor: 0,
             selected,
         });
@@ -833,6 +853,9 @@ impl App {
 
     fn select_environment(&mut self, cursor: usize) {
         if let Screen::DeploySelection(selection) = &mut self.screen {
+            if selection.environment_cursor == cursor {
+                return;
+            }
             selection.environment_cursor = cursor;
             selection.component_cursor = 0;
             selection.selected = selection
@@ -842,6 +865,12 @@ impl App {
                 .nth(cursor)
                 .map(|environment| environment.components.keys().cloned().collect())
                 .unwrap_or_default();
+        }
+        if let Screen::DeploySelection(selection) = &self.screen {
+            let config = selection.config.clone();
+            if let Some(environment) = environment_names(selection).get(cursor) {
+                self.remember_environment(&config, environment);
+            }
         }
     }
 
@@ -943,6 +972,7 @@ impl App {
         };
         let root = plan.selection.project_root.clone();
         let config = plan.selection.config.clone();
+        self.remember_environment(&config, &plan.selection.environment);
         let cancellation = tokio_util::sync::CancellationToken::new();
         let result = spawn_execute_thread(
             runtime,
@@ -1180,6 +1210,7 @@ impl App {
 
     fn handle_new_ssh_destination(&mut self, key: KeyCode, draft: &NewSshDestinationState) {
         match key {
+            KeyCode::F(3) => self.open_key_browser(draft),
             KeyCode::Tab => {
                 if let Screen::NewSshDestination(current) = &mut self.screen {
                     current.field = match current.field {
@@ -1232,7 +1263,6 @@ impl App {
                 }
             }
             KeyCode::Enter => self.start_host_key_probe(draft),
-            KeyCode::Char('f') => self.open_key_browser(draft),
             KeyCode::Esc => self.screen = Screen::SetupDestinations(draft.destinations.clone()),
             _ => {}
         }
@@ -1389,7 +1419,7 @@ impl App {
         fingerprint: &HostKeyFingerprint,
     ) {
         match key {
-            KeyCode::Char('y') | KeyCode::Enter => self.start_authentication(draft, fingerprint),
+            KeyCode::Char('y') => self.start_authentication(draft, fingerprint),
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.screen = Screen::NewSshDestination(draft.clone());
             }
@@ -1865,15 +1895,19 @@ fn deployment_summary(report: &DeploymentReport) -> String {
                 error,
                 ..
             } => {
-                let _ = writeln!(summary, "{component} / {stage:?}: {error}");
+                let _ = writeln!(
+                    summary,
+                    "{component} / {stage:?}: {}",
+                    crate::tui::deployment_error::driver_error(error)
+                );
             }
             DeploymentFailure::Contract {
-                component,
-                stage,
-                message,
-                ..
+                component, stage, ..
             } => {
-                let _ = writeln!(summary, "{component} / {stage:?}: {message}");
+                let _ = writeln!(
+                    summary,
+                    "{component} / {stage:?}: Operation safety check failed; inspect recorded and current state before retrying."
+                );
             }
         }
     }
@@ -1889,7 +1923,11 @@ fn deployment_summary(report: &DeploymentReport) -> String {
         );
     }
     for (component, error) in &report.compensation_failures {
-        let _ = writeln!(summary, "MANUAL RECOVERY REQUIRED — {component}: {error}");
+        let _ = writeln!(
+            summary,
+            "MANUAL RECOVERY REQUIRED — {component}: {}",
+            crate::tui::deployment_error::driver_error(error)
+        );
     }
     for warning in &report.warnings {
         let _ = writeln!(summary, "WARNING — {warning}");
@@ -2280,7 +2318,7 @@ mod tests {
         assert!(summary.contains("worker / Activate"));
         assert!(summary.contains("CompensationFailed"));
         assert!(summary.contains("MANUAL RECOVERY REQUIRED"));
-        assert!(summary.contains("inspect current before retrying"));
+        assert!(summary.contains("recorded/current deployment state before retrying"));
         assert!(summary.contains("none reported"));
         assert!(summary.contains("WARNING — Deployment log incomplete: disk full"));
     }
@@ -2641,7 +2679,7 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Tab));
-        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::F(3)));
         assert!(matches!(app.screen, Screen::KeyBrowser { .. }));
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Char('s')));
@@ -2893,6 +2931,8 @@ mod tests {
         assert!(matches!(app.screen, Screen::HostKeyConfirm { .. }));
 
         app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::HostKeyConfirm { .. }));
+        app.handle_key(key(KeyCode::Char('y')));
         allow_background_task_to_run(&mut app).await;
         let Screen::RemoteSetupSelection(selection) = &app.screen else {
             panic!("expected remote setup candidates");
@@ -2909,7 +2949,7 @@ mod tests {
             draft,
             fingerprint: HostKeyFingerprint::parse("SHA256:fake-host").unwrap(),
         };
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('y')));
         allow_background_task_to_run(&mut app).await;
 
         assert!(matches!(app.screen, Screen::HostKeyConfirm { .. }));
