@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     application::{
         DeploymentSelection, RollbackCandidates, RollbackPlan, RollbackReport,
-        history_query::{DeploymentDetails, HistoricalLogPage, HistoricalLogQuery, HistoryPage},
+        history_query::{DeploymentDetails, HistoryPage},
     },
     domain::{ComponentName, DeploymentId, EnvironmentId},
     drivers::ReleaseRef,
@@ -103,12 +103,6 @@ pub(super) enum ManagementPage {
         cursor: usize,
     },
     Detail(Arc<DeploymentDetails>),
-    Logs {
-        details: Arc<DeploymentDetails>,
-        page: Arc<HistoricalLogPage>,
-        query: HistoricalLogQuery,
-        previous_offsets: Vec<u64>,
-    },
     Reports {
         page: Arc<HistoryPage<RecoveryReport>>,
         offset: u32,
@@ -138,6 +132,11 @@ pub(super) enum ManagementPage {
     },
     RollbackReview(Arc<RollbackPlan>),
     RollbackFinished(Arc<RollbackReport>),
+    RollbackFailed {
+        request_id: uuid::Uuid,
+        message: String,
+        progress: crate::tui::live_progress::LiveProgress,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -145,11 +144,6 @@ pub(super) enum ManagementRequest {
     Environments(RecoveryQuery),
     History(DeploymentQuery),
     Detail(DeploymentId),
-    Logs {
-        details: Arc<DeploymentDetails>,
-        query: HistoricalLogQuery,
-        previous_offsets: Vec<u64>,
-    },
     Reports(RecoveryQuery),
     Report(uuid::Uuid),
     Inspect {
@@ -182,7 +176,6 @@ impl ManagementRequest {
             | Self::Detail(_)
             | Self::Reports(_)
             | Self::Report(_) => "Reading local records",
-            Self::Logs { .. } => "Reading a bounded local log page",
             Self::Inspect { .. } => "Inspecting remote state (read-only)",
             Self::Candidates { .. } => "Checking local rollback evidence",
             Self::Plan { .. } => "Checking rollback targets (read-only)",
@@ -196,6 +189,7 @@ pub(super) struct ManagementTask {
     id: uuid::Uuid,
     origin: ManagementScreen,
     cancellation: CancellationToken,
+    execution_progress: Option<crate::tui::live_progress::LiveProgress>,
 }
 
 impl ManagementScreen {
@@ -205,6 +199,36 @@ impl ManagementScreen {
 }
 
 impl App {
+    pub(super) fn management_has_live_progress(&self) -> bool {
+        let Some(live) = &self.live_progress else {
+            return false;
+        };
+        let Screen::Management(screen) = &self.screen else {
+            return false;
+        };
+        if !self
+            .live_environment
+            .as_ref()
+            .is_some_and(|(project, environment)| {
+                project == &screen.scope.config.project_id
+                    && screen.scope.environment_id() == Some(environment)
+            })
+        {
+            return false;
+        }
+        self.management_task
+            .as_ref()
+            .and_then(|task| task.execution_progress.as_ref())
+            .is_some_and(|progress| live.same_operation(progress))
+            || match &screen.page {
+                ManagementPage::RollbackFinished(report) => {
+                    live.snapshot().deployment.as_ref() == Some(&report.deployment.id)
+                }
+                ManagementPage::RollbackFailed { progress, .. } => live.same_operation(progress),
+                _ => false,
+            }
+    }
+
     pub(super) fn open_management(&mut self, root: PathBuf, config: ProjectConfig) {
         self.refresh_destination_labels();
         let Some(environment) = self.preferred_environment(&config) else {
@@ -253,12 +277,6 @@ impl App {
                 offset,
                 cursor,
             } => history_key(key, page, *offset, cursor),
-            ManagementPage::Logs {
-                details,
-                page,
-                query,
-                previous_offsets,
-            } => log_key(key, details, page, *query, previous_offsets),
             ManagementPage::Reports {
                 page,
                 offset,
@@ -362,17 +380,21 @@ impl App {
         mut screen: ManagementScreen,
         details: &Arc<DeploymentDetails>,
     ) {
+        if key == KeyCode::Char('l') {
+            let scope = crate::application::history_query::HistoryLogScope {
+                project: details.record.project.clone(),
+                environment: details.record.environment.clone(),
+                deployment: details.record.deployment.clone(),
+            };
+            self.open_history_logs(scope, screen.scope.root.clone());
+            return;
+        }
         if details.snapshots.is_empty() && matches!(key, KeyCode::Char('i' | 'r')) {
             self.message = Some(MISSING_FROZEN_CONTEXT.into());
             self.screen = Screen::Management(screen);
             return;
         }
         let request = match key {
-            KeyCode::Char('l') => Some(ManagementRequest::Logs {
-                details: Arc::clone(details),
-                query: HistoricalLogQuery::default(),
-                previous_offsets: Vec::new(),
-            }),
             KeyCode::Char('r') => {
                 screen.page = ManagementPage::RollbackSelection {
                     details: Arc::clone(details),
@@ -418,10 +440,7 @@ impl App {
 
     fn navigate_management(&mut self, key: KeyCode, mut screen: ManagementScreen) {
         if key == KeyCode::Esc {
-            screen.page = match &screen.page {
-                ManagementPage::Logs { details, .. } => ManagementPage::Detail(Arc::clone(details)),
-                _ => ManagementPage::Home,
-            };
+            screen.page = ManagementPage::Home;
             screen.scroll = 0;
         } else {
             scroll_key(key, &mut screen.scroll);
@@ -514,16 +533,38 @@ impl App {
         let sender = self.background_sender.clone();
         let scope = Arc::clone(&origin.scope);
         let label = request.label();
+        let execution_progress = matches!(request, ManagementRequest::Execute(_))
+            .then(crate::tui::live_progress::LiveProgress::default);
+        let worker_progress = execution_progress.clone();
         let spawn = std::thread::Builder::new()
             .name("shipforge-management".into())
             .spawn(move || {
                 let result = super::catch_worker_failure(|| {
-                    runtime.block_on(gateway.run(&scope, request, &worker_cancel))
+                    runtime.block_on(async {
+                        if let Some(progress) = worker_progress.clone() {
+                            let events = super::ProgressEvents { progress };
+                            gateway
+                                .run_with_events(&scope, request, &events, &worker_cancel)
+                                .await
+                        } else {
+                            gateway.run(&scope, request, &worker_cancel).await
+                        }
+                    })
                 });
+                if let Some(progress) = &worker_progress {
+                    progress.finish();
+                }
                 let _ = sender.send(BackgroundEvent::Management(id, result));
             });
         match spawn {
             Ok(_) => {
+                if let Some(progress) = &execution_progress {
+                    self.live_environment = origin.scope.environment_id().map(|environment| {
+                        (origin.scope.config.project_id.clone(), environment.clone())
+                    });
+                    self.live_progress = Some(progress.clone());
+                    self.live_logs = crate::tui::log_view::LogView::default();
+                }
                 self.invalidate_attention();
                 self.screen = Screen::Management(ManagementScreen {
                     scope: Arc::clone(&origin.scope),
@@ -538,6 +579,7 @@ impl App {
                     id,
                     origin,
                     cancellation,
+                    execution_progress,
                 });
             }
             Err(_) => {
@@ -575,13 +617,30 @@ impl App {
         let Some(task) = self.management_task.take() else {
             return;
         };
+        if let Some(progress) = &task.execution_progress {
+            progress.finish();
+        }
+        self.poll_live_logs();
         let mut screen = task.origin;
         match result {
             Ok(page) => {
                 screen.page = page;
                 screen.scroll = 0;
             }
-            Err(error) => self.message = Some(render::safe_text(&error)),
+            Err(error) => {
+                let message = render::safe_text(&error);
+                self.message = Some(message.clone());
+                if let Some(progress) = task.execution_progress {
+                    // The task ID was checked above. Preserve this execution's
+                    // projection; never substitute the source release's history.
+                    screen.page = ManagementPage::RollbackFailed {
+                        request_id: task.id,
+                        message,
+                        progress,
+                    };
+                    screen.scroll = 0;
+                }
+            }
         }
         self.screen = Screen::Management(screen);
     }
@@ -644,51 +703,6 @@ fn report_key(
         })),
         _ => None,
     }
-}
-
-fn log_key(
-    key: KeyCode,
-    details: &Arc<DeploymentDetails>,
-    page: &HistoricalLogPage,
-    mut query: HistoricalLogQuery,
-    previous: &[u64],
-) -> Option<ManagementRequest> {
-    let mut previous_offsets = previous.to_vec();
-    match key {
-        KeyCode::Char('n') => {
-            query.offset = page.next_offset?;
-            if query.offset <= page.offset || previous_offsets.len() >= 1024 {
-                return None;
-            }
-            previous_offsets.push(page.offset);
-        }
-        KeyCode::Char('b') => query.offset = previous_offsets.pop()?,
-        KeyCode::Left | KeyCode::Right => {
-            let index = page
-                .available_generations
-                .iter()
-                .position(|item| *item == query.generation)
-                .unwrap_or(0);
-            let index = if key == KeyCode::Left {
-                index.checked_sub(1)?
-            } else {
-                index.checked_add(1)?
-            };
-            query.generation = *page.available_generations.get(index)?;
-            query.offset = 0;
-            previous_offsets.clear();
-        }
-        KeyCode::Char('f') => {
-            query.offset = 0;
-            previous_offsets.clear();
-        }
-        _ => return None,
-    }
-    Some(ManagementRequest::Logs {
-        details: Arc::clone(details),
-        query,
-        previous_offsets,
-    })
 }
 
 fn rollback_key(

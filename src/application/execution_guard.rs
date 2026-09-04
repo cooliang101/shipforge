@@ -192,6 +192,16 @@ impl DeploymentDriver for GuardedDriver {
         self.inner.current(context).await
     }
 
+    async fn current_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        events: &dyn EventSink,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        // As with current(), frozen-endpoint diagnostics remain available after
+        // local configuration drift; this never authorizes a mutation.
+        self.inner.current_with_events(context, events).await
+    }
+
     async fn inventory(
         &self,
         context: &ComponentExecutionContext,
@@ -236,6 +246,33 @@ impl DeploymentDriver for GuardedDriver {
             .await
     }
 
+    async fn activate_with_events(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        release: &ReleaseRef,
+        events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        self.validate("activate", context)?;
+        self.inner
+            .activate_with_events(deployment, context, release, events)
+            .await
+    }
+
+    async fn rollback_with_events(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
+        release: Option<&ReleaseRef>,
+        events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        self.validate("rollback", context)?;
+        self.inner
+            .rollback_with_events(deployment, context, expected_current, release, events)
+            .await
+    }
+
     async fn logs(
         &self,
         context: &ComponentExecutionContext,
@@ -251,6 +288,18 @@ impl DeploymentDriver for GuardedDriver {
     ) -> Result<CleanupReport, DriverError> {
         self.validate("cleanup", context)?;
         self.inner.cleanup(context, policy).await
+    }
+
+    async fn cleanup_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        policy: &RetentionPolicy,
+        events: &dyn EventSink,
+    ) -> Result<CleanupReport, DriverError> {
+        self.validate("cleanup", context)?;
+        self.inner
+            .cleanup_with_events(context, policy, events)
+            .await
     }
 }
 

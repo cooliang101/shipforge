@@ -14,6 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod attention;
 mod connections;
+mod logs;
 mod management;
 mod navigation;
 mod project_edit;
@@ -41,7 +42,7 @@ use crate::{
         ProjectSetup, SshCandidate, SshCredential, TargetSetup, default_remote_root,
         discover_local_ssh, prepare_initialize,
     },
-    domain::{ComponentName, DestinationKey},
+    domain::{ComponentName, DestinationKey, EnvironmentId, ProjectId},
     drivers::{CredentialHandle, DriverDestinationInput, DriverKind, DriverLog, EventSink},
     projects::{
         DiscoveryReport, ProjectRegistry, ProjectRegistryError, ProjectSelection, ProjectStatus,
@@ -287,7 +288,6 @@ enum BackgroundEvent {
     HostKey(uuid::Uuid, Result<String, String>),
     Authentication(uuid::Uuid, Result<RemoteSetupCandidates, String>),
     DeploymentPlan(uuid::Uuid, Result<DeploymentPlan, String>),
-    DeploymentProgress(DriverLog),
     DeploymentFinished(Result<DeploymentReport, String>),
 }
 
@@ -441,6 +441,11 @@ pub(super) struct App {
     pub picker: Option<crate::tui::picker::Picker>,
     pub help_open: bool,
     pub help_scroll: u16,
+    pub live_progress: Option<crate::tui::live_progress::LiveProgress>,
+    pub live_logs: crate::tui::log_view::LogView,
+    live_environment: Option<(ProjectId, EnvironmentId)>,
+    pub log_workspace: Option<logs::LogWorkspace>,
+    pending_clipboard: Option<String>,
 }
 
 impl App {
@@ -540,6 +545,11 @@ impl App {
             picker: None,
             help_open: false,
             help_scroll: 0,
+            live_progress: None,
+            live_logs: crate::tui::log_view::LogView::default(),
+            live_environment: None,
+            log_workspace: None,
+            pending_clipboard: None,
         };
         app.refresh_attention(None);
         Ok(app)
@@ -569,16 +579,13 @@ impl App {
                 BackgroundEvent::DeploymentPlan(completed_id, result) => {
                     self.finish_deployment_plan(completed_id, result);
                 }
-                BackgroundEvent::DeploymentProgress(log) => {
-                    if let Screen::DeploymentRunning { logs, .. } = &mut self.screen {
-                        push_bounded_log(logs, log);
-                    }
-                }
                 BackgroundEvent::DeploymentFinished(result) => {
                     self.finish_deployment(result);
                 }
             }
         }
+        self.poll_live_logs();
+        self.poll_log_workspace();
     }
 
     fn finish_deployment_plan(
@@ -688,10 +695,14 @@ impl App {
             Screen::DeploymentRunning { .. } => {
                 if key.code == KeyCode::Esc {
                     self.request_deployment_cancellation();
+                } else if key.code == KeyCode::Char('l') {
+                    self.open_live_logs();
                 }
             }
             Screen::DeploymentFinished { root, config, .. } => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                if key.code == KeyCode::Char('l') {
+                    self.open_live_logs();
+                } else if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.show_overview(root, config);
                 } else if let Screen::DeploymentFinished { scroll, .. } = &mut self.screen {
                     *scroll = match key.code {
@@ -731,6 +742,17 @@ impl App {
         }
         if self.picker.is_some() {
             self.handle_search_key(key);
+            return true;
+        }
+        if self.log_workspace.is_some() {
+            self.handle_log_key(key);
+            return true;
+        }
+        if key.code == KeyCode::Char('l')
+            && key.modifiers.is_empty()
+            && self.management_has_live_progress()
+        {
+            self.open_live_logs();
             return true;
         }
         false
@@ -778,6 +800,7 @@ impl App {
     }
 
     fn request_deployment_cancellation(&mut self) {
+        self.cancel_log_operation();
         self.cancel_management();
         self.cancel_connections();
         self.cancel_project_edit();
@@ -815,6 +838,7 @@ impl App {
             || self.reinitialize_task.is_some()
             || self.remote_target_task.is_some()
             || self.setup_task.is_some()
+            || self.log_workspace_busy()
         {
             self.poll_background();
             std::thread::sleep(Duration::from_millis(10));
@@ -1001,6 +1025,11 @@ impl App {
         };
         let root = plan.selection.project_root.clone();
         let config = plan.selection.config.clone();
+        let live_environment = config
+            .environments
+            .get(&plan.selection.environment)
+            .map(|environment| (config.project_id.clone(), environment.id.clone()));
+        let progress = crate::tui::live_progress::LiveProgress::default();
         self.remember_environment(&config, &plan.selection.environment);
         let cancellation = tokio_util::sync::CancellationToken::new();
         let result = spawn_execute_thread(
@@ -1010,11 +1039,15 @@ impl App {
             plan,
             cancellation.clone(),
             self.background_sender.clone(),
+            progress.clone(),
         );
         if let Err(error) = result {
             self.message = Some(format!("Could not start Deployment: {error}"));
             return;
         }
+        self.live_environment = live_environment;
+        self.live_progress = Some(progress);
+        self.live_logs = crate::tui::log_view::LogView::default();
         self.screen = Screen::DeploymentRunning {
             root,
             config,
@@ -1026,6 +1059,10 @@ impl App {
     }
 
     fn finish_deployment(&mut self, result: Result<DeploymentReport, String>) {
+        if let Some(progress) = &self.live_progress {
+            progress.finish();
+        }
+        self.poll_live_logs();
         let Screen::DeploymentRunning {
             root, config, logs, ..
         } = self.screen.clone()
@@ -1820,18 +1857,21 @@ fn selection_state(selection: &DeploymentSelection) -> DeploySelectionState {
 
 #[derive(Debug)]
 struct ProgressEvents {
-    sender: SyncSender<BackgroundEvent>,
+    progress: crate::tui::live_progress::LiveProgress,
 }
 
 impl EventSink for ProgressEvents {
-    fn emit(&self, mut event: DriverLog) {
-        // Progress is a bounded UI projection, not the durable operation log.
-        // A slow renderer must not stall cancellation or remote recovery.
-        event.namespace = event.namespace.chars().take(128).collect();
-        event.message = event.message.chars().take(4096).collect();
-        let _ = self
-            .sender
-            .try_send(BackgroundEvent::DeploymentProgress(event));
+    fn emit(&self, event: DriverLog) {
+        self.emit_record(crate::telemetry::log_record::LogEvent {
+            namespace: event.namespace,
+            message: event.message,
+            scope: None,
+            kind: crate::telemetry::log_record::LogEventKind::Output,
+        });
+    }
+
+    fn emit_record(&self, event: crate::telemetry::log_record::LogEvent) {
+        self.progress.record(event);
     }
 }
 
@@ -1931,13 +1971,12 @@ fn spawn_execute_thread(
     plan: DeploymentPlan,
     cancellation: tokio_util::sync::CancellationToken,
     sender: SyncSender<BackgroundEvent>,
+    progress: crate::tui::live_progress::LiveProgress,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("shipforge-deployment-run".into())
         .spawn(move || {
-            let events = ProgressEvents {
-                sender: sender.clone(),
-            };
+            let events = ProgressEvents { progress };
             let result = catch_worker_failure(|| {
                 runtime.block_on(async {
                     session
@@ -1947,6 +1986,9 @@ fn spawn_execute_thread(
                         .and_then(|result| result)
                 })
             });
+            // Freeze operation time at the worker boundary, not when the UI
+            // eventually consumes a queued completion notification.
+            events.progress.finish();
             let _ = sender.send(BackgroundEvent::DeploymentFinished(result));
         })
         .map(drop)
@@ -2103,6 +2145,59 @@ mod tests {
         })
         .await
         .expect("background operation should produce the expected screen");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_clock_freezes_before_a_blocked_completion_delivery() {
+        let directory = tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("shipforge.yaml"),
+            include_str!("../../docs/examples/shipforge.yaml"),
+        )
+        .unwrap();
+        let crate::config::ProjectConfigState::Loaded(config) =
+            crate::config::load(directory.path()).unwrap()
+        else {
+            panic!("fixture configuration");
+        };
+        let environment = config.environments.keys().next().unwrap().clone();
+        let selection = DeploymentSelection {
+            project_root: directory.path().to_path_buf(),
+            config,
+            environment,
+            components: BTreeSet::new(),
+        };
+        let gateway = Arc::new(FakeDeploymentGateway::default());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let plan = gateway.plan(selection, &cancellation).await.unwrap();
+        // Rendezvous channel keeps delivery blocked until this test receives.
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let progress = crate::tui::live_progress::LiveProgress::default();
+        cancellation.cancel();
+        spawn_execute_thread(
+            tokio::runtime::Handle::current(),
+            gateway,
+            Arc::new(DeploymentSession::default()),
+            plan,
+            cancellation,
+            sender,
+            progress.clone(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !progress.snapshot().finished {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must finish even with UI delivery blocked");
+        let elapsed = progress.snapshot().elapsed_ms;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(progress.snapshot().elapsed_ms, elapsed);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+            BackgroundEvent::DeploymentFinished(Ok(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2295,24 +2390,26 @@ mod tests {
 
     #[test]
     fn progress_flood_is_nonblocking_and_bounds_unicode_payloads() {
-        let (sender, receiver) = mpsc::sync_channel(2);
-        let events = ProgressEvents { sender };
+        let progress = crate::tui::live_progress::LiveProgress::default();
+        let events = ProgressEvents {
+            progress: progress.clone(),
+        };
         for _ in 0..1000 {
             events.emit(DriverLog {
-                namespace: "界".repeat(200),
-                message: "界".repeat(5000),
+                namespace: "build.stdout".into(),
+                message: "界".repeat(2000),
             });
         }
-        let retained: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(retained.len(), 2);
-        for event in retained {
-            let BackgroundEvent::DeploymentProgress(log) = event else {
-                panic!("expected a progress projection");
-            };
-            assert_eq!(log.namespace.chars().count(), 128);
-            assert_eq!(log.message.chars().count(), 4096);
-        }
-        drop(receiver);
+        let retained = progress.drain();
+        assert!(!retained.rows.is_empty());
+        assert!(retained.rows.len() <= 128);
+        assert!(retained.snapshot.dropped_rows > 0);
+        assert!(
+            retained
+                .rows
+                .iter()
+                .all(|row| row.event.message.len() <= 16 * 1024)
+        );
         events.emit(DriverLog {
             namespace: "closed".into(),
             message: "ignored".into(),

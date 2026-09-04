@@ -418,7 +418,7 @@ fn query_reopens_without_schema_changes_or_rewriting_any_history() {
     assert_eq!(store.recovery_basis(&id).unwrap(), before);
     drop(store);
     let reopened = HistoryStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(reopened.schema_version().unwrap(), 7);
     assert_eq!(
         reopened
             .retention_history(&InspectionScope::from(&release))

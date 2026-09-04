@@ -236,7 +236,7 @@ fn environment_pages_reject_invalid_bounds_and_schemas_without_modifying_files()
         );
     }
     let directory = tempfile::tempdir().unwrap();
-    for version in [0, 5, 7] {
+    for version in [0, 5, 6, 8] {
         let path = directory.path().join(format!("history-{version}.sqlite3"));
         let database = rusqlite::Connection::open(&path).unwrap();
         database

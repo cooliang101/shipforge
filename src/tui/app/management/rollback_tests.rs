@@ -1,5 +1,8 @@
 //! Real application plans with an in-memory Driver; no SSH or build execution.
 
+#[path = "rollback_failure_tests.rs"]
+mod failure_tests;
+
 use std::{any::Any, sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
@@ -204,6 +207,17 @@ impl ManagementGateway for ServiceGateway {
         request: ManagementRequest,
         cancellation: &CancellationToken,
     ) -> Result<ManagementPage, String> {
+        self.run_with_events(scope, request, &super::gateway::SilentEvents, cancellation)
+            .await
+    }
+
+    async fn run_with_events(
+        &self,
+        scope: &ManagementScope,
+        request: ManagementRequest,
+        events: &dyn EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<ManagementPage, String> {
         self.requests.lock().unwrap().push(request.clone());
         match request {
             ManagementRequest::Candidates { source, selected } => {
@@ -241,7 +255,7 @@ impl ManagementGateway for ServiceGateway {
             ManagementRequest::Execute(plan) => {
                 let report = self
                     .service
-                    .execute((*plan).clone(), &self.registry, cancellation)
+                    .execute_with_events((*plan).clone(), &self.registry, events, cancellation)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(ManagementPage::RollbackFinished(Arc::new(report)))

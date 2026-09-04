@@ -223,32 +223,16 @@ impl DeploymentDriver for LinuxSshDriver {
         &self,
         context: &ComponentExecutionContext,
     ) -> Result<Option<ReleaseRef>, DriverError> {
-        let (destination, target, credential) = self.settings(context)?;
-        let session = connect_authenticated(
-            destination,
-            &credential,
-            CONNECTION_TIMEOUT,
-            &context.cancellation,
-        )
-        .await
-        .map_err(|source| operation_error("connect", context, source))?;
-        check_marker(&session, target, context, true).await?;
-        let observed = session
-            .observe_current(target, ActivationOptions::default(), &context.cancellation)
+        self.current_with_events(context, &super::command_events::QuietEvents)
             .await
-            .map_err(|source| operation_error("observe", context, source))?;
-        if let Some(version) = &observed {
-            session
-                .check_release_manifest(
-                    target,
-                    &super::DeploymentMarker::for_context(context),
-                    version,
-                    &context.cancellation,
-                )
-                .await
-                .map_err(|source| operation_error("observe", context, source))?;
-        }
-        Ok(observed.map(|version| Self::release_ref(context, version)))
+    }
+
+    async fn current_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        events: &dyn EventSink,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        super::command_events::relay(events, |sink| self.current_inner(context, sink)).await
     }
 
     async fn inventory(
@@ -310,6 +294,132 @@ impl DeploymentDriver for LinuxSshDriver {
         package: &ReleasePackage,
         events: &dyn EventSink,
     ) -> Result<PreparedRelease, DriverError> {
+        super::command_events::relay(events, |sink| {
+            self.prepare_inner(deployment, context, plan, package, events, sink)
+        })
+        .await
+    }
+
+    async fn activate(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        release: &ReleaseRef,
+    ) -> Result<ActivationReceipt, DriverError> {
+        self.activate_with_events(
+            deployment,
+            context,
+            release,
+            &super::command_events::QuietEvents,
+        )
+        .await
+    }
+
+    async fn activate_with_events(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        release: &ReleaseRef,
+        events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        super::command_events::relay(events, |sink| {
+            self.activate_inner(deployment, context, release, sink)
+        })
+        .await
+    }
+
+    async fn rollback(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
+        release: Option<&ReleaseRef>,
+    ) -> Result<ActivationReceipt, DriverError> {
+        self.rollback_with_events(
+            deployment,
+            context,
+            expected_current,
+            release,
+            &super::command_events::QuietEvents,
+        )
+        .await
+    }
+
+    async fn rollback_with_events(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
+        release: Option<&ReleaseRef>,
+        events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        super::command_events::relay(events, |sink| {
+            self.rollback_inner(deployment, context, expected_current, release, sink)
+        })
+        .await
+    }
+
+    async fn logs(
+        &self,
+        context: &ComponentExecutionContext,
+        _release: &ReleaseRef,
+    ) -> Result<Vec<DriverLog>, DriverError> {
+        Err(error(
+            "logs",
+            &context.component,
+            "remote log retrieval is not implemented",
+        ))
+    }
+
+    async fn cleanup(
+        &self,
+        context: &ComponentExecutionContext,
+        policy: &RetentionPolicy,
+    ) -> Result<CleanupReport, DriverError> {
+        self.cleanup_with_events(context, policy, &super::command_events::QuietEvents)
+            .await
+    }
+
+    async fn cleanup_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        policy: &RetentionPolicy,
+        events: &dyn EventSink,
+    ) -> Result<CleanupReport, DriverError> {
+        super::command_events::relay(events, |sink| self.cleanup_inner(context, policy, sink)).await
+    }
+}
+
+impl LinuxSshDriver {
+    async fn current_inner(
+        &self,
+        context: &ComponentExecutionContext,
+        command_events: Arc<dyn EventSink>,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        let (destination, target, credential) = self.settings(context)?;
+        let session = connect_authenticated(
+            destination,
+            &credential,
+            CONNECTION_TIMEOUT,
+            &context.cancellation,
+        )
+        .await
+        .map_err(|source| operation_error("connect", context, source))?
+        .with_command_events(command_events);
+        check_marker(&session, target, context, true).await?;
+        let observed = observe_validated_current(&session, target, context).await?;
+        Ok(observed.map(|version| Self::release_ref(context, version)))
+    }
+
+    async fn prepare_inner(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        plan: &ComponentPlan,
+        package: &ReleasePackage,
+        events: &dyn EventSink,
+        command_events: Arc<dyn EventSink>,
+    ) -> Result<PreparedRelease, DriverError> {
         validate_prepare_request(context, plan, package)?;
         let (destination, target, credential) = self.settings(context)?;
         let session = connect_authenticated(
@@ -319,7 +429,8 @@ impl DeploymentDriver for LinuxSshDriver {
             &context.cancellation,
         )
         .await
-        .map_err(|source| operation_error("connect", context, source))?;
+        .map_err(|source| operation_error("connect", context, source))?
+        .with_command_events(command_events);
         super::space::check_release_space(
             &session,
             target,
@@ -397,11 +508,12 @@ impl DeploymentDriver for LinuxSshDriver {
         })
     }
 
-    async fn activate(
+    async fn activate_inner(
         &self,
         deployment: &DeploymentId,
         context: &ComponentExecutionContext,
         release: &ReleaseRef,
+        command_events: Arc<dyn EventSink>,
     ) -> Result<ActivationReceipt, DriverError> {
         validate_release_ref("activate", context, release)?;
         let key = Self::prepared_key(deployment, context, &release.version);
@@ -431,7 +543,8 @@ impl DeploymentDriver for LinuxSshDriver {
             &context.cancellation,
         )
         .await
-        .map_err(|source| operation_error("connect", context, source))?;
+        .map_err(|source| operation_error("connect", context, source))?
+        .with_command_events(command_events);
         check_marker(&session, target, context, false).await?;
         let phase = super::driver_audit::AuditPhase {
             deployment,
@@ -474,19 +587,15 @@ impl DeploymentDriver for LinuxSshDriver {
         super::driver_audit::record_phase_result(&session, target, &phase, result).await
     }
 
-    async fn rollback(
+    async fn rollback_inner(
         &self,
         deployment: &DeploymentId,
         context: &ComponentExecutionContext,
         expected_current: Option<&ReleaseRef>,
         release: Option<&ReleaseRef>,
+        command_events: Arc<dyn EventSink>,
     ) -> Result<ActivationReceipt, DriverError> {
-        if let Some(expected) = expected_current {
-            validate_release_ref("rollback", context, expected)?;
-        }
-        if let Some(release) = release {
-            validate_release_ref("rollback", context, release)?;
-        }
+        validate_rollback_request(context, expected_current, release)?;
         let (destination, target, credential) = self.settings(context)?;
         let session = connect_authenticated(
             destination,
@@ -495,7 +604,8 @@ impl DeploymentDriver for LinuxSshDriver {
             &context.cancellation,
         )
         .await
-        .map_err(|source| operation_error("connect", context, source))?;
+        .map_err(|source| operation_error("connect", context, source))?
+        .with_command_events(command_events);
         check_marker(&session, target, context, false).await?;
         let current = observe_validated_current(&session, target, context).await?;
         if current.as_ref() != expected_current.map(|release| &release.version) {
@@ -582,22 +692,11 @@ impl DeploymentDriver for LinuxSshDriver {
         super::driver_audit::record_phase_result(&session, target, &phase, result).await
     }
 
-    async fn logs(
-        &self,
-        context: &ComponentExecutionContext,
-        _release: &ReleaseRef,
-    ) -> Result<Vec<DriverLog>, DriverError> {
-        Err(error(
-            "logs",
-            &context.component,
-            "remote log retrieval is not implemented",
-        ))
-    }
-
-    async fn cleanup(
+    async fn cleanup_inner(
         &self,
         context: &ComponentExecutionContext,
         policy: &RetentionPolicy,
+        command_events: Arc<dyn EventSink>,
     ) -> Result<CleanupReport, DriverError> {
         super::retention::validate_candidate(context, policy)
             .map_err(|source| operation_error("cleanup", context, source))?;
@@ -609,7 +708,8 @@ impl DeploymentDriver for LinuxSshDriver {
             &context.cancellation,
         )
         .await
-        .map_err(|source| operation_error("connect", context, source))?;
+        .map_err(|source| operation_error("connect", context, source))?
+        .with_command_events(command_events);
         session
             .cleanup_release(target, context, policy)
             .await
@@ -763,6 +863,17 @@ async fn check_marker(
             .check_unmarked_root(target, &context.cancellation)
             .await
             .map_err(|source| operation_error("marker", context, source))?;
+    }
+    Ok(())
+}
+
+fn validate_rollback_request(
+    context: &ComponentExecutionContext,
+    expected_current: Option<&ReleaseRef>,
+    release: Option<&ReleaseRef>,
+) -> Result<(), DriverError> {
+    for reference in expected_current.into_iter().chain(release) {
+        validate_release_ref("rollback", context, reference)?;
     }
     Ok(())
 }

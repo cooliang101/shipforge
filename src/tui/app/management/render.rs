@@ -8,7 +8,6 @@ use ratatui::{
 };
 
 use crate::{
-    application::history_query::HistoricalLogStatus,
     history::{CurrentAlignment, PackageAlignment},
     tui::presentation::{context_label, environment_label, is_production, step_label},
 };
@@ -32,7 +31,7 @@ impl ManagementScreen {
                 cancelling: true, ..
             } => "Cancellation requested; waiting for a safe result. Do not close the terminal.",
             ManagementPage::Loading { .. } => {
-                "Esc / Ctrl+C request cancellation; wait for completion"
+                "Esc / Ctrl+C request cancellation; l opens active rollback logs"
             }
             ManagementPage::Environments { .. }
             | ManagementPage::History { .. }
@@ -47,9 +46,6 @@ impl ManagementScreen {
             }
             ManagementPage::Detail(_) => {
                 "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  r rollback  i inspect remote"
-            }
-            ManagementPage::Logs { .. } => {
-                "Esc details  ↑/↓ PgUp/PgDn scroll  n/b page  ←/→ rotation  f reload"
             }
             ManagementPage::InspectSelection { selected, .. } if selected.is_empty() => {
                 "Esc back  ↑/↓ Component  Space select at least one Component"
@@ -72,7 +68,10 @@ impl ManagementScreen {
             ManagementPage::RollbackReview(_) => {
                 "Esc reject  ↑/↓ PgUp/PgDn scroll  c confirm rollback"
             }
-            _ => "Esc back  ↑/↓ PgUp/PgDn scroll  Home top",
+            ManagementPage::RollbackFinished(_) | ManagementPage::RollbackFailed { .. } => {
+                "Esc back  ↑/↓ PgUp/PgDn scroll  l this rollback's logs"
+            }
+            ManagementPage::Report { .. } => "Esc back  ↑/↓ PgUp/PgDn scroll  Home top",
         }
     }
 
@@ -92,7 +91,6 @@ impl ManagementScreen {
             ManagementPage::Home => "Manage",
             ManagementPage::Environments { .. } => "Historical Environments",
             ManagementPage::History { .. } | ManagementPage::Detail(_) => "Deployment history",
-            ManagementPage::Logs { .. } => "Historical logs",
             ManagementPage::Reports { .. } | ManagementPage::Report { .. } => "Inspections",
             ManagementPage::InspectSelection { .. } => "Choose inspection targets",
             ManagementPage::RollbackSelection { .. } | ManagementPage::RollbackTargets { .. } => {
@@ -100,6 +98,7 @@ impl ManagementScreen {
             }
             ManagementPage::RollbackReview(_) => "Confirm rollback",
             ManagementPage::RollbackFinished(_) => "Rollback result",
+            ManagementPage::RollbackFailed { .. } => "Rollback did not complete normally",
             ManagementPage::Loading { .. } => "Working",
         };
         let environment = self.scope.historical_environment.as_ref().map_or_else(
@@ -186,12 +185,57 @@ impl ManagementScreen {
                 None,
             );
         }
+        if let ManagementPage::Loading { cancelling, .. } = &self.page
+            && app.management_has_live_progress()
+            && let Some(progress) = &app.live_progress
+        {
+            let snapshot = progress.snapshot();
+            let mut text = format!(
+                "Rollback running · elapsed {} ms\n{}\nl opens logs, full step progress, search and export.\n\n",
+                snapshot.elapsed_ms,
+                if *cancelling {
+                    "Safe cancellation requested; waiting for compensation."
+                } else {
+                    "Esc / Ctrl+C requests safe cancellation."
+                }
+            );
+            let mut steps: Vec<_> = snapshot.steps.iter().collect();
+            steps.sort_by_key(|step| std::cmp::Reverse(step.updated_sequence));
+            for step in steps.iter().take(3) {
+                let _ = writeln!(
+                    text,
+                    "{} / {}: {:?}; persistence {:?}",
+                    step.scope.component,
+                    step_label(&step.scope.step),
+                    step.state,
+                    step.persistence
+                );
+            }
+            if snapshot.dropped_rows > 0
+                || snapshot.dropped_steps > 0
+                || snapshot.rejected_events > 0
+            {
+                let _ = writeln!(
+                    text,
+                    "Window gaps: {} rows / {} steps / {} rejected",
+                    snapshot.dropped_rows, snapshot.dropped_steps, snapshot.rejected_events
+                );
+            }
+            text.push_str("\nLatest output (bounded):\n");
+            let rows = app.live_logs.matching();
+            for row in rows.iter().skip(rows.len().saturating_sub(8)) {
+                let _ = writeln!(
+                    text,
+                    "{}",
+                    safe_text(row.event.message.lines().next().unwrap_or(""))
+                );
+            }
+            return ("Rollback progress", text, None);
+        }
         match &self.page {
             ManagementPage::Home | ManagementPage::Loading { .. } => self.overview_content(),
             ManagementPage::Environments { .. } => self.environments_content(),
-            ManagementPage::History { .. }
-            | ManagementPage::Detail(_)
-            | ManagementPage::Logs { .. } => self.deployment_content(),
+            ManagementPage::History { .. } | ManagementPage::Detail(_) => self.deployment_content(),
             ManagementPage::Reports { .. } | ManagementPage::Report { .. } => {
                 self.inspection_content()
             }
@@ -201,6 +245,26 @@ impl ManagementScreen {
             ManagementPage::RollbackTargets { .. } => self.rollback_targets_content(),
             ManagementPage::RollbackReview(_) | ManagementPage::RollbackFinished(_) => {
                 self.rollback_execution_content()
+            }
+            ManagementPage::RollbackFailed {
+                request_id,
+                message,
+                progress,
+            } => {
+                let snapshot = progress.snapshot();
+                let deployment = snapshot.deployment.as_ref().map_or_else(
+                    || "Unavailable: this request supplied no Deployment ID; the source Deployment is not substituted.".into(),
+                    ToString::to_string,
+                );
+                (
+                    "Rollback did not complete normally",
+                    format!(
+                        "Local request: {request_id}\nRollback Deployment: {deployment}\nElapsed: {} ms (execution stopped)\n\n{}\n\nInspect this request's available logs and recorded history; missing evidence is unknown. This error does not prove that remote state is unchanged.\n\nl opens this rollback's log window; h there reads its retained files when an ID is available. Inspect current state before retrying; this page cannot re-confirm the old plan.",
+                        snapshot.elapsed_ms,
+                        safe_text(message)
+                    ),
+                    None,
+                )
             }
         }
     }
@@ -324,30 +388,6 @@ impl ManagementScreen {
                     let _ = writeln!(text, "\n{}", super::MISSING_FROZEN_CONTEXT);
                 }
                 ("Deployment details · original record", text, None)
-            }
-            ManagementPage::Logs { page, details, .. } => {
-                let status = match page.status {
-                    HistoricalLogStatus::Ready => "Sanitized persisted output",
-                    HistoricalLogStatus::NotIndexed => {
-                        "No local log index. Logs cannot be reconstructed from remote state."
-                    }
-                    HistoricalLogStatus::Missing => {
-                        "Indexed local log is missing. Remote inspection cannot restore it."
-                    }
-                };
-                (
-                    "Historical logs · local",
-                    format!(
-                        "Deployment: {}\n{status}\nRotation:{} (0 = active) · bytes {}..{} of {} after sanitizing\n\n{}",
-                        details.record.deployment,
-                        page.generation,
-                        page.offset,
-                        page.next_offset.unwrap_or(page.total_bytes),
-                        page.total_bytes,
-                        page.text
-                    ),
-                    None,
-                )
             }
             _ => unreachable!("page category is selected by the exhaustive renderer"),
         }

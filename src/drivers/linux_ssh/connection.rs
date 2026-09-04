@@ -1,4 +1,11 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use russh::{
     ChannelMsg, Disconnect, client,
@@ -7,7 +14,7 @@ use russh::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::SshCredential, telemetry::CommandSpec};
+use crate::{config::SshCredential, drivers::EventSink, telemetry::CommandSpec};
 
 use super::{HostKeyVerifier, LinuxSshDestination, probe::connect_platform_agent};
 
@@ -22,6 +29,7 @@ pub(super) fn client_config() -> Arc<client::Config> {
 
 pub struct AuthenticatedSession {
     pub(super) handle: client::Handle<HostKeyVerifier>,
+    command_events: Option<Arc<dyn EventSink>>,
 }
 
 impl fmt::Debug for AuthenticatedSession {
@@ -33,6 +41,11 @@ impl fmt::Debug for AuthenticatedSession {
 }
 
 impl AuthenticatedSession {
+    pub(super) fn with_command_events(mut self, events: Arc<dyn EventSink>) -> Self {
+        self.command_events = Some(events);
+        self
+    }
+
     /// Executes a structured command on the authenticated endpoint.
     ///
     /// The command is rendered by quoting its program and every argument for
@@ -49,19 +62,43 @@ impl AuthenticatedSession {
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<RemoteCommandOutput, SshConnectionError> {
+        self.execute_allowing(command, timeout, cancellation, &[0])
+            .await
+    }
+
+    /// The caller explicitly supplies protocol-defined nonzero predicate results.
+    /// These are observations, not failed commands; status interpretation is unchanged.
+    pub(super) async fn execute_allowing(
+        &self,
+        command: &CommandSpec,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+        accepted_statuses: &[u32],
+    ) -> Result<RemoteCommandOutput, SshConnectionError> {
         if cancellation.is_cancelled() {
             return Err(SshConnectionError::Cancelled);
         }
         let rendered = command
             .render_posix()
             .map_err(|error| SshConnectionError::Command(error.to_string()))?;
-        let operation = execute_command(&self.handle, &rendered);
-        tokio::select! {
+        let accepted = AtomicBool::new(false);
+        let operation = execute_command(&self.handle, &rendered, &accepted);
+        let result = tokio::select! {
             () = cancellation.cancelled() => Err(SshConnectionError::Cancelled),
             result = tokio::time::timeout(timeout, operation) => {
-                result.map_err(|_| SshConnectionError::Timeout { timeout, phase: "remote command" })?
+                result.unwrap_or(Err(SshConnectionError::Timeout { timeout, phase: "remote command" }))
             }
+        };
+        if let Some(events) = &self.command_events {
+            record_command_result(
+                events.as_ref(),
+                command,
+                accepted.load(Ordering::Acquire),
+                accepted_statuses,
+                &result,
+            );
         }
+        result
     }
 
     /// Closes the SSH connection without opening a remote channel.
@@ -91,11 +128,13 @@ pub struct RemoteCommandOutput {
 async fn execute_command(
     handle: &client::Handle<HostKeyVerifier>,
     command: &str,
+    accepted: &AtomicBool,
 ) -> Result<RemoteCommandOutput, SshConnectionError> {
     let mut channel = handle
         .channel_open_session()
         .await
         .map_err(|error| SshConnectionError::Protocol(error.to_string()))?;
+
     channel
         .exec(true, command)
         .await
@@ -108,6 +147,7 @@ async fn execute_command(
     let mut stderr_truncated = false;
     while let Some(message) = channel.wait().await {
         match message {
+            ChannelMsg::Success => accepted.store(true, Ordering::Release),
             ChannelMsg::Data { data } => {
                 append_bounded(&mut stdout, &data, &mut stdout_truncated);
             }
@@ -116,12 +156,16 @@ async fn execute_command(
             }
             ChannelMsg::ExitStatus {
                 exit_status: status,
-            } => exit_status = Some(status),
+            } => {
+                accepted.store(true, Ordering::Release);
+                exit_status = Some(status);
+            }
             ChannelMsg::ExitSignal {
                 signal_name,
                 error_message,
                 ..
             } => {
+                accepted.store(true, Ordering::Release);
                 return Err(SshConnectionError::ExitSignal {
                     signal: format!("{signal_name:?}"),
                     message: error_message,
@@ -206,7 +250,34 @@ async fn connect_and_authenticate(
     if !authenticated {
         return Err(SshConnectionError::Rejected);
     }
-    Ok(AuthenticatedSession { handle })
+    Ok(AuthenticatedSession {
+        handle,
+        command_events: None,
+    })
+}
+
+fn record_command_result(
+    events: &dyn EventSink,
+    command: &CommandSpec,
+    accepted: bool,
+    accepted_statuses: &[u32],
+    result: &Result<RemoteCommandOutput, SshConnectionError>,
+) {
+    let event = match result {
+        Ok(output) if accepted_statuses.contains(&output.exit_status) => return,
+        Ok(_) => super::command_events::failed(
+            command,
+            "Remote command returned an unsuccessful exit status.",
+        ),
+        Err(_) if accepted => super::command_events::failed(
+            command,
+            "Remote command did not complete normally; its final remote outcome may be unknown.",
+        ),
+        Err(_) => super::command_events::unavailable(
+            "Remote command dispatch was not confirmed; a failed-command snapshot is unavailable.",
+        ),
+    };
+    events.emit_record(event);
 }
 
 async fn connection_phase<T>(
@@ -334,8 +405,86 @@ pub enum SshConnectionError {
 }
 
 #[cfg(test)]
+mod diagnostics_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_evidence_respects_dispatch_confirmation_and_expected_predicate_results() {
+        use crate::{
+            drivers::DriverLog,
+            telemetry::{
+                CommandArgument,
+                log_record::{LogEvent, LogEventKind},
+            },
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Events(Mutex<Vec<LogEvent>>);
+        impl EventSink for Events {
+            fn emit(&self, _event: DriverLog) {
+                panic!("structured event required");
+            }
+            fn emit_record(&self, event: LogEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let events = Events::default();
+        let command =
+            CommandSpec::structured("test", ["-e", "/actual/path"].map(CommandArgument::plain))
+                .unwrap();
+        let output = |status| {
+            Ok(RemoteCommandOutput {
+                exit_status: status,
+                stdout: Vec::new(),
+                stderr: b"malicious guessed command must not supply argv".to_vec(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        };
+        for status in [0, 1] {
+            record_command_result(&events, &command, true, &[0, 1], &output(status));
+        }
+        record_command_result(&events, &command, true, &[0, 44], &output(44));
+        assert!(events.0.lock().unwrap().is_empty());
+        record_command_result(&events, &command, true, &[0, 1], &output(2));
+        record_command_result(
+            &events,
+            &command,
+            false,
+            &[0],
+            &Err(SshConnectionError::Protocol("secret raw failure".into())),
+        );
+        record_command_result(
+            &events,
+            &command,
+            true,
+            &[0],
+            &Err(SshConnectionError::Cancelled),
+        );
+        let recorded = events.0.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        let LogEventKind::FailedCommand { command } = &recorded[0].kind else {
+            panic!("actual attempted argv expected");
+        };
+        assert_eq!(command.program, "test");
+        assert_eq!(command.args, ["-e", "/actual/path"]);
+        assert!(matches!(
+            recorded[1].kind,
+            LogEventKind::CommandUnavailable { .. }
+        ));
+        assert!(matches!(
+            recorded[2].kind,
+            LogEventKind::FailedCommand { .. }
+        ));
+        let text = serde_json::to_string(&*recorded).unwrap();
+        assert!(!text.contains("secret raw"));
+        assert!(!text.contains("malicious guessed"));
+        assert!(recorded.iter().all(|event| event.scope.is_none()));
+    }
 
     #[test]
     fn shared_client_config_changes_only_tcp_no_delay_from_protocol_defaults() {

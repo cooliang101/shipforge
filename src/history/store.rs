@@ -25,7 +25,7 @@ pub use read_only::DeploymentDetails;
 mod destination_references;
 pub use destination_references::DestinationReferenceSummary;
 
-const LATEST_SCHEMA_VERSION: u32 = 6;
+const LATEST_SCHEMA_VERSION: u32 = 7;
 const MIGRATION_1: &str = r"
 CREATE TABLE deployments (
  id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL,
@@ -75,6 +75,10 @@ CREATE TABLE deployment_logs (
  max_bytes INTEGER NOT NULL CHECK (max_bytes > 0),
  retained_files INTEGER NOT NULL CHECK (retained_files > 0)
 ) STRICT;
+";
+const MIGRATION_7: &str = r"
+ALTER TABLE deployment_logs ADD COLUMN format TEXT NOT NULL DEFAULT 'legacy_text'
+ CHECK (format IN ('legacy_text','jsonl_v1'));
 ";
 
 pub struct HistoryStore {
@@ -165,6 +169,12 @@ impl HistoryStore {
             transaction.pragma_update(None, "user_version", 6_u32)?;
             transaction.commit()?;
         }
+        if self.schema_version()? == 6 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(MIGRATION_7)?;
+            transaction.pragma_update(None, "user_version", 7_u32)?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -215,19 +225,54 @@ impl HistoryStore {
         max_bytes: u64,
         retained_files: u32,
     ) -> Result<DeploymentLogRecord, HistoryError> {
+        self.register_log(
+            deployment,
+            max_bytes,
+            retained_files,
+            DeploymentLogFormat::LegacyText,
+        )
+    }
+
+    /// Positively indexes a new versioned JSONL log at the generated `.log` path.
+    /// Existing registrations are never relabeled or replaced.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, duplicate identity or database failure.
+    pub fn register_event_log(
+        &self,
+        deployment: &DeploymentId,
+        max_bytes: u64,
+        retained_files: u32,
+    ) -> Result<DeploymentLogRecord, HistoryError> {
+        self.register_log(
+            deployment,
+            max_bytes,
+            retained_files,
+            DeploymentLogFormat::JsonlV1,
+        )
+    }
+
+    fn register_log(
+        &self,
+        deployment: &DeploymentId,
+        max_bytes: u64,
+        retained_files: u32,
+        format: DeploymentLogFormat,
+    ) -> Result<DeploymentLogRecord, HistoryError> {
         if max_bytes == 0 || retained_files == 0 {
             return Err(HistoryError::InvalidLogLimits);
         }
         let stored_max = i64::try_from(max_bytes).map_err(|_| HistoryError::InvalidLogLimits)?;
         let relative_path = format!("logs/{deployment}.log");
         self.connection.execute(
-            "INSERT INTO deployment_logs (deployment_id,relative_path,max_bytes,retained_files)
-             VALUES (?1,?2,?3,?4)",
+            "INSERT INTO deployment_logs (deployment_id,relative_path,max_bytes,retained_files,format)
+             VALUES (?1,?2,?3,?4,?5)",
             params![
                 deployment.to_string(),
                 relative_path,
                 stored_max,
-                retained_files
+                retained_files,
+                format.as_str()
             ],
         )?;
         Ok(DeploymentLogRecord {
@@ -235,6 +280,7 @@ impl HistoryStore {
             relative_path: relative_path.into(),
             max_bytes,
             retained_files,
+            format,
         })
     }
 
@@ -248,11 +294,11 @@ impl HistoryStore {
         deployment: &DeploymentId,
     ) -> Result<Option<DeploymentLogRecord>, HistoryError> {
         let row = self.connection.query_row(
-            "SELECT relative_path,max_bytes,retained_files FROM deployment_logs WHERE deployment_id=?1",
+            "SELECT relative_path,max_bytes,retained_files,format FROM deployment_logs WHERE deployment_id=?1",
             [deployment.to_string()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, u32>(2)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, u32>(2)?, row.get::<_, String>(3)?)),
         ).optional()?;
-        let Some((relative_path, max_bytes, retained_files)) = row else {
+        let Some((relative_path, max_bytes, retained_files, format)) = row else {
             return Ok(None);
         };
         let max_bytes = u64::try_from(max_bytes)
@@ -270,6 +316,7 @@ impl HistoryStore {
             relative_path: relative_path.into(),
             max_bytes,
             retained_files,
+            format: DeploymentLogFormat::parse(&format)?,
         }))
     }
 
@@ -601,6 +648,33 @@ pub struct DeploymentLogRecord {
     pub max_bytes: u64,
     /// Number of rotated files kept in addition to the active log.
     pub retained_files: u32,
+    /// Authoritative format; file contents never determine this value.
+    pub format: DeploymentLogFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeploymentLogFormat {
+    LegacyText,
+    JsonlV1,
+}
+
+impl DeploymentLogFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyText => "legacy_text",
+            Self::JsonlV1 => "jsonl_v1",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, HistoryError> {
+        match value {
+            "legacy_text" => Ok(Self::LegacyText),
+            "jsonl_v1" => Ok(Self::JsonlV1),
+            _ => Err(HistoryError::Corrupt(
+                "unknown Deployment log format".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -791,11 +865,11 @@ mod tests {
         let path = directory.path().join("nested/history.sqlite3");
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            6
+            7
         );
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            6
+            7
         );
     }
 
@@ -838,7 +912,7 @@ mod tests {
             )
             .unwrap();
         let persisted = store.component_results(&deployment).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         assert_eq!(persisted[0].result, result);
         assert_eq!(persisted[0].error.as_deref(), Some("[REDACTED] failed"));
     }

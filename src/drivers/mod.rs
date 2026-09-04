@@ -407,6 +407,15 @@ pub struct DriverLog {
 
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: DriverLog);
+
+    /// Receives execution evidence independently of arbitrary output text.
+    /// Legacy consumers still receive its human-readable diagnostic.
+    fn emit_record(&self, event: crate::telemetry::log_record::LogEvent) {
+        self.emit(DriverLog {
+            namespace: event.namespace,
+            message: event.message,
+        });
+    }
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -466,6 +475,15 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         &self,
         context: &ComponentExecutionContext,
     ) -> Result<Option<ReleaseRef>, DriverError>;
+    /// Optional diagnostics for observations made during an identified execution.
+    /// The read and its outcome remain identical for legacy Drivers.
+    async fn current_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        _events: &dyn EventSink,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        self.current(context).await
+    }
     /// Reads remote Release facts and auxiliary history without repairing either.
     async fn inventory(
         &self,
@@ -492,6 +510,16 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         context: &ComponentExecutionContext,
         release: &ReleaseRef,
     ) -> Result<ActivationReceipt, DriverError>;
+    /// Optional execution diagnostics; legacy Drivers retain their original behavior.
+    async fn activate_with_events(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        context: &ComponentExecutionContext,
+        release: &ReleaseRef,
+        _events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        self.activate(deployment, context, release).await
+    }
     /// Restores `release` only if observation matches `expected_current`.
     /// `None` means confirmed undeployed, never unknown or an unchecked wildcard.
     async fn rollback(
@@ -501,6 +529,18 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         expected_current: Option<&ReleaseRef>,
         release: Option<&ReleaseRef>,
     ) -> Result<ActivationReceipt, DriverError>;
+    /// Optional execution diagnostics, including compensation with a fresh token.
+    async fn rollback_with_events(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
+        release: Option<&ReleaseRef>,
+        _events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        self.rollback(deployment, context, expected_current, release)
+            .await
+    }
     async fn logs(
         &self,
         context: &ComponentExecutionContext,
@@ -511,6 +551,15 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         context: &ComponentExecutionContext,
         policy: &RetentionPolicy,
     ) -> Result<CleanupReport, DriverError>;
+    /// Optional execution diagnostics without changing cleanup evidence or effects.
+    async fn cleanup_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        policy: &RetentionPolicy,
+        _events: &dyn EventSink,
+    ) -> Result<CleanupReport, DriverError> {
+        self.cleanup(context, policy).await
+    }
 }
 
 #[derive(Debug, Default)]

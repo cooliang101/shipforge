@@ -22,6 +22,16 @@ pub(in crate::tui::app) trait ManagementGateway:
         request: ManagementRequest,
         cancellation: &CancellationToken,
     ) -> Result<ManagementPage, String>;
+
+    async fn run_with_events(
+        &self,
+        scope: &ManagementScope,
+        request: ManagementRequest,
+        _events: &dyn crate::drivers::EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<ManagementPage, String> {
+        self.run(scope, request, cancellation).await
+    }
 }
 
 #[derive(Debug)]
@@ -54,6 +64,17 @@ impl ManagementGateway for LocalManagementGateway {
         request: ManagementRequest,
         cancellation: &CancellationToken,
     ) -> Result<ManagementPage, String> {
+        self.run_with_events(scope, request, &SilentEvents, cancellation)
+            .await
+    }
+
+    async fn run_with_events(
+        &self,
+        scope: &ManagementScope,
+        request: ManagementRequest,
+        events: &dyn crate::drivers::EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<ManagementPage, String> {
         if cancellation.is_cancelled() {
             return Err("Operation cancelled.".into());
         }
@@ -61,13 +82,14 @@ impl ManagementGateway for LocalManagementGateway {
             request @ (ManagementRequest::Environments(_)
             | ManagementRequest::History(_)
             | ManagementRequest::Detail(_)
-            | ManagementRequest::Logs { .. }
             | ManagementRequest::Reports(_)
             | ManagementRequest::Report(_)) => self.local(scope, request),
             request @ (ManagementRequest::Inspect { .. }
             | ManagementRequest::Candidates { .. }
             | ManagementRequest::Plan { .. }
-            | ManagementRequest::Execute(_)) => self.remote(scope, request, cancellation).await,
+            | ManagementRequest::Execute(_)) => {
+                self.remote(scope, request, events, cancellation).await
+            }
         }
     }
 }
@@ -106,21 +128,6 @@ impl LocalManagementGateway {
                 .deployment(project, environment, &id)
                 .map(|details| ManagementPage::Detail(Arc::new(details)))
                 .map_err(|error| error.to_string()),
-            ManagementRequest::Logs {
-                details,
-                query,
-                previous_offsets,
-            } => {
-                let page = history
-                    .log_page(project, environment, &details.record.deployment, query)
-                    .map_err(|error| error.to_string())?;
-                Ok(ManagementPage::Logs {
-                    details,
-                    page: Arc::new(page),
-                    query,
-                    previous_offsets,
-                })
-            }
             ManagementRequest::Reports(query) => history
                 .recovery_reports(project, environment, query)
                 .map(|page| ManagementPage::Reports {
@@ -144,6 +151,7 @@ impl LocalManagementGateway {
         &self,
         scope: &ManagementScope,
         request: ManagementRequest,
+        events: &dyn crate::drivers::EventSink,
         cancellation: &CancellationToken,
     ) -> Result<ManagementPage, String> {
         // Even a manually constructed Execute request cannot cross from a
@@ -219,7 +227,7 @@ impl LocalManagementGateway {
                     Arc::clone(&self.session),
                 );
                 let report = service
-                    .execute((*plan).clone(), &self.destinations, cancellation)
+                    .execute_with_events((*plan).clone(), &self.destinations, events, cancellation)
                     .await
                     .map_err(rollback_error)?;
                 Ok(ManagementPage::RollbackFinished(Arc::new(report)))
@@ -227,6 +235,12 @@ impl LocalManagementGateway {
             _ => unreachable!("only explicit checks and rollback are routed here"),
         }
     }
+}
+
+pub(super) struct SilentEvents;
+
+impl crate::drivers::EventSink for SilentEvents {
+    fn emit(&self, _: crate::drivers::DriverLog) {}
 }
 
 fn inspection_error(error: &RecoveryError) -> String {

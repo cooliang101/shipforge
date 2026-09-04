@@ -1,5 +1,6 @@
 mod activation;
 mod audit;
+mod command_events;
 mod connection;
 mod destination;
 mod driver;

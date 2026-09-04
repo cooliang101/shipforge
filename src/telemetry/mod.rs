@@ -1,5 +1,6 @@
 //! Structured events and sensitive-data redaction.
 
+pub mod log_record;
 mod security;
 mod stream_redaction;
 

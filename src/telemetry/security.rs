@@ -116,6 +116,65 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    /// Copies the actual structured argv as a bounded, redacted diagnostic.
+    /// Sensitive arguments are replaced before any formatting or serialization.
+    /// Explicit Shell input and incomplete/oversized snapshots are unavailable,
+    /// never shortened and presented as a complete command.
+    #[must_use]
+    pub fn diagnostic_snapshot(
+        &self,
+        location: super::log_record::CommandLocation,
+    ) -> Option<super::log_record::RecordedCommand> {
+        use super::log_record::{
+            LogEvent, LogEventKind, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_BYTES, RecordedCommand,
+            sanitize_log_event,
+        };
+        let bytes = self
+            .args
+            .iter()
+            .fold(self.program.len(), |total, argument| {
+                total.saturating_add(argument.value.len())
+            });
+        if self.shell
+            || self.program.contains('\0')
+            || self
+                .args
+                .iter()
+                .any(|argument| argument.value.contains('\0'))
+            || self.args.len() > MAX_COMMAND_ARGUMENTS
+            || bytes > MAX_COMMAND_BYTES
+        {
+            return None;
+        }
+        let event = LogEvent {
+            namespace: "linux-ssh.command".into(),
+            message: "Remote command diagnostic".into(),
+            scope: None,
+            kind: LogEventKind::FailedCommand {
+                command: RecordedCommand {
+                    location,
+                    index: None,
+                    program: self.program.clone(),
+                    args: self
+                        .args
+                        .iter()
+                        .map(|argument| {
+                            if argument.sensitive {
+                                "[REDACTED]".into()
+                            } else {
+                                argument.value.clone()
+                            }
+                        })
+                        .collect(),
+                },
+            },
+        };
+        match sanitize_log_event(&event, &Redactor::default()).ok()?.kind {
+            LogEventKind::FailedCommand { command } => Some(command),
+            _ => None,
+        }
+    }
+
     /// Creates a structured command without invoking a Shell.
     ///
     /// # Errors

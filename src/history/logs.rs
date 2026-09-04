@@ -68,6 +68,21 @@ impl RollingLogWriter {
         } else {
             bytes
         };
+        self.append_bytes(retained)
+    }
+
+    /// Appends one already-sanitized complete record without splitting or truncating it.
+    ///
+    /// # Errors
+    /// Rejects records larger than a generation and reports rotation or write failures.
+    pub fn append_record(&mut self, record: &str) -> Result<(), RollingLogError> {
+        if u64::try_from(record.len()).unwrap_or(u64::MAX) > self.max_bytes {
+            return Err(RollingLogError::RecordTooLarge);
+        }
+        self.append_bytes(record.as_bytes())
+    }
+
+    fn append_bytes(&mut self, retained: &[u8]) -> Result<(), RollingLogError> {
         let retained_len = u64::try_from(retained.len()).unwrap_or(u64::MAX);
         if self.length > 0 && self.length.saturating_add(retained_len) > self.max_bytes {
             self.rotate()?;
@@ -133,6 +148,8 @@ fn remove_if_exists(path: &Path) -> Result<(), RollingLogError> {
 pub enum RollingLogError {
     #[error("rolling log size and retained-file count must be non-zero")]
     InvalidLimits,
+    #[error("complete rolling log record exceeds the generation size limit")]
+    RecordTooLarge,
     #[error("rolling log writer is closed")]
     Closed,
     #[error("rolling log I/O failed at `{path}`: {source}")]
@@ -187,5 +204,25 @@ mod tests {
         drop(writer);
         let path = directory.path().join(format!("{deployment}.log"));
         assert_eq!(std::fs::read(path).unwrap(), b"efgh");
+    }
+
+    #[test]
+    fn complete_records_rotate_whole_and_oversized_record_does_not_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = DeploymentId::new();
+        let mut writer = RollingLogWriter::open(directory.path(), &id, 12, 2).unwrap();
+        writer.append_record("first-line\n").unwrap();
+        writer.append_record("second-line\n").unwrap();
+        assert!(matches!(
+            writer.append_record("too-long-record\n"),
+            Err(RollingLogError::RecordTooLarge)
+        ));
+        drop(writer);
+        let path = directory.path().join(format!("{id}.log"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second-line\n");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("log.1")).unwrap(),
+            "first-line\n"
+        );
     }
 }

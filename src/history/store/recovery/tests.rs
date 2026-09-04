@@ -441,7 +441,7 @@ fn all_legacy_versions_are_read_without_migration_then_migrate_without_invention
         assert_eq!(attention.candidates[0].deployment, id);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let store = HistoryStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         let basis = store.recovery_basis(&id).unwrap();
         assert_eq!(basis.record.project, project);
         assert_eq!(basis.record.environment, environment);
@@ -457,6 +457,41 @@ fn all_legacy_versions_are_read_without_migration_then_migrate_without_invention
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn attention_accepts_current_log_format_schema_without_rewriting_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let store = HistoryStore::open(&path).unwrap();
+    let id = DeploymentId::new();
+    let project = ProjectId::new();
+    let environment = EnvironmentId::new();
+    store
+        .create_deployment(&id, &project, &environment, 1)
+        .unwrap();
+    store.register_event_log(&id, 1024, 3).unwrap();
+    drop(store);
+    let before = std::fs::read(&path).unwrap();
+    let attention =
+        HistoryStore::local_attention(&path, Some(&project), Some(&environment)).unwrap();
+    assert_eq!(attention.candidates.len(), 1);
+    assert_eq!(attention.candidates[0].deployment, id);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT format FROM deployment_logs", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "jsonl_v1"
+    );
 }
 
 #[test]

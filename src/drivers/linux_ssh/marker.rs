@@ -282,7 +282,7 @@ async fn marker_test(
     )
     .map_err(|_| MarkerError::Remote)?;
     let output = session
-        .execute(&command, MARKER_TIMEOUT, cancellation)
+        .execute_allowing(&command, MARKER_TIMEOUT, cancellation, &[0, 1])
         .await
         .map_err(|_| MarkerError::Remote)?;
     match output.exit_status {

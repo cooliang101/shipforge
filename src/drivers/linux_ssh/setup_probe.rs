@@ -92,7 +92,9 @@ async fn run_test(
     cancellation: &CancellationToken,
 ) -> Result<bool, RemoteSetupProbeError> {
     let command = test_command(predicate, root)?;
-    let output = session.execute(&command, timeout, cancellation).await?;
+    let output = session
+        .execute_allowing(&command, timeout, cancellation, &[0, 1])
+        .await?;
     match output.exit_status {
         0 => Ok(true),
         1 => Ok(false),

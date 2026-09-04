@@ -3,6 +3,7 @@ use std::{any::Any, sync::Mutex};
 use async_trait::async_trait;
 
 use super::*;
+mod events;
 use crate::{
     config::{DestinationSettings, HostKeyFingerprint},
     domain::{

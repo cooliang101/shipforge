@@ -248,6 +248,7 @@ fn stale_results_do_not_replace_current_screen_or_clear_the_active_request() {
         id,
         origin: screen(&app),
         cancellation: CancellationToken::new(),
+        execution_progress: None,
     });
     app.finish_management(uuid::Uuid::now_v7(), Err("stale failure".into()));
     assert_eq!(app.management_task.as_ref().unwrap().id, id);

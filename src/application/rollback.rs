@@ -12,7 +12,8 @@ use crate::{
         DeploymentId, DeploymentState,
     },
     drivers::{
-        ActivationReceipt, ComponentExecutionContext, DeploymentDriver, DriverError, ReleaseRef,
+        ActivationReceipt, ComponentExecutionContext, DeploymentDriver, DriverError, EventSink,
+        ReleaseRef,
     },
     history::{
         DeploymentComponentSnapshot, DeploymentMetadata, GitWorktree, HistoryStore, IntentStatus,
@@ -20,7 +21,11 @@ use crate::{
     telemetry::Redactor,
 };
 
-use super::{DeploymentFailure, OrchestrationError, OrchestrationStage, clock::MonotonicClock};
+use super::{
+    DeploymentFailure, OrchestrationError, OrchestrationStage,
+    clock::MonotonicClock,
+    step_events::{NoEvents, ScopedEvents, StepEvents, persistence, step_state},
+};
 
 const RECOVERY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -41,11 +46,19 @@ pub struct RollbackReport {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug)]
 pub struct RollbackOrchestrator<'a> {
     history: &'a HistoryStore,
     redactor: Redactor,
     clock: MonotonicClock,
+    events: &'a dyn EventSink,
+}
+
+impl std::fmt::Debug for RollbackOrchestrator<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RollbackOrchestrator")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> RollbackOrchestrator<'a> {
@@ -55,7 +68,14 @@ impl<'a> RollbackOrchestrator<'a> {
             history,
             redactor,
             clock: MonotonicClock::default(),
+            events: &NoEvents,
         }
+    }
+
+    #[must_use]
+    pub fn with_events(mut self, events: &'a dyn EventSink) -> Self {
+        self.events = events;
+        self
     }
 
     /// Runs an explicit Rollback Deployment linked to its source Deployment.
@@ -75,11 +95,47 @@ impl<'a> RollbackOrchestrator<'a> {
         activation_order: &[ComponentName],
         cancellation: &CancellationToken,
     ) -> Result<RollbackReport, OrchestrationError> {
+        let (deployment, components) = self.prepare_rollback(
+            source_deployment,
+            components,
+            activation_order,
+            cancellation,
+        )?;
+        self.rollback_started(deployment, components, activation_order, cancellation)
+            .await
+    }
+
+    pub(super) fn prepare_rollback(
+        &self,
+        source_deployment: &DeploymentId,
+        components: Vec<RollbackComponent>,
+        activation_order: &[ComponentName],
+        cancellation: &CancellationToken,
+    ) -> Result<(Deployment, BTreeMap<ComponentName, RollbackComponent>), OrchestrationError> {
         let mut components = validate_components(components, activation_order)?;
         for component in components.values_mut() {
             component.context.cancellation = cancellation.clone();
         }
-        let mut deployment = self.start(source_deployment, &components, activation_order)?;
+        let deployment = self.start(source_deployment, &components, activation_order)?;
+        Ok((deployment, components))
+    }
+
+    pub(super) async fn rollback_started(
+        &self,
+        mut deployment: Deployment,
+        components: BTreeMap<ComponentName, RollbackComponent>,
+        activation_order: &[ComponentName],
+        cancellation: &CancellationToken,
+    ) -> Result<RollbackReport, OrchestrationError> {
+        self.events
+            .emit_record(crate::telemetry::log_record::LogEvent {
+                namespace: "deployment.started".into(),
+                message: format!("Rollback Deployment {} started", deployment.id),
+                scope: None,
+                kind: crate::telemetry::log_record::LogEventKind::DeploymentStarted {
+                    deployment: deployment.id.clone(),
+                },
+            });
         let mut warnings = Vec::new();
         if let Some(failure) = self
             .preflight(
@@ -133,6 +189,37 @@ impl<'a> RollbackOrchestrator<'a> {
             compensation_failures: BTreeMap::new(),
             warnings,
         })
+    }
+
+    pub(super) fn log_initialization_failed(
+        &self,
+        deployment: Deployment,
+        cancelled: bool,
+    ) -> OrchestrationError {
+        let terminal = if cancelled {
+            DeploymentState::Cancelled
+        } else {
+            DeploymentState::Failed
+        };
+        let persisted = self.clock.timestamp().and_then(|timestamp| {
+            self.history
+                .transition_deployment(
+                    &deployment.id,
+                    DeploymentState::Running,
+                    terminal,
+                    timestamp,
+                )
+                .map_err(Into::into)
+        });
+        OrchestrationError::Execution {
+            deployment: deployment.id,
+            source: Box::new(OrchestrationError::InvalidInput(
+                "Rollback log initialization failed; no remote mutation started".into(),
+            )),
+            persistence: persisted.err().map(|_| {
+                "Rollback terminal state could not be persisted; inspect durable history before retrying".into()
+            }),
+        }
     }
 
     fn start(
@@ -252,7 +339,13 @@ impl<'a> RollbackOrchestrator<'a> {
                 return Some(DeploymentFailure::Cancelled);
             }
             let component = &components[name];
-            let observed = component.driver.current(&component.context).await;
+            let observed = component
+                .driver
+                .current_with_events(
+                    &component.context,
+                    &ScopedEvents::new(self.events, name, "rollback"),
+                )
+                .await;
             if !self.record_observation(
                 deployment,
                 component,
@@ -300,7 +393,13 @@ impl<'a> RollbackOrchestrator<'a> {
                 return (applied, Some(DeploymentFailure::Cancelled));
             }
             let component = &components[name];
-            let observed = component.driver.current(&component.context).await;
+            let observed = component
+                .driver
+                .current_with_events(
+                    &component.context,
+                    &ScopedEvents::new(self.events, name, "rollback"),
+                )
+                .await;
             if !self.record_observation(
                 deployment,
                 component,
@@ -374,17 +473,24 @@ impl<'a> RollbackOrchestrator<'a> {
             self.warning(warnings, "record Rollback intent");
             return Some(history_failure(component, OrchestrationStage::Rollback));
         };
+        let step_events = StepEvents::start(
+            self.events,
+            name,
+            OrchestrationStage::Rollback.intent_name(),
+        );
         let context = execution_context(&component.context, cancellation.clone());
         let result = component
             .driver
-            .rollback(
+            .rollback_with_events(
                 &deployment.id,
                 &context,
                 Some(&component.expected_current),
                 component.target.as_ref(),
+                &step_events,
             )
             .await;
         self.driver_warnings(warnings, &result);
+        let warnings_before = warnings.len();
         let valid = result
             .as_ref()
             .is_ok_and(|receipt| receipt.current == component.target && receipt.healthy);
@@ -405,8 +511,14 @@ impl<'a> RollbackOrchestrator<'a> {
                 Some(history_failure(component, OrchestrationStage::Rollback))
             }
         } else {
-            let (failure, observed) =
-                failed_rollback(component, result.clone(), cancellation, applied).await;
+            let (failure, observed) = failed_rollback(
+                component,
+                result.clone(),
+                cancellation,
+                applied,
+                &step_events,
+            )
+            .await;
             self.record_observation(
                 deployment,
                 component,
@@ -428,6 +540,10 @@ impl<'a> RollbackOrchestrator<'a> {
             self.warning(warnings, "complete Rollback intent");
             failure.get_or_insert_with(|| history_failure(component, OrchestrationStage::Rollback));
         }
+        step_events.finish(
+            step_state(valid),
+            persistence(warnings.len() == warnings_before),
+        );
         failure
     }
 
@@ -518,7 +634,12 @@ impl<'a> RollbackOrchestrator<'a> {
         let mut failures = BTreeMap::new();
         for applied in applied.iter().rev() {
             let component = &components[&applied.name];
-            let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+            let observed = observe_after_failure(
+                component,
+                RECOVERY_OBSERVATION_TIMEOUT,
+                &ScopedEvents::new(self.events, &applied.name, "compensate"),
+            )
+            .await;
             // Observation persistence is auxiliary during recovery: a write
             // failure must not suppress a safe, separately journaled rollback.
             self.record_observation(
@@ -607,17 +728,24 @@ impl<'a> RollbackOrchestrator<'a> {
         intent: crate::history::IntentId,
         warnings: &mut Vec<String>,
     ) -> (ComponentDeploymentResult, Option<DriverError>) {
+        let step_events = StepEvents::start(
+            self.events,
+            &applied.name,
+            OrchestrationStage::Compensate.intent_name(),
+        );
         let context = execution_context(&component.context, CancellationToken::new());
         let result = component
             .driver
-            .rollback(
+            .rollback_with_events(
                 &deployment.id,
                 &context,
                 component.target.as_ref(),
                 Some(&applied.original),
+                &step_events,
             )
             .await;
         self.driver_warnings(warnings, &result);
+        let warnings_before = warnings.len();
         let valid = result.as_ref().is_ok_and(|receipt| {
             receipt.current.as_ref() == Some(&applied.original) && receipt.healthy
         });
@@ -649,7 +777,9 @@ impl<'a> RollbackOrchestrator<'a> {
                 )
             }
             Err(error) => {
-                let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+                let observed =
+                    observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT, &step_events)
+                        .await;
                 self.record_observation(
                     deployment,
                     component,
@@ -675,6 +805,10 @@ impl<'a> RollbackOrchestrator<'a> {
         if self.complete_intent(intent, driver_result, valid).is_err() {
             self.warning(warnings, "complete Rollback compensation intent");
         }
+        step_events.finish(
+            step_state(valid),
+            persistence(warnings.len() == warnings_before),
+        );
         (result, failure)
     }
 
@@ -902,6 +1036,7 @@ async fn failed_rollback(
     result: Result<ActivationReceipt, DriverError>,
     cancellation: &CancellationToken,
     applied: &mut Vec<AppliedRollback>,
+    events: &dyn EventSink,
 ) -> (DeploymentFailure, Result<Option<ReleaseRef>, DriverError>) {
     let name = &component.context.component;
     let was_error = result.is_err();
@@ -911,7 +1046,7 @@ async fn failed_rollback(
         message: "Driver Rollback receipt is unhealthy or differs from the requested target".into(),
         suggested_action: "inspect the current Release and restore it manually".into(),
     });
-    let observation = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+    let observation = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT, events).await;
     let failure = match &observation {
         Ok(observed) => {
             // Only a successful observation can prove that the target, including
@@ -956,12 +1091,29 @@ fn history_failure(component: &RollbackComponent, stage: OrchestrationStage) -> 
 async fn observe_after_failure(
     component: &RollbackComponent,
     timeout: Duration,
+    events: &dyn EventSink,
 ) -> Result<Option<ReleaseRef>, DriverError> {
     let context = execution_context(&component.context, CancellationToken::new());
-    if let Ok(result) = tokio::time::timeout(timeout, component.driver.current(&context)).await {
+    if let Ok(result) = tokio::time::timeout(
+        timeout,
+        component.driver.current_with_events(&context, events),
+    )
+    .await
+    {
         result
     } else {
         context.cancellation.cancel();
+        events.emit_record(crate::telemetry::log_record::LogEvent {
+            namespace: "observe.command".into(),
+            message:
+                "Observation deadline expired; no complete failed-command snapshot is available."
+                    .into(),
+            scope: None,
+            kind: crate::telemetry::log_record::LogEventKind::CommandUnavailable {
+                location: crate::telemetry::log_record::CommandLocation::Remote,
+                index: None,
+            },
+        });
         Err(DriverError {
             stage: "observe".into(),
             target: context.component.to_string(),

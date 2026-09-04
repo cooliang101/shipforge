@@ -19,6 +19,11 @@ use crate::{
 };
 
 pub use crate::history::DeploymentDetails;
+mod logs;
+pub use logs::{
+    HistoryLogScope, LogCoverage, LogCoverageIssue, LogCursor, LogEntry, LogEntryContent,
+    LogExportFormat, LogFilter, LogReadPage, LogReadQuery, PreparedLogExport,
+};
 
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
@@ -92,6 +97,8 @@ pub enum HistoryQueryError {
     LogChanged,
     #[error("Historical log exceeds bounded file or text limits")]
     LogLimit,
+    #[error("Historical log operation was cancelled")]
+    Cancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -282,10 +289,28 @@ impl HistoryQueryService {
         if !available.contains(&query.generation) {
             return Ok(empty_log(query, HistoricalLogStatus::Missing, available));
         }
-        let path = log_path(&directory, id, query.generation);
-        let bytes = read_log(&directory, &path, index.max_bytes)?;
-        // Writers may retain a UTF-8 tail or split a chunk; invalid bytes are visible replacements.
-        let text = self.safe_text(&String::from_utf8_lossy(&bytes))?;
+        // The compatibility API cannot express partial evidence. Structured callers
+        // should use read_logs for explicit coverage and cross-generation search.
+        let text = match index.format {
+            crate::history::DeploymentLogFormat::LegacyText => {
+                let (text, verified_available) = logs::compatibility_legacy_page(
+                    self,
+                    &HistoryLogScope {
+                        project: project.clone(),
+                        environment: environment.clone(),
+                        deployment: id.clone(),
+                    },
+                    query.generation,
+                )?;
+                available = verified_available;
+                text
+            }
+            crate::history::DeploymentLogFormat::JsonlV1 => {
+                let path = log_path(&directory, id, query.generation);
+                let bytes = read_log(&directory, &path, index.max_bytes)?;
+                logs::compatibility_text(&bytes, &self.redactor)?
+            }
+        };
         paginate_log(&text, query, available)
     }
 
@@ -294,29 +319,8 @@ impl HistoryQueryService {
     }
 
     fn safe_text(&self, text: &str) -> Result<String, HistoryQueryError> {
-        let mut text = text.to_owned();
-        for secret in self.redactor.values() {
-            text = text.replace(secret, "[REDACTED]");
-            if text.len() > MAX_TEXT_BYTES {
-                return Err(HistoryQueryError::LogLimit);
-            }
-        }
-        text.retain(|character| {
-            (!character.is_control() || matches!(character, '\n' | '\t'))
-                && !matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        });
-        // Removing terminal controls can join previously separated secret bytes.
-        // Reapply redaction before deriving any page offsets from the visible text.
-        for secret in self.redactor.values() {
-            text = text.replace(secret, "[REDACTED]");
-            if text.len() > MAX_TEXT_BYTES {
-                return Err(HistoryQueryError::LogLimit);
-            }
-        }
-        if text.len() > MAX_TEXT_BYTES {
-            return Err(HistoryQueryError::LogLimit);
-        }
-        Ok(text)
+        crate::telemetry::log_record::sanitize_log_text(text, &self.redactor, MAX_TEXT_BYTES)
+            .map_err(|_| HistoryQueryError::LogLimit)
     }
 
     fn sanitize_details(&self, details: &mut DeploymentDetails) -> Result<(), HistoryQueryError> {
@@ -493,7 +497,7 @@ fn open_log(path: &Path) -> Result<File, HistoryQueryError> {
     options.open(path).map_err(|_| HistoryQueryError::LogIo)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStamp {
     size: u64,
     modified: Option<SystemTime>,

@@ -7,6 +7,7 @@ use std::{
 use async_trait::async_trait;
 
 use super::*;
+mod events;
 use crate::{
     application::{DeploymentOrchestrator, PlannedComponent},
     domain::{

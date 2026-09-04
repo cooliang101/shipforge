@@ -7,6 +7,7 @@ use std::{
 use async_trait::async_trait;
 
 use super::*;
+mod events;
 use crate::{
     domain::{
         ComponentGeneration, DestinationKey, DestinationRevision, DriverCapabilities,
@@ -136,6 +137,17 @@ impl DeploymentDriver for FakeDriver {
             .current
             .get(&context.component)
             .cloned())
+    }
+    async fn current_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        events: &dyn EventSink,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        let result = self.current(context).await;
+        if result.is_err() {
+            events::failed_observation(events, &context.component);
+        }
+        result
     }
     async fn prepare(
         &self,
@@ -653,11 +665,16 @@ async fn failed_rollback_observation_has_a_finite_deadline() {
     let fixture = Fixture::new();
     let component = fixture.component("worker", None);
     fixture.state.lock().unwrap().hang_observation = true;
-    let error = observe_after_failure(&component, Duration::from_millis(1))
+    let records = crate::application::step_events::tests::Records::default();
+    let error = observe_after_failure(&component, Duration::from_millis(1), &records)
         .await
         .unwrap_err();
     assert_eq!(error.stage, "observe");
     assert!(error.message.contains("timed out"));
+    assert!(matches!(
+        records.0.lock().unwrap()[0].kind,
+        crate::telemetry::log_record::LogEventKind::CommandUnavailable { .. }
+    ));
 }
 
 #[tokio::test]

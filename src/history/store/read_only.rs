@@ -334,7 +334,7 @@ fn bound_details(connection: &Connection, deployment: &DeploymentId) -> Result<(
     let mut count = 0_usize;
     for (table, columns, limit) in [
         ("deployment_metadata", "metadata", 1_u32),
-        ("deployment_logs", "relative_path", 1),
+        ("deployment_logs", "relative_path,format", 1),
         ("component_snapshots", "component,snapshot", 256),
         (
             "component_results",

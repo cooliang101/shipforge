@@ -46,4 +46,6 @@ Never store secrets in `shipforge.yaml`. Validate SSH host keys, separate argume
 
 History browsing must not create or migrate storage. Public errors must not echo raw parser/SQLite diagnostics; retain operation context and known outcomes. Require unmodified confirmation keys, and wait for tracked workers before leaving or exiting.
 
+Log format comes from the history index, never JSON-looking output. Reassemble explicit fragments before redaction; search/export only verified retained evidence. Copy recorded failed argv, never reconstructed commands. Export freezes sanitized bytes and requires explicit no-clobber confirmation; clipboard requests have no acknowledgement.
+
 History rules are in `docs/architecture.md`: distinguish unknown from absent and retain known outcomes on persistence failures. Keep `recovery_reports`/`recovery_report_components` and `deployment_revisions` separate from original outcomes; never complete old intents or reconstruct missing YAML/history. Inventory is not health or historical endpoint proof; auxiliary JSONL must not prevent compensation. Cleanup needs original package evidence and a fresh per-version intent; unknown outcomes stay pending, and cleanup failure never compensates a successful deployment.

@@ -17,7 +17,13 @@ use crate::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{DeploymentComponent, clock::MonotonicClock, orchestrator::planned_release_ref};
+use super::{
+    DeploymentComponent,
+    clock::MonotonicClock,
+    orchestrator::planned_release_ref,
+    step_events::{StepEvents, persistence, step_state},
+};
+use crate::telemetry::log_record::{LogPersistence, LogStepState};
 
 pub const DEFAULT_RETAIN_COUNT: usize = 5;
 const MAX_CANDIDATES: usize = 16;
@@ -341,7 +347,7 @@ impl RetentionRun<'_> {
         context: &crate::drivers::ComponentExecutionContext,
         policy: &RetentionPolicy,
         deadline: tokio::time::Instant,
-    ) -> Result<crate::history::IntentId, String> {
+    ) -> Result<(crate::history::IntentId, StepEvents<'_>), String> {
         let version = &policy.candidate.release.version;
         let intent = self
             .history
@@ -355,6 +361,11 @@ impl RetentionRun<'_> {
                     .map_err(|_| "cleanup clock unavailable")?,
             )
             .map_err(|_| "cleanup intent could not be persisted; no deletion started")?;
+        let step_events = StepEvents::start(
+            self.events,
+            &context.component,
+            &format!("cleanup.{version}"),
+        );
         // Database contention can consume the earlier budget check. Recheck after
         // journaling; a known non-start is not an uncertain remote side effect.
         let not_started = if self.cancellation.is_cancelled() || context.cancellation.is_cancelled()
@@ -367,20 +378,33 @@ impl RetentionRun<'_> {
             None
         };
         if let Some(diagnostic) = not_started {
-            self.history
-                .complete_intent(
-                    intent,
-                    IntentStatus::Failed,
-                    Some(diagnostic),
-                    self.clock.timestamp().map_err(|_| {
-                        "cleanup not started but result time unavailable; intent remains pending"
-                    })?,
-                    self.redactor,
-                )
-                .map_err(|_| format!("{diagnostic}; outcome could not be saved; intent remains pending"))?;
+            let completed = self
+                .clock
+                .timestamp()
+                .map_err(|_| {
+                    "cleanup not started but result time unavailable; intent remains pending"
+                        .to_owned()
+                })
+                .and_then(|timestamp| {
+                    self.history
+                        .complete_intent(
+                            intent,
+                            IntentStatus::Failed,
+                            Some(diagnostic),
+                            timestamp,
+                            self.redactor,
+                        )
+                        .map_err(|_| {
+                            format!(
+                                "{diagnostic}; outcome could not be saved; intent remains pending"
+                            )
+                        })
+                });
+            step_events.finish(LogStepState::Skipped, persistence(completed.is_ok()));
+            completed?;
             return Err(diagnostic.into());
         }
-        Ok(intent)
+        Ok((intent, step_events))
     }
 
     async fn delete_candidate(
@@ -391,9 +415,9 @@ impl RetentionRun<'_> {
         policy: &RetentionPolicy,
         deadline: tokio::time::Instant,
     ) -> Result<(), String> {
-        let intent = self.begin_candidate(deployment, context, policy, deadline)?;
+        let (intent, step_events) = self.begin_candidate(deployment, context, policy, deadline)?;
         let version = &policy.candidate.release.version;
-        self.events.emit(DriverLog {
+        step_events.emit(DriverLog {
             namespace: "retention.started".into(),
             message: format!(
                 "Removing expired version {version} for {}",
@@ -403,7 +427,10 @@ impl RetentionRun<'_> {
         // Guarded Drivers revalidate the saved YAML/registry before mutation.
         let outcome = tokio::time::timeout(
             CLEANUP_TIMEOUT,
-            component.planned.driver.cleanup(context, policy),
+            component
+                .planned
+                .driver
+                .cleanup_with_events(context, policy, &step_events),
         )
         .await;
         let (result, resolved) = match outcome {
@@ -428,6 +455,8 @@ impl RetentionRun<'_> {
             }
         };
         if !resolved {
+            // An auxiliary error observation does not complete the durable intent.
+            step_events.finish(LogStepState::Unknown, LogPersistence::Unconfirmed);
             let diagnostic = result
                 .as_ref()
                 .err()
@@ -455,11 +484,14 @@ impl RetentionRun<'_> {
             Ok(()) => (IntentStatus::Succeeded, None),
             Err(error) => (IntentStatus::Failed, Some(error.as_str())),
         };
-        self.history.complete_intent(intent, status, diagnostic,
-                self.clock.timestamp().map_err(|_| "cleanup completed but result time could not be recorded")?, self.redactor)
-                .map_err(|_| format!("cleanup of {version} returned {result:?}, but its local outcome could not be saved; stop and inspect"))?;
+        let completed = self.clock.timestamp()
+            .map_err(|_| "cleanup completed but result time could not be recorded".to_owned())
+            .and_then(|timestamp| self.history.complete_intent(intent, status, diagnostic, timestamp, self.redactor)
+                .map_err(|_| format!("cleanup of {version} returned {result:?}, but its local outcome could not be saved; stop and inspect")));
+        step_events.finish(step_state(result.is_ok()), persistence(completed.is_ok()));
+        completed?;
         result?;
-        self.events.emit(DriverLog {
+        step_events.emit(DriverLog {
             namespace: "retention.finished".into(),
             message: format!(
                 "Removed expired version {version} for {}",

@@ -71,6 +71,14 @@ struct Candidate {
 
 #[async_trait]
 trait InventoryRemote: Sync {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, InventoryError> {
+        self.command(command, cancellation).await
+    }
+
     async fn check_root(
         &self,
         target: &LinuxSshTarget,
@@ -92,6 +100,20 @@ trait InventoryRemote: Sync {
 
 #[async_trait]
 impl InventoryRemote for AuthenticatedSession {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, InventoryError> {
+        self.execute_allowing(command, COMMAND_TIMEOUT, cancellation, &[0, 1])
+            .await
+            .map_err(|error| match error {
+                SshConnectionError::Cancelled => InventoryError::Cancelled,
+                SshConnectionError::Timeout { .. } => InventoryError::Timeout,
+                _ => InventoryError::Remote,
+            })
+    }
+
     async fn check_root(
         &self,
         target: &LinuxSshTarget,
@@ -596,7 +618,12 @@ async fn test<R: InventoryRemote>(
     path: &str,
     cancellation: &CancellationToken,
 ) -> Result<bool, InventoryError> {
-    let output = raw_command(remote, "test", &[flag, path], cancellation).await?;
+    if cancellation.is_cancelled() {
+        return Err(InventoryError::Cancelled);
+    }
+    let command = CommandSpec::structured("test", [flag, path].map(CommandArgument::plain))
+        .map_err(|_| InventoryError::Remote)?;
+    let output = remote.predicate(&command, cancellation).await?;
     if output.stdout_truncated || output.stderr_truncated || !output.stdout.is_empty() {
         return Err(InventoryError::Remote);
     }

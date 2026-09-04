@@ -24,7 +24,7 @@ async fn finish(app: &mut App) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             app.poll_background();
-            if app.management_task.is_none() {
+            if app.management_task.is_none() && !app.log_workspace_busy() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -197,10 +197,21 @@ async fn browse_removed_environment(
     }
     press(app, KeyCode::Char('l'));
     finish(app).await;
-    let ManagementPage::Logs { page, .. } = screen(app).page else {
-        panic!("old logs expected")
-    };
-    assert_eq!(page.text, "retired-environment-log");
+    assert!(matches!(screen(app).page, ManagementPage::Detail(_)));
+    let workspace = app.log_workspace.as_ref().expect("historical logs overlay");
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal
+        .draw(|frame| workspace.render(frame, frame.area()))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(text.contains("retired-environment-log"));
+    assert!(text.contains(&old_deployment.to_string()));
     press(app, KeyCode::Esc); // detail
     press(app, KeyCode::Esc); // historical Home
     press(app, KeyCode::Char('p'));

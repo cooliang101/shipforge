@@ -6,7 +6,7 @@ ShipForge is a Rust TUI for building local project Components and deploying thei
 
 M1's safe deployment loop and M2's history/recovery management have passed their scoped acceptance, but this is not a production-ready release. Setup, deployment planning, live logs, cancellation, and rollback are implemented. Real two-Destination deployment and [WSL systemd lifecycle tests](docs/validation/systemd-acceptance.md) pass. M2 provides [detailed history](docs/validation/his-01.md), [remote inventory and audit](docs/validation/his-02.md), [read-only reconciliation](docs/validation/rec-01.md), [Release retention](docs/validation/ret-01.md), and [project/connection and history management](docs/validation/tui-mgt-01.md).
 
-[TUI-01](docs/validation/tui-01.md) and [TUI-02](docs/validation/tui-02.md) have passed scoped automated acceptance for navigation, confirmations, searchable candidates, manual setup, per-Component remote directory/service selection and confirmed managed-section reinitialization. Log interaction, remaining M3 consistency/exit/performance work and M4 security, platform, packaging and final MVP acceptance remain on the [roadmap](docs/roadmap.md).
+[TUI-01](docs/validation/tui-01.md) and [TUI-02](docs/validation/tui-02.md) have passed scoped automated acceptance for navigation, confirmations, searchable candidates, manual setup, per-Component remote directory/service selection and confirmed managed-section reinitialization. [TUI-03](docs/validation/tui-03.md) has passed scoped automated acceptance for step timing, retained-log search/filtering, recorded failed-command copying and confirmed local export. Remaining M3 consistency/exit/performance work and M4 security, platform, packaging and final MVP acceptance remain on the [roadmap](docs/roadmap.md).
 
 An early real SSH connection timeout and a separate unknown current observation remain unexplained despite passing subsequent tests; a common cause is unproven. Their evidence and diagnostics are retained for platform validation, not treated as resolved by the TUI changes.
 
@@ -19,6 +19,8 @@ cargo run
 ```
 
 All user operations are inside the TUI; there are no deployment subcommands. Select a project directory, confirm discovered Components or add one manually, and select an SSH connection and key. Use `F1` for help and `F4` to search supported candidate lists. Each Component can browse/select its own remote directory and optional service. Confirm the YAML preview to save `shipforge.yaml` in the project root; saving does not deploy. Never put secrets or private-key paths in that file. The target needs standard Linux SSH/SFTP and deployment tools, plus systemd or curl when configured; it does not need a ShipForge daemon.
+
+During execution or from history details, `l` opens logs: `/` searches retained files, `f`/`t` filters Components/steps, `p` shows progress, and `e`/`s` previews log/summary export before confirmation. `y` requests copying recorded, redacted failed argv as diagnostic JSON; terminal clipboard permission is required and delivery is not acknowledged. See the [TUI guide](docs/tui-guide.md#步骤与日志) for scope and limits.
 
 ## Verify changes
 

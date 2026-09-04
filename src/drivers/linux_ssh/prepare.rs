@@ -185,6 +185,15 @@ impl AuthenticatedSession {
 
 #[async_trait]
 trait ReleaseRemote: Sync {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, SshConnectionError> {
+        self.command(command, timeout, cancellation).await
+    }
+
     async fn upload(
         &self,
         local_path: &Path,
@@ -212,6 +221,16 @@ trait ReleaseRemote: Sync {
 
 #[async_trait]
 impl ReleaseRemote for AuthenticatedSession {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, SshConnectionError> {
+        self.execute_allowing(command, timeout, cancellation, &[0, 1])
+            .await
+    }
+
     async fn upload(
         &self,
         local_path: &Path,
@@ -520,15 +539,12 @@ async fn remote_exists<R: ReleaseRemote>(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<bool, PrepareReleaseError> {
-    let output = run(
-        remote,
-        "inspect remote path",
-        "test",
-        ["-e", path],
-        timeout,
-        cancellation,
-    )
-    .await?;
+    let command = CommandSpec::structured("test", ["-e", path].map(CommandArgument::plain))
+        .map_err(|error| PrepareReleaseError::InvalidCommand(error.to_string()))?;
+    let output = remote
+        .predicate(&command, timeout, cancellation)
+        .await
+        .map_err(|error| map_ssh_error("inspect remote path", &error))?;
     match output.exit_status {
         0 => Ok(true),
         1 => Ok(false),

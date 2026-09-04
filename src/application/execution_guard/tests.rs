@@ -3,6 +3,7 @@ use std::{any::Any, collections::BTreeSet, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+mod events;
 use crate::{
     application::{DeploymentComponent, DeploymentOrchestrator, PlannedComponent},
     config::{DestinationSettings, HostKeyFingerprint},
@@ -136,6 +137,14 @@ impl DeploymentDriver for FakeDriver {
             .get(&context.component)
             .cloned())
     }
+    async fn current_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        events: &dyn EventSink,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        events::driver_event(events, "observe");
+        self.current(context).await
+    }
     async fn prepare(
         &self,
         _: &DeploymentId,
@@ -226,6 +235,40 @@ impl DeploymentDriver for FakeDriver {
             .actions
             .push(format!("cleanup:{}", context.component));
         Ok(CleanupReport::default())
+    }
+
+    async fn activate_with_events(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        release: &ReleaseRef,
+        events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        events::driver_event(events, "activate");
+        self.activate(deployment, context, release).await
+    }
+
+    async fn rollback_with_events(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+        expected_current: Option<&ReleaseRef>,
+        release: Option<&ReleaseRef>,
+        events: &dyn EventSink,
+    ) -> Result<ActivationReceipt, DriverError> {
+        events::driver_event(events, "rollback");
+        self.rollback(deployment, context, expected_current, release)
+            .await
+    }
+
+    async fn cleanup_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        policy: &RetentionPolicy,
+        events: &dyn EventSink,
+    ) -> Result<CleanupReport, DriverError> {
+        events::driver_event(events, "cleanup");
+        self.cleanup(context, policy).await
     }
 }
 

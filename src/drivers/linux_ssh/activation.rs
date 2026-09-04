@@ -319,10 +319,29 @@ trait ActivationRemote: Sync {
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<RemoteCommandOutput, SshConnectionError>;
+
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, SshConnectionError> {
+        self.command(command, timeout, cancellation).await
+    }
 }
 
 #[async_trait]
 impl ActivationRemote for AuthenticatedSession {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, SshConnectionError> {
+        self.execute_allowing(command, timeout, cancellation, &[0, 1])
+            .await
+    }
+
     async fn command(
         &self,
         command: &CommandSpec,
@@ -1207,15 +1226,12 @@ async fn test_path<R: ActivationRemote>(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<bool, ActivateReleaseError> {
-    let output = run(
-        remote,
-        stage,
-        "test",
-        [predicate, path],
-        timeout,
-        cancellation,
-    )
-    .await?;
+    let command = CommandSpec::structured("test", [predicate, path].map(CommandArgument::plain))
+        .map_err(|error| ActivateReleaseError::InvalidCommand(error.to_string()))?;
+    let output = remote
+        .predicate(&command, timeout, cancellation)
+        .await
+        .map_err(|error| map_ssh_error(stage, &error))?;
     match output.exit_status {
         0 => Ok(true),
         1 => Ok(false),

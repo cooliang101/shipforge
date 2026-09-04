@@ -12,6 +12,10 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::telemetry::log_record::{
+    LOG_RECORD_VERSION, LogEvent, LogEventKind, LogFragment, LogRecord, encode_log_record,
+    split_log_event,
+};
 use crate::{
     adapters::OutputStream,
     domain::{ComponentName, DeploymentId},
@@ -68,9 +72,12 @@ pub(super) struct DeploymentLogSink<'a> {
     state: Arc<WriterState>,
     redactor: Redactor,
     started: Instant,
+    events: bool,
+    event_sequence: Mutex<()>,
 }
 
 impl<'a> DeploymentLogSink<'a> {
+    #[cfg(test)]
     pub(super) fn open(
         directory: &Path,
         deployment: &DeploymentId,
@@ -94,6 +101,33 @@ impl<'a> DeploymentLogSink<'a> {
             path: directory.to_owned(),
             source,
         })
+    }
+
+    pub(super) fn open_events(
+        directory: &Path,
+        deployment: &DeploymentId,
+        ui: &'a dyn EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, RollingLogError> {
+        let mut writer =
+            RollingLogWriter::open(directory, deployment, LOG_MAX_BYTES, LOG_RETAINED_FILES)?;
+        let mut sink = Self::with_writer(
+            ui,
+            cancellation,
+            environment_redactor(),
+            QUEUED_WRITES,
+            move |text| {
+                writer
+                    .append_record(text)
+                    .map_err(|_| "deployment log write failed".into())
+            },
+        )
+        .map_err(|source| RollingLogError::Io {
+            path: directory.to_owned(),
+            source,
+        })?;
+        sink.events = true;
+        Ok(sink)
     }
 
     fn with_writer(
@@ -134,6 +168,8 @@ impl<'a> DeploymentLogSink<'a> {
             state,
             redactor,
             started: Instant::now(),
+            events: false,
+            event_sequence: Mutex::new(()),
         })
     }
 
@@ -171,32 +207,45 @@ impl<'a> DeploymentLogSink<'a> {
             while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
-            let result = self
-                .sender
-                .lock()
-                .map_err(|_| "deployment log sender is unavailable")
-                .and_then(|sender| {
-                    let sender = sender.as_ref().ok_or("deployment log is already closed")?;
-                    sender
-                        .try_send(remaining[..end].to_owned())
-                        .map_err(|error| match error {
-                            TrySendError::Full(_) => {
-                                "deployment log queue is full; output could not be persisted"
-                            }
-                            TrySendError::Disconnected(_) => "deployment log writer disconnected",
-                        })
-                });
-            if let Err(error) = result {
-                self.state.fail(error.into());
-                return;
-            }
+            self.enqueue_complete(remaining[..end].to_owned());
             remaining = &remaining[end..];
+        }
+    }
+
+    fn enqueue_complete(&self, text: String) {
+        if self.failure().is_some() {
+            return;
+        }
+        let result = self
+            .sender
+            .lock()
+            .map_err(|_| "deployment log sender is unavailable")
+            .and_then(|sender| {
+                let sender = sender.as_ref().ok_or("deployment log is already closed")?;
+                sender.try_send(text).map_err(|error| match error {
+                    TrySendError::Full(_) => {
+                        "deployment log queue is full; output could not be persisted"
+                    }
+                    TrySendError::Disconnected(_) => "deployment log writer disconnected",
+                })
+            });
+        if let Err(error) = result {
+            self.state.fail(error.into());
         }
     }
 }
 
 impl EventSink for DeploymentLogSink<'_> {
     fn emit(&self, event: DriverLog) {
+        if self.events {
+            self.emit_record(LogEvent {
+                namespace: event.namespace,
+                message: event.message,
+                scope: None,
+                kind: LogEventKind::Output,
+            });
+            return;
+        }
         let namespace = plain_text(&self.redactor.redact(&event.namespace), 128);
         let message = self.redactor.redact(&event.message);
         // Disk receives the complete sanitized text. Only the UI projection is
@@ -209,6 +258,51 @@ impl EventSink for DeploymentLogSink<'_> {
             namespace,
             message: plain_text(&message, MAX_UI_CHARACTERS),
         });
+    }
+
+    fn emit_record(&self, event: LogEvent) {
+        if !self.events {
+            self.emit(DriverLog {
+                namespace: event.namespace,
+                message: event.message,
+            });
+            return;
+        }
+        let Ok(events) = split_log_event(&event, &self.redactor) else {
+            self.state
+                .fail("deployment log event could not be safely recorded".into());
+            return;
+        };
+        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let Ok(_sequence) = self.event_sequence.lock() else {
+            self.state
+                .fail("deployment event ordering is unavailable".into());
+            return;
+        };
+        let count = u32::try_from(events.len()).unwrap_or(u32::MAX);
+        let event_id = uuid::Uuid::now_v7();
+        for (index, event) in events.into_iter().enumerate() {
+            let record = LogRecord {
+                version: LOG_RECORD_VERSION,
+                elapsed_ms,
+                fragment: (count > 1).then_some(LogFragment {
+                    event_id,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    count,
+                }),
+                event,
+            };
+            match encode_log_record(&record, &Redactor::default()) {
+                Ok(text) => self.enqueue_complete(text),
+                Err(_) => self
+                    .state
+                    .fail("deployment log record exceeded its safe limits".into()),
+            }
+            // Structured events already contain bounded, sanitized fields. The
+            // viewer owns window eviction; do not silently truncate full-record
+            // detail or erase newlines before that viewer receives the event.
+            self.ui.emit_record(record.event);
+        }
     }
 }
 

@@ -19,7 +19,11 @@ use crate::{
     telemetry::Redactor,
 };
 
-use super::{PlannedComponent, clock::MonotonicClock};
+use super::{
+    PlannedComponent,
+    clock::MonotonicClock,
+    step_events::{ScopedEvents, StepEvents, persistence, step_state},
+};
 
 const RECOVERY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -468,11 +472,12 @@ impl<'a> DeploymentOrchestrator<'a> {
             }
             let component = &components[name];
             let receipt = &prepared[name];
-            events.emit(crate::drivers::DriverLog {
-                namespace: "activate.started".into(),
-                message: format!("Activating {name} and checking health"),
-            });
-            let result = match self.activate(deployment, name, component, receipt).await {
+            let scoped_events = ScopedEvents::new(events, name, "activate");
+            let events = &scoped_events as &dyn EventSink;
+            let result = match self
+                .activate(deployment, name, component, receipt, events)
+                .await
+            {
                 Ok(result) => result,
                 Err(error) => {
                     let message = format!(
@@ -513,6 +518,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                                 component,
                                 receipt,
                                 &mut activated,
+                                events,
                             )
                             .await;
                         return Ok((activated, Some(failure)));
@@ -531,7 +537,8 @@ impl<'a> DeploymentOrchestrator<'a> {
                 }
                 Err(error) => {
                     let observed =
-                        observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+                        observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT, events)
+                            .await;
                     self.observation(&deployment.id, name, "activate.failure", &observed, None);
                     let failure = activation_failure(
                         component,
@@ -562,9 +569,10 @@ impl<'a> DeploymentOrchestrator<'a> {
         component: &DeploymentComponent,
         receipt: &PreparedRelease,
         activated: &mut Vec<ActivatedComponent>,
+        events: &dyn EventSink,
     ) -> DeploymentFailure {
         let name = &component.planned.context.component;
-        let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+        let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT, events).await;
         self.observation(
             &deployment.id,
             name,
@@ -601,6 +609,8 @@ impl<'a> DeploymentOrchestrator<'a> {
             component.package.release().version.as_str(),
             self.timestamp()?,
         )?;
+        let step_events =
+            StepEvents::start(events, name, OrchestrationStage::Prepare.intent_name());
         let mut result = component
             .planned
             .driver
@@ -609,7 +619,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                 &component.planned.context,
                 &component.planned.plan,
                 &component.package,
-                events,
+                &step_events,
             )
             .await;
         if result
@@ -622,6 +632,7 @@ impl<'a> DeploymentOrchestrator<'a> {
                 "Driver returned a Release identity different from the frozen plan",
             ));
         }
+        let prepared = result.is_ok();
         if let Ok(receipt) = &result {
             let persisted = self.timestamp().and_then(|timestamp| {
                 self.history
@@ -643,7 +654,12 @@ impl<'a> DeploymentOrchestrator<'a> {
             }
         }
         let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
-        self.complete_intent(intent, &outcome)?;
+        let completed = self.complete_intent(intent, &outcome);
+        step_events.finish(
+            step_state(prepared),
+            persistence(completed.is_ok() && (!prepared || result.is_ok())),
+        );
+        completed?;
         Ok(result)
     }
 
@@ -653,6 +669,7 @@ impl<'a> DeploymentOrchestrator<'a> {
         name: &ComponentName,
         component: &DeploymentComponent,
         prepared: &PreparedRelease,
+        events: &dyn EventSink,
     ) -> Result<Result<ActivationReceipt, DriverError>, OrchestrationError> {
         let intent = self.history.record_intent(
             &deployment.id,
@@ -661,13 +678,21 @@ impl<'a> DeploymentOrchestrator<'a> {
             prepared.release.version.as_str(),
             self.timestamp()?,
         )?;
+        let step_events =
+            StepEvents::start(events, name, OrchestrationStage::Activate.intent_name());
+        step_events.emit(crate::drivers::DriverLog {
+            namespace: "activate.started".into(),
+            message: format!("Activating {name} and checking health"),
+        });
+        let warnings_before = self.history_warnings.borrow().len();
         let result = component
             .planned
             .driver
-            .activate(
+            .activate_with_events(
                 &deployment.id,
                 &component.planned.context,
                 &prepared.release,
+                &step_events,
             )
             .await;
         self.remember_driver_warnings(&result);
@@ -712,6 +737,10 @@ impl<'a> DeploymentOrchestrator<'a> {
             ),
         }
         self.remember_history_error(self.complete_intent(intent, &outcome));
+        step_events.finish(
+            step_state(outcome.is_ok()),
+            persistence(self.history_warnings.borrow().len() == warnings_before),
+        );
         Ok(result)
     }
 
@@ -824,11 +853,9 @@ impl<'a> DeploymentOrchestrator<'a> {
     ) -> Result<BTreeMap<ComponentName, DriverError>, OrchestrationError> {
         let mut failures = BTreeMap::new();
         for activated in activated.iter().rev() {
-            events.emit(crate::drivers::DriverLog {
-                namespace: "compensate.started".into(),
-                message: format!("Restoring {} to its previous state", activated.name),
-            });
             let component = &components[&activated.name];
+            let scoped_events = ScopedEvents::new(events, &activated.name, "compensate");
+            let events = &scoped_events as &dyn EventSink;
             let intent = self.history.record_intent(
                 &deployment.id,
                 &activated.name,
@@ -843,39 +870,44 @@ impl<'a> DeploymentOrchestrator<'a> {
                 Ok(intent) => intent,
                 Err(error) => {
                     let (result, error) = self
-                        .blocked_compensation(deployment, component, error)
+                        .blocked_compensation(deployment, component, error, events)
                         .await;
                     results.insert(activated.name.clone(), result);
                     failures.insert(activated.name.clone(), error);
                     continue;
                 }
             };
+            let step_events = StepEvents::start(
+                events,
+                &activated.name,
+                OrchestrationStage::Compensate.intent_name(),
+            );
+            step_events.emit(crate::drivers::DriverLog {
+                namespace: "compensate.started".into(),
+                message: format!("Restoring {} to its previous state", activated.name),
+            });
+            let warnings_before = self.history_warnings.borrow().len();
             let context = recovery_context(&component.planned.context);
             let rollback = component
                 .planned
                 .driver
-                .rollback(
+                .rollback_with_events(
                     &deployment.id,
                     &context,
                     activated.observed.as_ref(),
                     activated.previous.as_ref(),
+                    &step_events,
                 )
                 .await;
             self.remember_driver_warnings(&rollback);
-            let rollback = rollback.and_then(|receipt| {
-                if receipt.current == activated.previous && receipt.healthy {
-                    Ok(receipt)
-                } else {
-                    Err(contract_driver_error(
-                        "compensate",
-                        &activated.name,
-                        "Driver rollback receipt is unhealthy or differs from the pre-activation Release",
-                    ))
-                }
-            });
+            let rollback = validate_compensation_receipt(rollback, activated);
             let intent_outcome = rollback.as_ref().map(|_| ()).map_err(Clone::clone);
             self.compensation_observation(&deployment.id, &activated.name, &rollback);
             self.remember_history_error(self.complete_intent(intent, &intent_outcome));
+            step_events.finish(
+                step_state(intent_outcome.is_ok()),
+                persistence(self.history_warnings.borrow().len() == warnings_before),
+            );
             let (outcome, observed) = match rollback {
                 Ok(receipt) => (
                     ComponentOutcome::Compensated,
@@ -883,7 +915,8 @@ impl<'a> DeploymentOrchestrator<'a> {
                 ),
                 Err(error) => {
                     let observation =
-                        observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+                        observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT, events)
+                            .await;
                     self.observation(
                         &deployment.id,
                         &activated.name,
@@ -960,6 +993,7 @@ impl<'a> DeploymentOrchestrator<'a> {
         deployment: &Deployment,
         component: &DeploymentComponent,
         error: HistoryError,
+        events: &dyn EventSink,
     ) -> (ComponentDeploymentResult, DriverError) {
         // Journal failure forbids this mutation, not other independently journalable recovery.
         let name = &component.planned.context.component;
@@ -968,7 +1002,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             name,
             &format!("cannot persist recovery intent: {error}; no recovery mutation attempted"),
         );
-        let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+        let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT, events).await;
         self.observation(&deployment.id, name, "compensate.blocked", &observed, None);
         (
             ComponentDeploymentResult {
@@ -1140,16 +1174,34 @@ fn activation_failure(
 async fn observe_after_failure(
     component: &DeploymentComponent,
     timeout: Duration,
+    events: &dyn EventSink,
 ) -> Result<Option<ReleaseRef>, DriverError> {
     // Cancellation of the user operation must not suppress the read that decides
     // whether an uncertain activation needs compensation. Bound even a stuck Driver.
     let context = recovery_context(&component.planned.context);
-    if let Ok(result) =
-        tokio::time::timeout(timeout, component.planned.driver.current(&context)).await
+    if let Ok(result) = tokio::time::timeout(
+        timeout,
+        component
+            .planned
+            .driver
+            .current_with_events(&context, events),
+    )
+    .await
     {
         result
     } else {
         context.cancellation.cancel();
+        events.emit_record(crate::telemetry::log_record::LogEvent {
+            namespace: "observe.command".into(),
+            message:
+                "Observation deadline expired; no complete failed-command snapshot is available."
+                    .into(),
+            scope: None,
+            kind: crate::telemetry::log_record::LogEventKind::CommandUnavailable {
+                location: crate::telemetry::log_record::CommandLocation::Remote,
+                index: None,
+            },
+        });
         Err(DriverError {
             stage: "observe".into(),
             target: context.component.to_string(),
@@ -1197,6 +1249,23 @@ fn failure_observed(
         } if failed == component => observed_release.clone(),
         _ => None,
     }
+}
+
+fn validate_compensation_receipt(
+    rollback: Result<ActivationReceipt, DriverError>,
+    activated: &ActivatedComponent,
+) -> Result<ActivationReceipt, DriverError> {
+    rollback.and_then(|receipt| {
+        if receipt.current == activated.previous && receipt.healthy {
+            Ok(receipt)
+        } else {
+            Err(contract_driver_error(
+                "compensate",
+                &activated.name,
+                "Driver rollback receipt is unhealthy or differs from the pre-activation Release",
+            ))
+        }
+    })
 }
 
 fn contract_driver_error(stage: &str, component: &ComponentName, message: &str) -> DriverError {

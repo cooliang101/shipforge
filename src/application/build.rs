@@ -80,6 +80,32 @@ pub async fn run_build_with_output(
     cancellation: &CancellationToken,
     observe: &(dyn Fn(usize, crate::adapters::OutputStream, &[u8]) + Sync),
 ) -> Result<BuildReport, BuildError> {
+    run_build_with_events(
+        project_root,
+        working_directory,
+        commands,
+        allow_dirty,
+        command_timeout,
+        cancellation,
+        observe,
+        &|_, _| {},
+    )
+    .await
+}
+
+/// Reports a failed command from the executing loop, including spawn/I/O errors.
+/// The callback is diagnostic only and must not execute or retry the command.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_build_with_events(
+    project_root: &Path,
+    working_directory: &Path,
+    commands: &[BuildCommand],
+    allow_dirty: bool,
+    command_timeout: Duration,
+    cancellation: &CancellationToken,
+    observe: &(dyn Fn(usize, crate::adapters::OutputStream, &[u8]) + Sync),
+    failed: &(dyn Fn(usize, &BuildCommand) + Sync),
+) -> Result<BuildReport, BuildError> {
     let (root, working_directory) = resolve_working_directory(project_root, working_directory)?;
     let git = inspect_git(&root, command_timeout, cancellation).await?;
     if matches!(git, GitWorktreeState::Dirty { .. }) && !allow_dirty {
@@ -99,6 +125,7 @@ pub async fn run_build_with_output(
         // Empty chunks mark command stream completion, including failure.
         observe(index, crate::adapters::OutputStream::Stdout, &[]);
         observe(index, crate::adapters::OutputStream::Stderr, &[]);
+        observe_command_failure(index, command, &output, failed);
         let output = output?;
         match (output.termination, output.exit_code) {
             (ProcessTermination::Exited, Some(0)) => outputs.push(output),
@@ -117,6 +144,52 @@ pub async fn run_build_with_output(
         working_directory,
         commands: outputs,
     })
+}
+
+fn observe_command_failure(
+    index: usize,
+    command: &BuildCommand,
+    result: &Result<ProcessOutput, ProcessError>,
+    failed: &(dyn Fn(usize, &BuildCommand) + Sync),
+) {
+    if !result.as_ref().is_ok_and(|output| {
+        output.termination == ProcessTermination::Exited && output.exit_code == Some(0)
+    }) {
+        failed(index, command);
+    }
+}
+
+pub(super) fn command_snapshot(
+    index: usize,
+    command: &BuildCommand,
+) -> crate::telemetry::log_record::RecordedCommand {
+    use crate::telemetry::log_record::{CommandLocation, RecordedCommand};
+
+    let (program, args) = if command.shell {
+        #[cfg(windows)]
+        let invocation = (
+            "cmd.exe".into(),
+            vec![
+                "/D".into(),
+                "/S".into(),
+                "/C".into(),
+                command.program.clone(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let invocation = ("sh".into(), vec!["-c".into(), command.program.clone()]);
+        invocation
+    } else {
+        (command.program.clone(), command.args.clone())
+    };
+    RecordedCommand {
+        location: CommandLocation::Local,
+        index: index
+            .checked_add(1)
+            .and_then(|index| u32::try_from(index).ok()),
+        program,
+        args,
+    }
 }
 
 /// Inspects the Project Git worktree without changing it.
@@ -364,6 +437,10 @@ pub enum BuildError {
     #[error(transparent)]
     Process(#[from] ProcessError),
 }
+
+#[cfg(test)]
+#[path = "build/event_tests.rs"]
+mod event_tests;
 
 #[cfg(test)]
 mod tests {

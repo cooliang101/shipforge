@@ -9,6 +9,7 @@ mod deployment_logs;
 mod destination_setup;
 mod execution_guard;
 pub mod history_query;
+pub mod local_export;
 mod orchestrator;
 mod planner;
 pub mod project_edit;
@@ -19,6 +20,7 @@ mod retention;
 mod rollback;
 mod rollback_service;
 mod session;
+mod step_events;
 
 pub use crate::drivers::ReleasePackage;
 pub use artifact::{PackageError, ReleaseManifest, package_release};

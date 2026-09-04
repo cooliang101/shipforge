@@ -314,9 +314,13 @@ async fn execute_plan(
         }
     };
     let events = &logs as &dyn EventSink;
-    events.emit(DriverLog {
+    events.emit_record(crate::telemetry::log_record::LogEvent {
         namespace: "deployment.started".into(),
         message: format!("Deployment {} started", deployment.id),
+        scope: None,
+        kind: crate::telemetry::log_record::LogEventKind::DeploymentStarted {
+            deployment: deployment.id.clone(),
+        },
     });
     let built = build_plan(
         &plan,
@@ -428,15 +432,15 @@ fn snapshot_plan(
     Ok(())
 }
 
-fn open_deployment_log<'a>(
+pub(super) fn open_deployment_log<'a>(
     history_path: &std::path::Path,
     history: &HistoryStore,
     deployment: &crate::domain::DeploymentId,
     events: &'a dyn EventSink,
     cancellation: &CancellationToken,
 ) -> Result<super::deployment_logs::DeploymentLogSink<'a>, DeploymentServiceError> {
-    history.register_deployment_log(deployment, super::deployment_logs::LOG_MAX_BYTES, 3)?;
-    super::deployment_logs::DeploymentLogSink::open(
+    history.register_event_log(deployment, super::deployment_logs::LOG_MAX_BYTES, 3)?;
+    super::deployment_logs::DeploymentLogSink::open_events(
         &history_path.with_file_name("logs"),
         deployment,
         events,
@@ -545,14 +549,17 @@ async fn build_plan(
             entry.release.as_str(),
             clock.timestamp()?,
         )?;
+        let step_events =
+            super::step_events::StepEvents::start(events, &entry.component, "build-package");
         let result = build_component(
             &plan.selection.project_root,
             entry,
             packages,
-            events,
+            &step_events,
             cancellation,
         )
         .await;
+        let built = result.is_ok();
         let result = result.and_then(|component| {
             DeploymentOrchestrator::new(history, Redactor::default())
                 .record_package(deployment, &component)?;
@@ -565,15 +572,24 @@ async fn build_plan(
                 Some(error.to_string()),
             ),
         };
-        let completed = history
-            .complete_intent(
-                intent,
-                status,
-                diagnostic.as_deref(),
-                clock.timestamp()?,
-                &Redactor::default(),
-            )
-            .map_err(DeploymentServiceError::from);
+        let completed = clock
+            .timestamp()
+            .map_err(DeploymentServiceError::from)
+            .and_then(|timestamp| {
+                history
+                    .complete_intent(
+                        intent,
+                        status,
+                        diagnostic.as_deref(),
+                        timestamp,
+                        &Redactor::default(),
+                    )
+                    .map_err(DeploymentServiceError::from)
+            });
+        step_events.finish(
+            super::step_events::step_state(built),
+            super::step_events::persistence(completed.is_ok() && (!built || result.is_ok())),
+        );
         if let Err(persistence) = completed {
             return Err(match result {
                 Ok(_) => persistence,
@@ -640,7 +656,7 @@ async fn build_component(
         message: format!("Building {}", entry.component),
     });
     let output = super::deployment_logs::BuildOutputProjector::new(&entry.component, events);
-    let build = super::build::run_build_with_output(
+    let build = super::build::run_build_with_events(
         project_root,
         &entry.config.working_directory,
         &entry.config.build,
@@ -648,6 +664,16 @@ async fn build_component(
         COMMAND_TIMEOUT,
         cancellation,
         &|index, stream, bytes| output.output(index, stream, bytes),
+        &|index, command| {
+            events.emit_record(crate::telemetry::log_record::LogEvent {
+                namespace: "build.command_failed".into(),
+                message: format!("Build command {} did not complete successfully", index + 1),
+                scope: None,
+                kind: crate::telemetry::log_record::LogEventKind::FailedCommand {
+                    command: super::build::command_snapshot(index, command),
+                },
+            });
+        },
     )
     .await?;
     let artifact = entry
@@ -678,6 +704,10 @@ fn generate_release_version() -> Result<ReleaseVersion, DeploymentServiceError> 
     ReleaseVersion::parse(format!("{timestamp}-{random}"))
         .map_err(|error| DeploymentServiceError::Version(error.to_string()))
 }
+
+#[cfg(test)]
+#[path = "deployment/event_tests.rs"]
+mod event_tests;
 
 #[cfg(test)]
 mod version_tests {
@@ -716,7 +746,7 @@ mod version_tests {
         );
     }
 
-    fn failing_build_plan(directory: &std::path::Path) -> (DeploymentPlan, PathBuf) {
+    pub(super) fn failing_build_plan(directory: &std::path::Path) -> (DeploymentPlan, PathBuf) {
         use crate::{
             config::{CredentialRegistry, DestinationSettings, HostKeyFingerprint},
             drivers::{DeploymentDriver, linux_ssh::LinuxSshDriver},

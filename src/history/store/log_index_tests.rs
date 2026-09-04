@@ -27,7 +27,7 @@ fn registered_log_round_trips_generated_relative_path_and_rotation_limits() {
     assert_eq!(registered.deployment, deployment);
     drop(store);
     let reopened = HistoryStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(reopened.schema_version().unwrap(), 7);
     assert_eq!(
         reopened.deployment_log(&deployment).unwrap(),
         Some(registered)
@@ -89,7 +89,7 @@ fn migration_from_version_three_preserves_existing_deployments() {
     ).unwrap();
     drop(connection);
     let store = HistoryStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 7);
     assert_eq!(
         store.deployment_state(&deployment).unwrap().as_deref(),
         Some("created")
@@ -141,4 +141,99 @@ fn log_lookup_keeps_distinct_deployments_separate() {
     assert_ne!(first_log.relative_path, second_log.relative_path);
     assert_eq!(store.deployment_log(&first).unwrap(), Some(first_log));
     assert_eq!(store.deployment_log(&second).unwrap(), Some(second_log));
+}
+
+#[test]
+fn event_format_is_explicit_and_cannot_relabel_legacy_or_accept_unknown_formats() {
+    let store = HistoryStore::in_memory().unwrap();
+    let legacy = create_deployment(&store);
+    let current = create_deployment(&store);
+    assert_eq!(
+        store
+            .register_deployment_log(&legacy, 1024, 3)
+            .unwrap()
+            .format,
+        DeploymentLogFormat::LegacyText
+    );
+    assert_eq!(
+        store.register_event_log(&current, 1024, 3).unwrap().format,
+        DeploymentLogFormat::JsonlV1
+    );
+    assert!(store.register_event_log(&legacy, 1024, 3).is_err());
+    assert!(
+        store
+            .connection
+            .execute(
+                "UPDATE deployment_logs SET format='guessed_json' WHERE deployment_id=?1",
+                [legacy.to_string()]
+            )
+            .is_err()
+    );
+    store
+        .connection
+        .pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE deployment_logs SET format='guessed_json' WHERE deployment_id=?1",
+            [legacy.to_string()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.deployment_log(&legacy),
+        Err(HistoryError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn schema_six_is_read_only_rejected_and_write_migration_preserves_legacy_logs() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let mut connection = Connection::open(&path).unwrap();
+    for migration in [
+        MIGRATION_1,
+        MIGRATION_2,
+        MIGRATION_3,
+        MIGRATION_4,
+        details::MIGRATION_5,
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    let transaction = connection.transaction().unwrap();
+    recovery::migrate(&transaction).unwrap();
+    transaction
+        .pragma_update(None, "user_version", 6_u32)
+        .unwrap();
+    transaction.commit().unwrap();
+    let id = DeploymentId::new();
+    connection.execute("INSERT INTO deployments (id,project_id,environment_id,state,created_at_ms,updated_at_ms) VALUES (?1,?2,?3,'failed',1,1)", params![id.to_string(),ProjectId::new().to_string(),EnvironmentId::new().to_string()]).unwrap();
+    connection
+        .execute(
+            "INSERT INTO deployment_logs VALUES (?1,?2,1024,3)",
+            params![id.to_string(), format!("logs/{id}.log")],
+        )
+        .unwrap();
+    assert!(matches!(
+        HistoryStore::open_existing_read_only(&path),
+        Err(HistoryError::InvalidMetadata(_))
+    ));
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        6
+    );
+    drop(connection);
+    let store = HistoryStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(
+        store.deployment_log(&id).unwrap().unwrap().format,
+        DeploymentLogFormat::LegacyText
+    );
+    assert_eq!(
+        store.deployment_state(&id).unwrap().as_deref(),
+        Some("failed")
+    );
+    assert!(!directory.path().join("logs").exists());
 }

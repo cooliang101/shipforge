@@ -314,7 +314,7 @@ impl HistoryStore {
         connection.pragma_update(None, "query_only", true)?;
         let transaction = connection.unchecked_transaction()?;
         let schema: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if schema > 6 {
+        if schema > super::super::LATEST_SCHEMA_VERSION {
             return Err(HistoryError::UnsupportedSchema(schema));
         }
         if schema == 0 {

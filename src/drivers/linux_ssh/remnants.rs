@@ -54,6 +54,14 @@ struct Entry {
 
 #[async_trait]
 trait RemnantsRemote: Sync {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, RemnantsError> {
+        self.command(command, cancellation).await
+    }
+
     async fn root(
         &self,
         target: &LinuxSshTarget,
@@ -69,6 +77,20 @@ trait RemnantsRemote: Sync {
 
 #[async_trait]
 impl RemnantsRemote for AuthenticatedSession {
+    async fn predicate(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, RemnantsError> {
+        self.execute_allowing(command, COMMAND_TIMEOUT, cancellation, &[0, 1])
+            .await
+            .map_err(|error| match error {
+                SshConnectionError::Cancelled => RemnantsError::Cancelled,
+                SshConnectionError::Timeout { .. } => RemnantsError::Timeout,
+                _ => RemnantsError::Remote,
+            })
+    }
+
     async fn root(
         &self,
         target: &LinuxSshTarget,
@@ -356,7 +378,7 @@ async fn test<R: RemnantsRemote>(
 ) -> Result<bool, RemnantsError> {
     let command = CommandSpec::structured("test", [flag, path].map(CommandArgument::plain))
         .map_err(|_| RemnantsError::Remote)?;
-    let output = remote.command(&command, cancellation).await?;
+    let output = remote.predicate(&command, cancellation).await?;
     if output.stdout_truncated || output.stderr_truncated || !output.stdout.is_empty() {
         return Err(RemnantsError::Remote);
     }

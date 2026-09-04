@@ -3,6 +3,19 @@ use super::*;
 #[derive(Default)]
 struct CollectedEvents(Mutex<Vec<DriverLog>>);
 
+#[derive(Default)]
+struct StructuredEvents(Mutex<Vec<LogEvent>>);
+
+impl EventSink for StructuredEvents {
+    fn emit(&self, _event: DriverLog) {
+        panic!("structured writer must preserve event metadata");
+    }
+
+    fn emit_record(&self, event: LogEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
 impl EventSink for CollectedEvents {
     fn emit(&self, event: DriverLog) {
         self.0.lock().unwrap().push(event);
@@ -14,6 +27,109 @@ fn emit(logs: &DeploymentLogSink<'_>, message: &str) {
         namespace: "test.output".into(),
         message: message.into(),
     });
+}
+
+#[tokio::test]
+async fn event_writer_preserves_full_utf8_text_and_scope_as_complete_json_lines() {
+    use crate::telemetry::log_record::LogScope;
+    let directory = tempfile::tempdir().unwrap();
+    let id = DeploymentId::new();
+    let ui = StructuredEvents::default();
+    let cancellation = CancellationToken::new();
+    let logs = DeploymentLogSink::open_events(directory.path(), &id, &ui, &cancellation).unwrap();
+    let message = format!("FIRST_LINE\n{}\nEND_SENTINEL", "文".repeat(25_000));
+    let scope = LogScope {
+        component: ComponentName::parse("api").unwrap(),
+        step: "build-package".into(),
+    };
+    logs.emit_record(LogEvent {
+        namespace: "build.stdout".into(),
+        message: message.clone(),
+        scope: Some(scope.clone()),
+        kind: LogEventKind::Output,
+    });
+    assert!(logs.finish().await.is_none());
+    let text = std::fs::read_to_string(directory.path().join(format!("{id}.log"))).unwrap();
+    let records: Vec<_> = text
+        .lines()
+        .map(|line| serde_json::from_str::<LogRecord>(line).unwrap())
+        .collect();
+    assert!(records.len() > 1);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.event.scope.as_ref() == Some(&scope))
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.event.message.as_str())
+            .collect::<String>(),
+        message
+    );
+    assert!(!cancellation.is_cancelled());
+    let projected = ui.0.lock().unwrap();
+    assert_eq!(projected.len(), records.len());
+    assert!(
+        projected
+            .iter()
+            .all(|event| event.scope.as_ref() == Some(&scope))
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .map(|event| event.message.as_str())
+            .collect::<String>(),
+        message,
+        "the production writer must not truncate or flatten the live full-record view"
+    );
+}
+
+#[tokio::test]
+async fn event_writer_redacts_named_command_secrets_and_rejects_invalid_metadata() {
+    use crate::telemetry::log_record::{CommandLocation, RecordedCommand, decode_log_record};
+    let directory = tempfile::tempdir().unwrap();
+    let id = DeploymentId::new();
+    let ui = CollectedEvents::default();
+    let cancellation = CancellationToken::new();
+    let logs = DeploymentLogSink::open_events(directory.path(), &id, &ui, &cancellation).unwrap();
+    logs.emit_record(LogEvent {
+        namespace: "build.command".into(),
+        message: "failed".into(),
+        scope: None,
+        kind: LogEventKind::FailedCommand {
+            command: RecordedCommand {
+                location: CommandLocation::Local,
+                index: Some(1),
+                program: "tool".into(),
+                args: vec!["--token".into(), "PRIVATE_SENTINEL".into()],
+            },
+        },
+    });
+    assert!(logs.finish().await.is_none());
+    let text = std::fs::read_to_string(directory.path().join(format!("{id}.log"))).unwrap();
+    assert!(!text.contains("PRIVATE_SENTINEL"));
+    assert!(matches!(
+        decode_log_record(text.trim().as_bytes(), &Redactor::default())
+            .unwrap()
+            .event
+            .kind,
+        LogEventKind::FailedCommand { .. }
+    ));
+    let id = DeploymentId::new();
+    let logs = DeploymentLogSink::open_events(directory.path(), &id, &ui, &cancellation).unwrap();
+    logs.emit_record(LogEvent {
+        namespace: "\u{1b}unsafe".into(),
+        message: "PRIVATE_SENTINEL".into(),
+        scope: None,
+        kind: LogEventKind::Output,
+    });
+    assert!(logs.finish().await.is_some());
+    assert!(cancellation.is_cancelled());
+    assert_eq!(
+        std::fs::read(directory.path().join(format!("{id}.log"))).unwrap(),
+        b""
+    );
 }
 
 #[tokio::test]

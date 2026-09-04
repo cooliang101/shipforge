@@ -575,17 +575,42 @@ fn verify_history(history: &Path, deployment: &str) {
         rows.iter()
             .all(|row| row.0 == deployment && row.2 == "succeeded")
     );
-    let log: String = database
+    verify_structured_log(&database, history, deployment);
+}
+
+fn verify_structured_log(database: &rusqlite::Connection, history: &Path, deployment: &str) {
+    use shipforge::telemetry::{
+        Redactor,
+        log_record::{LogEventKind, decode_log_record},
+    };
+
+    let (log, format): (String, String) = database
         .query_row(
-            "SELECT relative_path FROM deployment_logs WHERE deployment_id=?1",
+            "SELECT relative_path,format FROM deployment_logs WHERE deployment_id=?1",
             [deployment],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
+    assert_eq!(format, "jsonl_v1");
     assert_eq!(log, format!("logs/{deployment}.log"));
     let contents = std::fs::read_to_string(history.parent().unwrap().join(log)).unwrap();
-    assert!(contents.contains(deployment));
-    assert!(contents.contains("[build.stderr]"));
-    assert!(contents.contains("unused"));
-    assert!(contents.contains("[deployment.finished]"));
+    let records: Vec<_> = contents
+        .lines()
+        .map(|line| decode_log_record(line.as_bytes(), &Redactor::default()).unwrap())
+        .collect();
+    assert!(records.iter().any(|record| {
+        matches!(&record.event.kind, LogEventKind::DeploymentStarted { deployment: id } if id.to_string() == deployment)
+    }));
+    assert!(records.iter().any(|record| {
+        record.event.namespace == "build.stderr"
+            && record.event.message.contains("unused")
+            && record.event.scope.as_ref().is_some_and(|scope| {
+                scope.component.as_str() == "api" && scope.step == "build-package"
+            })
+    }));
+    assert!(
+        records
+            .iter()
+            .any(|record| record.event.namespace == "deployment.finished")
+    );
 }

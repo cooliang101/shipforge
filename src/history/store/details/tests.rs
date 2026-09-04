@@ -738,7 +738,7 @@ fn all_previous_schema_versions_preserve_legacy_rows_without_inventing_context()
         }
         drop(connection);
         let store = HistoryStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         assert_eq!(store.pending_intents(&id).unwrap().len(), 1);
         assert_eq!(
             store.deployment(&id).unwrap().unwrap().state,

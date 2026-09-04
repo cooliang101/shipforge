@@ -158,6 +158,14 @@ async fn bounded_for<T>(
 
 #[async_trait]
 trait AuditRemote: Sync {
+    async fn read_command(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, AuditError> {
+        self.command(command, cancellation).await
+    }
+
     async fn marker(
         &self,
         target: &LinuxSshTarget,
@@ -173,6 +181,16 @@ trait AuditRemote: Sync {
 
 #[async_trait]
 impl AuditRemote for AuthenticatedSession {
+    async fn read_command(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteCommandOutput, AuditError> {
+        self.execute_allowing(command, AUDIT_TIMEOUT, cancellation, &[0, 44])
+            .await
+            .map_err(|_| AuditError::Remote)
+    }
+
     async fn marker(
         &self,
         target: &LinuxSshTarget,
@@ -267,7 +285,15 @@ fn audit_command(
             if payload.is_some() { "append" } else { "read" },
             payload.unwrap_or(""),
         ]
-        .map(CommandArgument::plain),
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if index == 10 {
+                CommandArgument::sensitive(value)
+            } else {
+                CommandArgument::plain(value)
+            }
+        }),
     )
     .map_err(|_| AuditError::Remote)
 }
@@ -324,7 +350,7 @@ async fn read_with_remote(
     let mut conflicts = BTreeSet::new();
     for file in ["releases.jsonl", "deployments.jsonl"] {
         let command = audit_command(target, &actual_marker, file, None)?;
-        if let Some(bytes) = audit_output(remote.command(&command, cancellation).await?)? {
+        if let Some(bytes) = audit_output(remote.read_command(&command, cancellation).await?)? {
             parse_lines(&bytes, file, marker, &mut history, &mut conflicts);
         } else {
             notice(

@@ -8,6 +8,7 @@ use std::{
 use async_trait::async_trait;
 
 use super::*;
+mod events;
 use crate::{
     domain::{
         Capability, ComponentGeneration, ComponentRelease, DestinationKey, DestinationRevision,
@@ -165,6 +166,17 @@ impl DeploymentDriver for FakeDriver {
             .current
             .get(&context.component)
             .cloned())
+    }
+    async fn current_with_events(
+        &self,
+        context: &ComponentExecutionContext,
+        events: &dyn EventSink,
+    ) -> Result<Option<ReleaseRef>, DriverError> {
+        let result = self.current(context).await;
+        if result.is_err() {
+            events::failed_observation(events, &context.component);
+        }
+        result
     }
     async fn prepare(
         &self,
@@ -1213,9 +1225,18 @@ async fn failed_compensation_observation_retains_manual_recovery_diagnostics() {
 async fn recovery_observation_is_bounded_even_if_a_driver_does_not_return() {
     let fixture = Fixture::new();
     fixture.state.lock().unwrap().hang_current = true;
-    let error = observe_after_failure(&fixture.component("backend"), Duration::from_millis(1))
-        .await
-        .unwrap_err();
+    let records = crate::application::step_events::tests::Records::default();
+    let error = observe_after_failure(
+        &fixture.component("backend"),
+        Duration::from_millis(1),
+        &records,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.stage, "observe");
     assert!(error.message.contains("timed out"));
+    assert!(matches!(
+        records.0.lock().unwrap()[0].kind,
+        crate::telemetry::log_record::LogEventKind::CommandUnavailable { .. }
+    ));
 }

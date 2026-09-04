@@ -278,7 +278,7 @@ fn historical_environment_limit_counts_distinct_ids_and_never_returns_a_truncate
 #[test]
 fn rejects_old_future_uninitialized_and_non_database_files_unchanged() {
     let directory = tempfile::tempdir().unwrap();
-    for version in [0, 1, 2, 3, 4, 5, 7] {
+    for version in [0, 1, 2, 3, 4, 5, 6, 8] {
         let path = directory.path().join(format!("schema-{version}.sqlite3"));
         let connection = Connection::open(&path).unwrap();
         connection

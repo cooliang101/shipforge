@@ -1,5 +1,8 @@
 mod app;
+mod clipboard;
 mod deployment_error;
+mod live_progress;
+mod log_view;
 mod picker;
 mod presentation;
 
@@ -100,6 +103,11 @@ fn run_event_loop() -> io::Result<()> {
 fn drive_event_loop(app: &mut App, guard: &mut TerminalGuard) -> io::Result<()> {
     loop {
         app.poll_background();
+        if let Some(text) = app.take_clipboard_request() {
+            let transport = clipboard_transport();
+            let outcome = clipboard::request_copy(guard.terminal.backend_mut(), &text, transport);
+            app.finish_clipboard_request(outcome);
+        }
         guard.terminal.draw(|frame| render(frame, app))?;
 
         if event::poll(Duration::from_millis(250))?
@@ -112,6 +120,20 @@ fn drive_event_loop(app: &mut App, guard: &mut TerminalGuard) -> io::Result<()> 
     }
 
     Ok(())
+}
+
+fn clipboard_transport() -> clipboard::ClipboardTransport {
+    // On Unix the terminal uses ANSI. On Windows, do not route OSC 52 through
+    // the legacy console fallback. This detects the transport, not OSC support.
+    #[cfg(windows)]
+    let supported = crossterm::ansi_support::supports_ansi();
+    #[cfg(not(windows))]
+    let supported = true;
+    if supported {
+        clipboard::ClipboardTransport::Ansi
+    } else {
+        clipboard::ClipboardTransport::Unsupported
+    }
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
@@ -159,8 +181,19 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     if let Some(picker) = &app.picker {
         picker.render(frame, areas[1]);
     }
+    if let Some(logs) = &app.log_workspace {
+        logs.render(frame, areas[1]);
+    }
     if app.help_open {
         frame.render_widget(ratatui::widgets::Clear, areas[1]);
+        if let Some(logs) = &app.log_workspace {
+            frame.render_widget(
+                panel(" Log viewer help and current message ", logs.help_text())
+                    .scroll((app.help_scroll, 0)),
+                areas[1],
+            );
+            return;
+        }
         let message = app
             .message
             .as_deref()
@@ -177,7 +210,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn page_help(app: &App) -> &'static str {
-    if app.setup_busy() {
+    if app.log_workspace.is_some() {
+        "Log viewer open · F1 full keys / current message · Ctrl+C safe cancellation"
+    } else if app.setup_busy() {
         if app.setup_cancelling() {
             "SSH setup cancellation requested; waiting for the worker to stop"
         } else {
@@ -226,11 +261,11 @@ fn page_help(app: &App) -> &'static str {
                 if *cancellation_requested {
                     "Safe cancellation requested; recovery may still be running"
                 } else {
-                    "Deployment running   Esc request safe cancellation"
+                    "Esc request safe cancellation   l logs/search/export"
                 }
             }
             Screen::DeploymentFinished { .. } => {
-                "↑/↓ or PgUp/PgDn scroll   Enter/Esc project overview"
+                "↑/↓ scroll   l logs/search/export   Enter/Esc project overview"
             }
             Screen::SetupComponents(setup) if setup.selected.is_empty() => {
                 "Esc projects   a add manually   ↑/↓ move   Space select (required)"
@@ -295,7 +330,13 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             logs,
             cancellation_requested,
             ..
-        } => render_deployment_running(frame, area, logs, *cancellation_requested),
+        } => render_deployment_running(
+            frame,
+            area,
+            logs,
+            *cancellation_requested,
+            app.live_progress.as_ref(),
+        ),
         Screen::DeploymentFinished {
             summary,
             logs,
@@ -579,13 +620,58 @@ fn render_deployment_running(
     area: ratatui::layout::Rect,
     logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
     cancellation_requested: bool,
+    progress: Option<&live_progress::LiveProgress>,
 ) {
     let status = if cancellation_requested {
         "Safe cancellation requested; waiting for recovery. Do not close the terminal."
     } else {
         "Deployment running. Esc requests safe cancellation."
     };
-    render_deployment_log(frame, area, " Deployment progress ", status, logs);
+    let progress = progress.map(live_progress::LiveProgress::snapshot);
+    if let Some(progress) = progress {
+        let areas = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).split(area);
+        let mut text = format!(
+            "{status}\nElapsed: {}.{}s · l opens logs/search/export\n",
+            progress.elapsed_ms / 1000,
+            (progress.elapsed_ms % 1000) / 100
+        );
+        let mut steps = progress.steps.iter().collect::<Vec<_>>();
+        steps.sort_by_key(|step| std::cmp::Reverse(step.updated_sequence));
+        for step in steps.into_iter().take(2) {
+            let _ = writeln!(
+                text,
+                "{} / {}: {:?} · persistence {:?}",
+                step.scope.component,
+                step_label(&step.scope.step),
+                step.state,
+                step.persistence
+            );
+        }
+        if progress.dropped_rows > 0
+            || progress.dropped_steps > 0
+            || progress.rejected_events > 0
+            || progress.poisoned
+        {
+            let _ = writeln!(
+                text,
+                "Window gaps: {} rows / {} steps / {} rejected; progress unavailable: {}",
+                progress.dropped_rows,
+                progress.dropped_steps,
+                progress.rejected_events,
+                progress.poisoned
+            );
+        }
+        frame.render_widget(panel(" Deployment progress ", text), areas[0]);
+        render_deployment_log(
+            frame,
+            areas[1],
+            " Recent output ",
+            "Live window; retained history is available through l → h",
+            logs,
+        );
+    } else {
+        render_deployment_log(frame, area, " Deployment progress ", status, logs);
+    }
 }
 
 fn render_deployment_finished(
@@ -1034,7 +1120,7 @@ mod tests {
             .collect();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal
-            .draw(|frame| super::render_deployment_running(frame, frame.area(), &logs, true))
+            .draw(|frame| super::render_deployment_running(frame, frame.area(), &logs, true, None))
             .unwrap();
         let content = terminal
             .backend()

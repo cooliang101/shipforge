@@ -14,7 +14,8 @@ use crate::{
     config::{DestinationRegistry, DestinationRevisionRecord, ProjectConfigState},
     domain::{Capability, ComponentName, DeploymentId, DestinationKey, DestinationRevision},
     drivers::{
-        ComponentExecutionContext, DeploymentDriver, DriverError, DriverRegistry, ReleaseRef,
+        ComponentExecutionContext, DeploymentDriver, DriverError, DriverRegistry, EventSink,
+        ReleaseRef,
     },
     history::{
         CurrentAlignment, HistoryError, HistoryStore, InspectionScope, PackageAlignment,
@@ -242,8 +243,28 @@ impl RollbackService {
         destinations_path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<RollbackReport, RollbackServiceError> {
+        self.execute_with_events(
+            plan,
+            destinations_path,
+            &super::step_events::NoEvents,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Executes a confirmed rollback and publishes bounded execution evidence.
+    ///
+    /// # Errors
+    /// Returns the same validation, session, history and execution errors as `execute`.
+    pub async fn execute_with_events(
+        &self,
+        plan: RollbackPlan,
+        destinations_path: &Path,
+        events: &dyn EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<RollbackReport, RollbackServiceError> {
         self.session
-            .run(self.execute_exclusive(plan, destinations_path, cancellation))
+            .run(self.execute_exclusive(plan, destinations_path, events, cancellation))
             .await
             .map_err(|_| RollbackServiceError::Busy)?
     }
@@ -493,6 +514,7 @@ impl RollbackService {
         &self,
         plan: RollbackPlan,
         destinations_path: &Path,
+        events: &dyn EventSink,
         cancellation: &CancellationToken,
     ) -> Result<RollbackReport, RollbackServiceError> {
         cancelled(cancellation)?;
@@ -527,14 +549,56 @@ impl RollbackService {
         // A confirmed execution may write a new linked Deployment. Preview never does.
         // No outer timeout may drop the orchestrator after its first side effect.
         let history = HistoryStore::open(&self.history_path)?;
-        Ok(RollbackOrchestrator::new(&history, Redactor::default())
-            .rollback(
-                &plan.source,
-                components,
-                &plan.activation_order,
-                cancellation,
-            )
-            .await?)
+        let orchestrator = RollbackOrchestrator::new(&history, Redactor::default());
+        let (deployment, components) = orchestrator.prepare_rollback(
+            &plan.source,
+            components,
+            &plan.activation_order,
+            cancellation,
+        )?;
+        let logs = super::deployment::open_deployment_log(
+            &self.history_path,
+            &history,
+            &deployment.id,
+            events,
+            cancellation,
+        );
+        let Ok(logs) = logs else {
+            return Err(orchestrator
+                .log_initialization_failed(deployment, cancellation.is_cancelled())
+                .into());
+        };
+        let deployment_id = deployment.id.clone();
+        let result = orchestrator
+            .with_events(&logs)
+            .rollback_started(deployment, components, &plan.activation_order, cancellation)
+            .await;
+        if let Ok(report) = &result {
+            logs.emit(crate::drivers::DriverLog {
+                namespace: "deployment.finished".into(),
+                message: format!(
+                    "Rollback Deployment {} finished with {:?}",
+                    report.deployment.id, report.deployment.state
+                ),
+            });
+        }
+        let log_failure = logs.finish().await;
+        match result {
+            Ok(mut report) => {
+                if log_failure.is_some() {
+                    report.warnings.push("Rollback log is incomplete; known remote outcomes are retained; inspect durable history before retrying".into());
+                }
+                Ok(report)
+            }
+            Err(source) => Err(OrchestrationError::Execution {
+                deployment: deployment_id,
+                source: Box::new(source),
+                persistence: log_failure.map(|_| {
+                    "Rollback log is incomplete; inspect durable history before retrying".into()
+                }),
+            }
+            .into()),
+        }
     }
 
     async fn recheck_execution(
