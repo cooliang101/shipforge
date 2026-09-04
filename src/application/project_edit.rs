@@ -395,7 +395,7 @@ fn setup_from_config(config: &ProjectConfig) -> ProjectSetup {
     }
 }
 
-fn selected_destinations(
+pub(super) fn selected_destinations(
     config: &ProjectConfig,
     registry: &DestinationRegistry,
 ) -> Result<BTreeMap<DestinationKey, DestinationRevisionRecord>, ProjectEditError> {
@@ -413,7 +413,7 @@ fn selected_destinations(
         .collect()
 }
 
-fn bound_setup(
+pub(super) fn bound_setup(
     setup: &ProjectSetup,
     renames: &[EnvironmentRename],
 ) -> Result<(), ProjectEditError> {
@@ -495,7 +495,8 @@ fn add_text(text: &str, total: &mut usize) -> Result<(), ProjectEditError> {
         return Err(ProjectEditError::Limit);
     }
     if text.chars().any(|value| {
-        value.is_control() || matches!(value, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        value.is_control()
+            || matches!(value, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
     }) {
         return Err(ProjectEditError::Invalid(
             "fields cannot contain terminal control characters",
@@ -509,7 +510,7 @@ fn parse_registry(snapshot: &FileSnapshot) -> Result<DestinationRegistry, Projec
         .map_err(|_| ProjectEditError::Destination)
 }
 
-fn config_error(error: &config::ConfigError) -> ProjectEditError {
+pub(super) fn config_error(error: &config::ConfigError) -> ProjectEditError {
     use config::ConfigError;
     let reason = match error {
         ConfigError::Security(_) => "sensitive values or unsafe command data are not allowed",
@@ -545,15 +546,15 @@ fn cancelled(cancellation: &CancellationToken) -> Result<(), ProjectEditError> {
 }
 
 #[derive(Clone)]
-struct FileSnapshot {
-    path: PathBuf,
+pub(super) struct FileSnapshot {
+    pub(super) path: PathBuf,
     bytes: Vec<u8>,
     stamp: FileStamp,
-    permissions: Permissions,
+    pub(super) permissions: Permissions,
 }
 
 impl FileSnapshot {
-    fn read(path: &Path) -> Result<Self, ProjectEditError> {
+    pub(super) fn read(path: &Path) -> Result<Self, ProjectEditError> {
         let mut file = open_safe(path, false)?;
         let metadata = file.metadata().map_err(|_| ProjectEditError::Read)?;
         let stamp = file_stamp(&file, &metadata)?;
@@ -586,12 +587,12 @@ impl FileSnapshot {
         })
     }
 
-    fn text(&self) -> Result<&str, ProjectEditError> {
+    pub(super) fn text(&self) -> Result<&str, ProjectEditError> {
         std::str::from_utf8(&self.bytes)
             .map_err(|_| ProjectEditError::Invalid("files must use UTF-8"))
     }
 
-    fn ensure_unchanged(&self) -> Result<(), ProjectEditError> {
+    pub(super) fn ensure_unchanged(&self) -> Result<(), ProjectEditError> {
         let current = Self::read(&self.path)?;
         if current.stamp != self.stamp || current.bytes != self.bytes {
             Err(ProjectEditError::Stale)
@@ -691,7 +692,7 @@ fn identity(file: &File, metadata: &Metadata) -> Result<(u64, u64), ProjectEditE
     }
 }
 
-fn directory_identity(path: &Path) -> Result<(u64, u64), ProjectEditError> {
+pub(super) fn directory_identity(path: &Path) -> Result<(u64, u64), ProjectEditError> {
     let file = open_safe(path, true)?;
     identity(&file, &file.metadata().map_err(|_| ProjectEditError::Read)?)
 }

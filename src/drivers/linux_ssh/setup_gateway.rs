@@ -4,7 +4,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     application::{
         DestinationSetupError, DestinationSetupGateway, DestinationSetupRequest,
-        EndpointProbeRequest, LocalIdentityCandidate, RemoteSetupCandidates, SetupRootState,
+        EndpointProbeRequest, LocalIdentityCandidate, RemoteDirectoryCandidates,
+        RemoteSetupCandidates, SetupRootState,
     },
     config::SshCredential,
     drivers::DriverKind,
@@ -13,6 +14,7 @@ use crate::{
 use super::{
     LinuxSshDestination, RemoteRootState, capture_host_key, connect_authenticated,
     probe_agent_identities, probe_remote_setup,
+    setup_probe::{browse_remote_directories, validate_browse_path},
 };
 
 #[derive(Debug, Default)]
@@ -123,6 +125,67 @@ impl DestinationSetupGateway for LinuxSshSetupGateway {
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
+
+    async fn browse_directories(
+        &self,
+        request: &DestinationSetupRequest,
+        connect_timeout: std::time::Duration,
+        command_timeout: std::time::Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteDirectoryCandidates, DestinationSetupError> {
+        let error = |message| DestinationSetupError::operation("directory browsing", message);
+        if cancellation.is_cancelled() {
+            return Err(error("cancelled"));
+        }
+        if request.driver != DriverKind::linux_ssh() {
+            return Err(error(
+                "connection type does not support this directory browser",
+            ));
+        }
+        validate_browse_path(&request.remote_root).map_err(error)?;
+        if connect_timeout.is_zero() || command_timeout.is_zero() {
+            return Err(error("connection and directory deadlines must be nonzero"));
+        }
+        let destination = LinuxSshDestination::validate(&request.destination)
+            .map_err(|_| error("saved connection or host-key pin is invalid"))?;
+        let credential = request
+            .credential
+            .downcast_ref::<SshCredential>()
+            .ok_or_else(|| error("credential type does not match the saved connection"))?;
+        // Browsing is an interactive read, not an unlimited remote scan.
+        let connect_timeout = connect_timeout.min(std::time::Duration::from_secs(60));
+        let command_timeout = command_timeout.min(std::time::Duration::from_secs(60));
+        let session = connect_authenticated(&destination, credential, connect_timeout, cancellation)
+            .await.map_err(|failure| error(match failure {
+                super::SshConnectionError::Cancelled => "cancelled",
+                super::SshConnectionError::Timeout { .. } => "saved connection timed out",
+                _ => "saved connection could not be authenticated; check its host-key pin and selected identity",
+            }))?;
+        let candidates = browse_remote_directories(
+            &session,
+            &request.remote_root,
+            command_timeout,
+            cancellation,
+        )
+        .await
+        .map_err(error);
+        // A cancellation must still close the authenticated connection. Preserve
+        // the primary read failure if disconnect also fails; no write occurred.
+        let disconnected = tokio::time::timeout(
+            command_timeout.min(std::time::Duration::from_secs(5)),
+            session.disconnect(),
+        )
+        .await
+        .map_err(|_| error("connection close timed out; directory evidence was not accepted"))
+        .and_then(|result| {
+            result
+                .map_err(|_| error("connection close failed; directory evidence was not accepted"))
+        });
+        match (candidates, disconnected) {
+            (Ok(candidates), Ok(())) => Ok(candidates),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
 }
 
 const fn map_root_state(state: RemoteRootState) -> SetupRootState {
@@ -216,5 +279,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("port is invalid"));
+    }
+
+    #[tokio::test]
+    async fn directory_browsing_rejects_invalid_inputs_before_network_or_identity_reads() {
+        let gateway = LinuxSshSetupGateway;
+        for (path, cancelled, timeout) in [
+            ("/srv/../secret-sentinel", false, Duration::from_secs(1)),
+            ("relative", false, Duration::from_secs(1)),
+            ("/srv", true, Duration::from_secs(1)),
+            ("/srv", false, Duration::ZERO),
+        ] {
+            let cancellation = CancellationToken::new();
+            if cancelled {
+                cancellation.cancel();
+            }
+            let result = gateway
+                .browse_directories(
+                    &DestinationSetupRequest {
+                        driver: DriverKind::linux_ssh(),
+                        destination: destination(),
+                        credential: SetupCredential::new(SshCredential::IdentityFile {
+                            path: "must-not-read-identity".into(),
+                        }),
+                        remote_root: path.into(),
+                    },
+                    timeout,
+                    Duration::from_secs(1),
+                    &cancellation,
+                )
+                .await
+                .unwrap_err();
+            assert!(!result.to_string().contains("secret-sentinel"));
+            assert!(!result.to_string().contains("must-not-read-identity"));
+            if cancelled {
+                assert!(result.to_string().contains("cancelled"));
+            }
+        }
+        let result = gateway
+            .browse_directories(
+                &DestinationSetupRequest {
+                    driver: DriverKind::linux_ssh(),
+                    destination: destination(),
+                    credential: SetupCredential::new(42_u8),
+                    remote_root: "/srv".into(),
+                },
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(result.to_string().contains("credential type"));
     }
 }

@@ -553,3 +553,315 @@ fn existing_connection_form_and_identity_browser_keep_id_but_not_identity_conten
         assert!(!context.contains("New connection"));
     }
 }
+
+fn search_form() -> Arc<ConnectionForm> {
+    Arc::new(ConnectionForm {
+        existing: None,
+        host: "original.example".into(),
+        user: "original-user".into(),
+        port: "22".into(),
+        field: SshField::Host,
+        credentials: Vec::new(),
+        credential_cursor: 0,
+        hosts: Vec::new(),
+        host_cursor: 0,
+        notices: Vec::new(),
+    })
+}
+
+#[test]
+fn connection_search_maps_original_id_and_key_index_without_opening_or_reading_them() {
+    let items = (0..3)
+        .map(|_| saved_connection("same.example"))
+        .collect::<Vec<_>>();
+    let last_id = items[2].key.clone();
+    let mut screen = ConnectionsScreen {
+        page: ConnectionsPage::List {
+            items: Arc::new(items),
+            cursor: 0,
+        },
+        scroll: 0,
+    };
+    let choices = screen.search_choices().unwrap();
+    assert_eq!(choices.items[2].0, 2);
+    assert!(choices.items[2].1.contains(last_id.as_str()));
+    assert!(screen.select_search_choice(2));
+    assert!(!screen.select_search_choice(usize::MAX));
+    assert!(
+        matches!(&screen.page, ConnectionsPage::List { cursor: 2, items } if items[2].key == last_id)
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("identity");
+    std::fs::write(&path, "PRIVATE KEY CONTENT SENTINEL").unwrap();
+    screen.page = ConnectionsPage::Keys {
+        form: search_form(),
+        directory: Arc::new(KeyDirectory {
+            path: directory.path().to_owned(),
+            entries: vec![
+                KeyEntry {
+                    path: directory.path().join("folder"),
+                    directory: true,
+                },
+                KeyEntry {
+                    path: path.clone(),
+                    directory: false,
+                },
+            ],
+        }),
+        cursor: 0,
+    };
+    assert_eq!(
+        screen.search_choices().unwrap().items[1],
+        (1, "identity".into())
+    );
+    assert!(screen.select_search_choice(1));
+    assert!(
+        matches!(&screen.page, ConnectionsPage::Keys { cursor: 1, form, .. } if form.credentials.is_empty())
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "PRIVATE KEY CONTENT SENTINEL"
+    );
+}
+
+#[test]
+fn connection_search_changes_only_host_or_identity_draft_and_rejects_text_fields() {
+    let mut original = search_form();
+    Arc::make_mut(&mut original).hosts = vec![
+        SshCandidate {
+            host: "ignored".into(),
+            hostname: None,
+            user: None,
+            port: None,
+            identity_files: Vec::new(),
+        },
+        SshCandidate {
+            host: "production".into(),
+            hostname: Some("2001:db8::8".into()),
+            user: Some("deploy".into()),
+            port: Some(2202),
+            identity_files: vec!["DO-NOT-READ-THIS-KEY".into()],
+        },
+    ];
+    Arc::make_mut(&mut original).credentials = vec![
+        CredentialChoice::Saved {
+            handle: crate::drivers::CredentialHandle::new(),
+            label: "first identity".into(),
+        },
+        CredentialChoice::Saved {
+            handle: crate::drivers::CredentialHandle::new(),
+            label: "chosen identity".into(),
+        },
+    ];
+    let mut screen = ConnectionsScreen {
+        page: ConnectionsPage::Form(original.clone()),
+        scroll: 0,
+    };
+    let choices = screen.search_choices().unwrap();
+    assert!(choices.items[1].1.contains("deploy@[2001:db8::8]:2202"));
+    assert!(!choices.items[1].1.contains("DO-NOT-READ"));
+    assert!(screen.select_search_choice(1));
+    let ConnectionsPage::Form(form) = &mut screen.page else {
+        panic!()
+    };
+    assert_eq!(
+        (form.host.as_str(), form.user.as_str(), form.port.as_str()),
+        ("2001:db8::8", "deploy", "2202")
+    );
+    assert_eq!(original.host, "original.example");
+    Arc::make_mut(form).field = SshField::Credential;
+    assert!(screen.select_search_choice(1));
+    assert!(!screen.select_search_choice(2));
+    let ConnectionsPage::Form(form) = &mut screen.page else {
+        panic!()
+    };
+    assert_eq!(form.credential_cursor, 1);
+    for field in [SshField::User, SshField::Port] {
+        let ConnectionsPage::Form(form) = &mut screen.page else {
+            panic!()
+        };
+        Arc::make_mut(form).field = field;
+        assert!(screen.search_choices().is_none());
+        assert!(!screen.select_search_choice(0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_connection_list_is_unknown_not_empty_and_retry_is_read_only() {
+    let (directory, mut app, gateway) = fixture();
+    std::fs::write(
+        directory.path().join("destinations.yaml"),
+        "not: [valid yaml",
+    )
+    .unwrap();
+    app.open_connections();
+    wait(&mut app).await;
+    assert!(matches!(
+        &app.screen,
+        Screen::Connections(ConnectionsScreen {
+            page: ConnectionsPage::Unavailable,
+            ..
+        })
+    ));
+    let text = screen_text(&app);
+    assert!(text.contains("UNKNOWN"));
+    assert!(!text.contains("No saved connections."));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.connections_task.is_none());
+    DestinationRegistry::new()
+        .save(&directory.path().join("destinations.yaml"))
+        .unwrap();
+    press(&mut app, KeyCode::Char('f'));
+    wait(&mut app).await;
+    assert!(screen_text(&app).contains("No saved connections."));
+    assert_eq!(gateway.captures.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.auths.load(Ordering::Relaxed), 0);
+    assert!(!directory.path().join("history.sqlite3").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_refresh_discards_cached_choices_until_successful_read_even_if_previously_empty() {
+    for populated in [false, true] {
+        let (directory, mut app, gateway) = fixture();
+        let mut registry = DestinationRegistry::new();
+        let saved = saved_connection("cached.invalid");
+        if populated {
+            registry
+                .create(saved.key.clone(), saved.current.settings.clone())
+                .unwrap();
+        }
+        let path = directory.path().join("destinations.yaml");
+        registry.save(&path).unwrap();
+        let registry_bytes = std::fs::read(&path).unwrap();
+        app.open_connections();
+        wait(&mut app).await;
+        let Screen::Connections(screen) = &app.screen else {
+            panic!()
+        };
+        assert_eq!(
+            screen.search_choices().unwrap().items.len(),
+            usize::from(populated)
+        );
+
+        std::fs::write(&path, "invalid: [malformed-registry").unwrap();
+        press(&mut app, KeyCode::Char('f'));
+        wait(&mut app).await;
+        let Screen::Connections(screen) = &app.screen else {
+            panic!()
+        };
+        assert!(matches!(screen.page, ConnectionsPage::Unavailable));
+        assert!(screen.search_choices().is_none());
+        assert!(!screen_text(&app).contains("No saved connections."));
+        assert!(!screen_text(&app).contains("cached.invalid"));
+        press(&mut app, KeyCode::F(4));
+        assert!(matches!(
+            &app.screen,
+            Screen::Connections(ConnectionsScreen {
+                page: ConnectionsPage::Unavailable,
+                ..
+            })
+        ));
+        assert!(app.connections_task.is_none());
+
+        std::fs::write(&path, &registry_bytes).unwrap();
+        press(&mut app, KeyCode::Char('f'));
+        wait(&mut app).await;
+        let Screen::Connections(screen) = &app.screen else {
+            panic!()
+        };
+        let choices = screen.search_choices().unwrap();
+        assert_eq!(choices.items.len(), usize::from(populated));
+        if populated {
+            assert!(choices.items[0].1.contains(saved.key.as_str()));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), registry_bytes);
+        assert_eq!(gateway.captures.load(Ordering::Relaxed), 0);
+        assert_eq!(gateway.auths.load(Ordering::Relaxed), 0);
+        assert!(!directory.path().join("history.sqlite3").exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn form_loading_failure_preserves_the_list_instead_of_claiming_list_read_failed() {
+    let (directory, mut app, gateway) = fixture();
+    let saved = saved_connection("known.invalid");
+    let mut registry = DestinationRegistry::new();
+    registry
+        .create(saved.key.clone(), saved.current.settings)
+        .unwrap();
+    registry
+        .save(&directory.path().join("destinations.yaml"))
+        .unwrap();
+    app.open_connections();
+    wait(&mut app).await;
+    std::fs::write(
+        &app.credential_registry_path,
+        "invalid: [malformed-credentials",
+    )
+    .unwrap();
+    press(&mut app, KeyCode::Char('a'));
+    wait(&mut app).await;
+    let Screen::Connections(screen) = &app.screen else {
+        panic!()
+    };
+    assert!(
+        matches!(&screen.page, ConnectionsPage::List { items, .. } if items.len() == 1 && items[0].key == saved.key)
+    );
+    assert!(
+        screen.search_choices().unwrap().items[0]
+            .1
+            .contains(saved.key.as_str())
+    );
+    assert!(app.message.is_some());
+    assert_eq!(gateway.captures.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.auths.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn connection_empty_states_offer_only_actionable_short_help_and_return_paths() {
+    let mut screen = ConnectionsScreen {
+        page: ConnectionsPage::Unavailable,
+        scroll: 0,
+    };
+    assert!(screen.help().starts_with("Esc"));
+    assert!(screen.search_choices().is_none());
+    screen.page = ConnectionsPage::List {
+        items: Arc::new(Vec::new()),
+        cursor: 0,
+    };
+    assert!(!screen.help().contains("Enter"));
+    assert!(!screen.select_search_choice(0));
+    screen.page = ConnectionsPage::Keys {
+        form: search_form(),
+        directory: Arc::new(KeyDirectory {
+            path: "fixture".into(),
+            entries: Vec::new(),
+        }),
+        cursor: 0,
+    };
+    assert!(small_screen_text(&screen).contains("No visible files"));
+    assert!(screen.help().contains("Backspace parent"));
+    assert!(!screen.help().contains("Enter"));
+    assert!(!screen.select_search_choice(0));
+    for page in [
+        ConnectionsPage::Form(search_form()),
+        ConnectionsPage::List {
+            items: Arc::new(vec![saved_connection("example.invalid")]),
+            cursor: 0,
+        },
+        ConnectionsPage::Loading {
+            label: "Reading local choices",
+            started: Instant::now(),
+            cancelling: false,
+        },
+        ConnectionsPage::Loading {
+            label: "Reading local choices",
+            started: Instant::now(),
+            cancelling: true,
+        },
+    ] {
+        screen.page = page;
+        assert!(screen.help().chars().count() <= 80, "{}", screen.help());
+    }
+}

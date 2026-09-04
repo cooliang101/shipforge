@@ -7,6 +7,9 @@ use crate::telemetry::{CommandArgument, CommandSpec};
 
 use super::{AuthenticatedSession, SshConnectionError};
 
+mod directories;
+pub(super) use directories::{browse_remote_directories, validate_browse_path};
+
 const MAX_SYSTEMD_CANDIDATES: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

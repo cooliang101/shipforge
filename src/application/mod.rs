@@ -12,6 +12,7 @@ pub mod history_query;
 mod orchestrator;
 mod planner;
 pub mod project_edit;
+pub mod project_reinitialize;
 pub mod recovery;
 mod recovery_attention;
 mod retention;
@@ -33,8 +34,8 @@ pub use deployment::{
 };
 pub use destination_setup::{
     DestinationSetupError, DestinationSetupGateway, DestinationSetupRequest,
-    DestinationSetupService, EndpointProbeRequest, LocalIdentityCandidate, RemoteSetupCandidates,
-    SetupCredential, SetupRootState,
+    DestinationSetupService, EndpointProbeRequest, LocalIdentityCandidate,
+    RemoteDirectoryCandidates, RemoteSetupCandidates, SetupCredential, SetupRootState,
 };
 pub use orchestrator::{
     DeploymentComponent, DeploymentFailure, DeploymentOrchestrator, DeploymentReport,

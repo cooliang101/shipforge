@@ -1,6 +1,7 @@
 //! Standalone connection management and recent-Project unregistration.
 
 mod render;
+mod search;
 mod worker;
 
 use std::{sync::Arc, time::Instant};
@@ -25,6 +26,7 @@ pub(in crate::tui) struct ConnectionsScreen {
 
 #[derive(Clone, Debug)]
 pub(super) enum ConnectionsPage {
+    Unavailable,
     List {
         items: Arc<Vec<ConnectionDetails>>,
         cursor: usize,
@@ -126,6 +128,7 @@ pub(super) struct ConnectionsTask {
     id: uuid::Uuid,
     origin: ConnectionsScreen,
     cancellation: CancellationToken,
+    reading_list: bool,
 }
 
 impl ConnectionsScreen {
@@ -161,6 +164,14 @@ impl App {
             return;
         }
         let request = match &mut screen.page {
+            ConnectionsPage::Unavailable => match key {
+                KeyCode::Char('f') => Some(ConnectionsRequest::List),
+                KeyCode::Esc => {
+                    self.screen = Screen::Projects;
+                    return;
+                }
+                _ => None,
+            },
             ConnectionsPage::List { items, cursor } => {
                 move_cursor(key, cursor, items.len());
                 match key {
@@ -327,6 +338,7 @@ impl App {
         let worker_cancel = cancellation.clone();
         let sender = self.background_sender.clone();
         let label = request.label();
+        let reading_list = matches!(request, ConnectionsRequest::List);
         let spawned = std::thread::Builder::new()
             .name("shipforge-connections".into())
             .spawn(move || {
@@ -347,6 +359,7 @@ impl App {
                     id,
                     origin,
                     cancellation,
+                    reading_list,
                 });
                 self.screen = Screen::Connections(ConnectionsScreen {
                     page: ConnectionsPage::Loading {
@@ -420,7 +433,15 @@ impl App {
                 screen.page = page;
                 screen.scroll = 0;
             }
-            Err(error) => self.message = Some(render::safe_text(&error)),
+            Err(error) => {
+                // A failed refresh is unknown, not proof that an earlier list
+                // (including an empty one) still describes the registry.
+                if task.reading_list {
+                    screen.page = ConnectionsPage::Unavailable;
+                    screen.scroll = 0;
+                }
+                self.message = Some(render::safe_text(&error));
+            }
         }
         self.screen = Screen::Connections(screen);
     }
@@ -428,10 +449,7 @@ impl App {
 
 fn empty_screen() -> ConnectionsScreen {
     ConnectionsScreen {
-        page: ConnectionsPage::List {
-            items: Arc::new(Vec::new()),
-            cursor: 0,
-        },
+        page: ConnectionsPage::Unavailable,
         scroll: 0,
     }
 }

@@ -117,6 +117,8 @@ impl App {
             Screen::Management(screen) => screen.context_label(),
             Screen::Connections(screen) => self.connections_context_label(screen),
             Screen::ProjectEdit(screen) => self.project_edit_context_label(screen),
+            Screen::ManualComponent(screen) => screen.context_label(),
+            Screen::Reinitialize(screen) => screen.context_label(),
             Screen::Projects => "Projects".into(),
             Screen::Browser(_) => "Projects / Choose directory".into(),
             Screen::Overview { config, .. } => self.project_context("Overview", config),
@@ -171,14 +173,7 @@ impl App {
                     component.as_deref(),
                 )
             }
-            Screen::RemoteSetupSelection(selection) => context_label(
-                "Setup / Service",
-                Some(&suggest_project_name(
-                    &selection.destinations.components.root,
-                )),
-                Some("production"),
-                Some(selection.component.as_str()),
-            ),
+            Screen::RemoteSetupSelection(selection) => selection.context_label(),
             Screen::NewSshDestination(draft)
             | Screen::HostKeyPending { draft, .. }
             | Screen::HostKeyConfirm { draft, .. }

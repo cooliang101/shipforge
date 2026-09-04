@@ -2,7 +2,9 @@
 
 mod forms;
 mod gateway;
+mod remote;
 mod render;
+mod search;
 #[cfg(test)]
 mod tests;
 
@@ -144,6 +146,16 @@ impl App {
         if self.project_edit_task.is_some() {
             if key == KeyCode::Esc {
                 self.cancel_project_edit();
+            }
+            return;
+        }
+        if key == KeyCode::Char('b') && matches!(screen.page, ProjectEditPage::Target { .. }) {
+            if let Some(target) =
+                super::remote_target::RemoteSetupSelectionState::from_editor(screen.clone())
+            {
+                self.screen = Screen::RemoteSetupSelection(target);
+            } else {
+                self.message = Some("Select an available connection before opening target choices. Return to the project editor and reload if it changed.".into());
             }
             return;
         }

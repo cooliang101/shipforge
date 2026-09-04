@@ -59,6 +59,8 @@ impl App {
             || self.management_task.is_some()
             || self.connections_task.is_some()
             || self.project_edit_task.is_some()
+            || self.reinitialize_task.is_some()
+            || self.remote_target_task.is_some()
             || matches!(self.screen, Screen::DeploymentRunning { .. })
     }
 
@@ -530,7 +532,12 @@ mod tests {
         assert!(matches!(app.screen, Screen::SetupComponents(_)));
         std::fs::write(directory.path().join("shipforge.yaml"), "invalid: yaml").unwrap();
         app.select_root(directory.path());
-        assert!(app.message.is_some());
+        assert!(matches!(app.screen, Screen::Reinitialize(_)));
+        assert!(app.reinitialize_task.is_none());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("shipforge.yaml")).unwrap(),
+            "invalid: yaml"
+        );
         assert_eq!(*gateway.queries.lock().unwrap(), vec![None]);
         assert!(app.attention.request.is_none());
     }

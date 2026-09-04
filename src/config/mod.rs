@@ -3,6 +3,7 @@
 mod credentials;
 mod destinations;
 mod model;
+mod reinitialize;
 mod setup;
 mod topology;
 
@@ -27,6 +28,7 @@ pub use model::{
     ResolvedArtifact, ResolvedArtifactKind, TargetConfig,
 };
 use model::{ManagedEnvironment, RawEnvironment, RawProjectConfig};
+pub(crate) use reinitialize::reinitialize_setup;
 pub use setup::{
     ComponentSetup, EnvironmentRename, EnvironmentSetup, PreparedProjectInitialization,
     PreparedProjectUpdate, ProjectSetup, ReinitializeConfirmation, TargetSetup,

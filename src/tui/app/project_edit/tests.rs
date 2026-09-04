@@ -19,6 +19,8 @@ use crate::{
 
 use super::*;
 
+mod remote_targets;
+
 struct Fixture {
     directory: TempDir,
     original: ProjectConfig,
@@ -276,6 +278,222 @@ async fn component_argv_text_and_environment_rename_keep_safe_draft_context() {
     assert!(text.contains("[PRODUCTION] demo / PrOd-eu"));
     assert!(text.contains("PrOd-eu [PRODUCTION]"));
     assert!(render::safe_text(&"界".repeat(5000)).ends_with(" [display truncated]"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_search_focuses_original_rows_without_applying_or_saving_drafts() {
+    let fixture = Fixture::new().await;
+    let bytes = fixture.bytes();
+    let mut current = screen(&fixture.app);
+    let draft = current.draft.clone().unwrap();
+    let component = ComponentForm::new(
+        Some(name("backend")),
+        "backend".into(),
+        &draft.setup.components[&name("backend")],
+    );
+    let environment = environment(&fixture.app, "production");
+    let target = TargetForm {
+        target: environment.targets[&name("backend")].clone(),
+        component: name("backend"),
+        environment: environment.clone(),
+    };
+    for (page, expected_index, expected_label) in [
+        (ProjectEditPage::Components { cursor: 0 }, 1, "worker"),
+        (ProjectEditPage::Environments { cursor: 0 }, 1, "staging"),
+        (
+            ProjectEditPage::Environment {
+                form: environment,
+                cursor: 0,
+            },
+            2,
+            "worker",
+        ),
+        (
+            ProjectEditPage::Component {
+                form: component.clone(),
+                cursor: 0,
+            },
+            4,
+            "Apply Component",
+        ),
+        (
+            ProjectEditPage::Target {
+                form: target,
+                cursor: 0,
+            },
+            5,
+            "Apply target",
+        ),
+        (
+            ProjectEditPage::Commands {
+                form: component.clone(),
+                cursor: 0,
+            },
+            0,
+            "cargo",
+        ),
+        (
+            ProjectEditPage::Command {
+                form: component,
+                command: 0,
+                cursor: 0,
+            },
+            1,
+            "build",
+        ),
+    ] {
+        current.page = page;
+        let choices = current.search_choices().unwrap();
+        assert_eq!(choices.items[expected_index].0, expected_index);
+        assert!(choices.items[expected_index].1.contains(expected_label));
+        assert!(current.select_search_choice(expected_index));
+        assert_eq!(current.search_choices().unwrap().selected, expected_index);
+        assert!(!current.select_search_choice(usize::MAX));
+        assert_eq!(current.search_choices().unwrap().selected, expected_index);
+        assert!(Arc::ptr_eq(current.draft.as_ref().unwrap(), &draft));
+        assert!(!current.dirty);
+        assert!(current.help().chars().count() <= 80, "{}", current.help());
+        assert!(current.help().contains("F4 search"));
+    }
+    assert_eq!(fixture.bytes(), bytes);
+    assert!(fixture.app.project_edit_task.is_none());
+    assert!(!fixture.directory.path().join("history.sqlite3").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn searched_connection_and_dependency_require_separate_form_actions() {
+    let fixture = Fixture::with_hosts(["same.invalid", "same.invalid"]).await;
+    let bytes = fixture.bytes();
+    let mut current = screen(&fixture.app);
+    let draft = current.draft.as_ref().unwrap();
+    let second = draft.destinations()[1].key.clone();
+    let environment = environment(&fixture.app, "production");
+    let target = TargetForm {
+        target: environment.targets[&name("worker")].clone(),
+        environment,
+        component: name("worker"),
+    };
+    let original_destination = target.target.destination.clone();
+    current.page = ProjectEditPage::Destination {
+        form: target.clone(),
+        cursor: 0,
+    };
+    assert!(
+        current.search_choices().unwrap().items[1]
+            .1
+            .contains(second.as_str())
+    );
+    assert!(current.select_search_choice(1));
+    assert!(
+        matches!(&current.page, ProjectEditPage::Destination { cursor: 1, form } if form.target.destination == original_destination)
+    );
+    current.page = ProjectEditPage::Dependencies {
+        form: target,
+        names: vec![name("worker"), name("backend")],
+        selected: BTreeSet::from([name("backend")]),
+        cursor: 0,
+    };
+    assert_eq!(
+        current.search_choices().unwrap().items[1],
+        (1, "[x] after backend".into())
+    );
+    assert!(current.select_search_choice(1));
+    assert!(
+        matches!(&current.page, ProjectEditPage::Dependencies { cursor: 1, selected, .. } if selected == &BTreeSet::from([name("backend")]))
+    );
+    assert!(!current.dirty);
+    assert_eq!(fixture.bytes(), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_editor_choices_and_unavailable_configuration_have_actionable_help() {
+    let fixture = Fixture::new().await;
+    let mut current = screen(&fixture.app);
+    let environment = environment(&fixture.app, "production");
+    let target = TargetForm {
+        target: environment.targets[&name("worker")].clone(),
+        environment,
+        component: name("worker"),
+    };
+    for (page, return_hint) in [
+        (
+            ProjectEditPage::Discovery {
+                report: Arc::new(DiscoveryReport {
+                    components: Vec::new(),
+                    notices: Vec::new(),
+                }),
+                cursor: 0,
+            },
+            "Esc Components",
+        ),
+        (
+            ProjectEditPage::Dependencies {
+                form: target,
+                names: Vec::new(),
+                selected: BTreeSet::new(),
+                cursor: 0,
+            },
+            "Esc cancel",
+        ),
+        (
+            ProjectEditPage::Commands {
+                form: ComponentForm::blank(),
+                cursor: 0,
+            },
+            "Esc Component",
+        ),
+    ] {
+        current.page = page;
+        assert!(current.search_choices().unwrap().items.is_empty());
+        assert!(!current.select_search_choice(0));
+        assert!(current.help().contains(return_hint));
+        assert!(!current.help().contains("↑/↓"));
+        assert!(current.help().chars().count() <= 80);
+    }
+    Arc::make_mut(current.draft.as_mut().unwrap())
+        .setup
+        .components
+        .clear();
+    current.page = ProjectEditPage::Components { cursor: 0 };
+    assert!(small_editor_text(&current).contains("No Components in the draft"));
+    assert!(!current.help().contains("Enter"));
+    assert!(current.help().contains("a add"));
+    Arc::make_mut(current.draft.as_mut().unwrap())
+        .setup
+        .environments
+        .clear();
+    current.page = ProjectEditPage::Environments { cursor: 0 };
+    assert!(small_editor_text(&current).contains("No Environments in the draft"));
+    assert!(!current.help().contains("Enter"));
+    current.draft = None;
+    current.page = ProjectEditPage::Home;
+    assert!(current.help().contains("r retry"));
+    assert!(!current.help().contains("p YAML"));
+    assert!(current.search_choices().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_text_input_is_not_a_search_picker_and_keeps_literal_slashes() {
+    let mut fixture = Fixture::new().await;
+    let bytes = fixture.bytes();
+    set_page(
+        &mut fixture.app,
+        forms::text_page(
+            forms::TextField::Project,
+            "original".into(),
+            ProjectEditPage::Home,
+        ),
+    );
+    let mut current = screen(&fixture.app);
+    assert!(current.search_choices().is_none());
+    assert!(!current.select_search_choice(0));
+    press(&mut fixture.app, KeyCode::F(4));
+    press(&mut fixture.app, KeyCode::Char('/'));
+    assert!(
+        matches!(screen(&fixture.app).page, ProjectEditPage::Text(TextEdit { value, .. }) if value == "original/")
+    );
+    press(&mut fixture.app, KeyCode::Esc);
+    assert_eq!(fixture.bytes(), bytes);
 }
 
 fn screen(app: &App) -> ProjectEditScreen {

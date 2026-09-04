@@ -27,6 +27,7 @@ impl super::App {
 impl ConnectionsScreen {
     pub(in crate::tui) fn context_label(&self) -> String {
         let label = match &self.page {
+            ConnectionsPage::Unavailable => "Connections / Unavailable saved connections".into(),
             ConnectionsPage::List { items, cursor } => items.get(*cursor).map_or_else(
                 || "Connections / Saved connections".into(),
                 |connection| connection_context("Connections", connection),
@@ -57,32 +58,45 @@ impl ConnectionsScreen {
 
     pub(in crate::tui) fn help(&self) -> &'static str {
         match &self.page {
+            ConnectionsPage::Unavailable => "Esc projects   f retry reading saved connections",
+            ConnectionsPage::List { items, .. } if items.is_empty() => {
+                "Esc projects   a add SSH connection   f refresh"
+            }
             ConnectionsPage::List { .. } => {
-                "↑/↓ select   Enter details   a add SSH connection   f refresh   Esc projects"
+                "Esc projects   F4 search   ↑/↓ select   Enter details   a add   f refresh"
             }
             ConnectionsPage::Detail { .. } => {
-                "e edit connection   v verify saved connection (read-only)   x remove   Esc list"
+                "Esc list   e edit   v verify (read-only)   x remove registration"
+            }
+            ConnectionsPage::Form(form) if form.field == SshField::Host => {
+                "Esc list   Tab field   F4 hosts   F2 next host   F3 keys   Enter capture"
+            }
+            ConnectionsPage::Form(form) if form.field == SshField::Credential => {
+                "Esc list   Tab field   ↑/↓ identity   F4 search   F3 keys   Enter capture"
             }
             ConnectionsPage::Form(_) => {
-                "Tab field   type edit   ↑/↓ identity   F2 next suggested host   F3 browse key   Enter capture key   Esc list"
+                "Esc list   Tab field   type edit   F2 next host   F3 keys   Enter capture"
+            }
+            ConnectionsPage::Keys { directory, .. } if directory.entries.is_empty() => {
+                "Esc form   Backspace parent"
             }
             ConnectionsPage::Keys { .. } => {
-                "↑/↓ select   Enter directory   Backspace parent   s select private key   Esc form"
+                "Esc form   F4 search   ↑/↓ select   Enter dir   Backspace parent   s key"
             }
             ConnectionsPage::HostKey { .. } => {
-                "y explicitly trust this fingerprint, authenticate and save   n / Esc reject"
+                "Esc / n reject   y trust fingerprint, authenticate and save"
             }
             ConnectionsPage::Remove(preview) if !preview.can_remove() => {
-                "Removal blocked   PgUp/PgDn scroll   Esc return"
+                "Esc return   Removal blocked   PgUp/PgDn scroll"
             }
             ConnectionsPage::Remove(_) | ConnectionsPage::ProjectRemove(_) => {
-                "PgUp/PgDn scroll   c confirm removal   Esc reject"
+                "Esc reject   PgUp/PgDn scroll   c confirm removal"
             }
             ConnectionsPage::Loading {
                 cancelling: true, ..
-            } => "Cancellation requested; waiting for a definite result before leaving",
+            } => "CANCELLING   Waiting for a definite result before leaving",
             ConnectionsPage::Loading { .. } => {
-                "Esc / Ctrl+C request cancellation; navigation stays blocked until completion"
+                "Esc / Ctrl+C cancel   Wait for completion before leaving (no detach)"
             }
             ConnectionsPage::ProjectRemoved(_) => {
                 "Project unregistered; files and history unchanged"
@@ -109,11 +123,16 @@ impl ConnectionsScreen {
 
     fn content(&self) -> (&'static str, String, Option<usize>) {
         match &self.page {
+            ConnectionsPage::Unavailable => (
+                " Saved connections unavailable ",
+                "UNKNOWN: saved connections could not be loaded.\nThis does not mean no connections exist.\n\nPress f to retry reading local settings, or Esc to return to Projects.".into(),
+                None,
+            ),
             ConnectionsPage::List { items, cursor } => {
                 let mut body =
                     "Standalone saved connections · no Project is required\n\n".to_owned();
                 if items.is_empty() {
-                    body.push_str("No saved connections. Press a to add one.\n");
+                    body.push_str("No saved connections.\nPress a to add one, f to refresh, or Esc to return.\n");
                 }
                 for (index, connection) in items.iter().enumerate() {
                     let DestinationSettings::LinuxSsh {
@@ -146,6 +165,9 @@ impl ConnectionsScreen {
                     "Directory: {}\nSelect a private key; file contents are never displayed.\n\n",
                     safe_text(&directory.path.display().to_string())
                 );
+                if directory.entries.is_empty() {
+                    body.push_str("No visible files or directories here.\nBackspace opens the parent directory; Esc returns to the form.\n");
+                }
                 for (index, entry) in directory.entries.iter().enumerate() {
                     let _ = writeln!(
                         body,
@@ -190,7 +212,7 @@ impl ConnectionsScreen {
                     if *cancelling {
                         "Cancellation requested. Waiting for the worker result; saved effects will be reported accurately."
                     } else {
-                        "The interface remains responsive. Esc requests cancellation."
+                        "RUNNING: Esc requests cancellation. Wait for the worker before leaving."
                     }
                 ),
                 None,
@@ -245,6 +267,14 @@ fn form_text(form: &ConnectionForm) -> String {
     if form.credentials.is_empty() {
         body.push_str("No identity found. F3: browse a local private-key file.\n");
     }
+    if form.hosts.is_empty() {
+        body.push_str("No suggested hosts. Type a hostname in the Host field.\n");
+    } else {
+        body.push_str("Host field: F4 searches suggested hosts; F2 cycles them.\n");
+    }
+    body.push_str(
+        "Enter captures the host-key fingerprint only. Review it before plain y saves.\n",
+    );
     for notice in &form.notices {
         let _ = writeln!(body, "\n{}", safe_text(notice));
     }

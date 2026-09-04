@@ -1,5 +1,6 @@
 mod app;
 mod deployment_error;
+mod picker;
 mod presentation;
 
 use std::{
@@ -81,7 +82,7 @@ fn run_event_loop() -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))?;
     let initial_directory = std::env::current_dir()?;
     let mut app = App::new(registry_path, destination_registry_path, &initial_directory)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .map_err(|_| io::Error::other("Could not open the initial project directory. Check its path and local read permissions."))?;
     let mut guard = TerminalGuard::enter()?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drive_event_loop(&mut app, &mut guard)
@@ -133,22 +134,74 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             });
     frame.render_widget(Paragraph::new(context).style(context_style), areas[0]);
     render_screen(frame, areas[1], app);
-    let help = if app.deployment_session.is_active()
+    let help = page_help(app);
+    let mut footer = vec![Line::from(help)];
+    if let Some(message) = &app.message {
+        footer.push(Line::from(vec![
+            Span::styled(
+                "Message: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(safe_text(message)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(footer), areas[2]);
+    if areas[0].width >= 48 {
+        let hints = ratatui::layout::Rect::new(areas[0].right() - 16, areas[0].y, 16, 1);
+        frame.render_widget(
+            Paragraph::new(" F1 help F4 find ")
+                .style(Style::default().add_modifier(Modifier::REVERSED)),
+            hints,
+        );
+    }
+    if let Some(picker) = &app.picker {
+        picker.render(frame, areas[1]);
+    }
+    if app.help_open {
+        frame.render_widget(ratatui::widgets::Clear, areas[1]);
+        let message = app
+            .message
+            .as_deref()
+            .map_or_else(|| "No current message.".into(), safe_text);
+        let instructions = format!(
+            "Current page: {}\n\nPage keys: {help}\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nDeployment/rollback: only unmodified c confirms. SSH fingerprint: only unmodified y trusts.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
+            app.context_label()
+        );
+        frame.render_widget(
+            panel(" Keyboard help and current message ", instructions).scroll((app.help_scroll, 0)),
+            areas[1],
+        );
+    }
+}
+
+fn page_help(app: &App) -> &'static str {
+    if app.setup_busy() {
+        if app.setup_cancelling() {
+            "SSH setup cancellation requested; waiting for the worker to stop"
+        } else {
+            "SSH setup working; Esc requests cancellation and waits before retry"
+        }
+    } else if app.deployment_session.is_active()
         && !matches!(
             app.screen,
             Screen::Management(_)
                 | Screen::Connections(_)
                 | Screen::ProjectEdit(_)
                 | Screen::DeploymentRunning { .. }
-        ) {
+        )
+    {
         "Deployment active   return to progress or cancel safely"
     } else {
         match &app.screen {
             Screen::Management(screen) => screen.help(),
             Screen::Connections(screen) => screen.help(),
             Screen::ProjectEdit(screen) => screen.help(),
+            Screen::ManualComponent(screen) => screen.help(),
+            Screen::Reinitialize(screen) => screen.help(),
             Screen::Projects => {
-                "↑/↓ select   Enter open   o browse   c connections   x unregister project   q quit"
+                "↑↓ select · Enter open · o browse · f refresh · c connections · x unregister · q quit"
             }
             Screen::Browser(_) => {
                 "↑/↓ select   Enter enter directory   Backspace parent   s select root   Esc back"
@@ -179,9 +232,14 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             Screen::DeploymentFinished { .. } => {
                 "↑/↓ or PgUp/PgDn scroll   Enter/Esc project overview"
             }
-            Screen::SetupComponents(_) => "↑/↓ select   Space toggle   Enter next   Esc projects",
+            Screen::SetupComponents(setup) if setup.selected.is_empty() => {
+                "Esc projects   a add manually   ↑/↓ move   Space select (required)"
+            }
+            Screen::SetupComponents(_) => {
+                "Esc projects   ↑/↓ move   Space toggle   Enter next   a add manually"
+            }
             Screen::SetupDestinations(_) => {
-                "←/→ Component   ↑/↓ Destination   Space assign   a add SSH   n review   Esc Components"
+                "←→ Component · ↑↓ connection · Space assign · e target · a SSH · n review · Esc back"
             }
             Screen::NewSshDestination(_) => {
                 "Tab field   ↑/↓ identity   F3 browse key   F2 next host   Enter probe   Esc cancel"
@@ -189,9 +247,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             Screen::HostKeyPending { .. } => "Fetching Host Key…   Esc cancel",
             Screen::HostKeyConfirm { .. } => "y trust fingerprint and authenticate   n/Esc reject",
             Screen::SshAuthenticationPending { .. } => "Authenticating and probing…   Esc cancel",
-            Screen::RemoteSetupSelection(_) => {
-                "↑/↓ select systemd service   Enter accept   Esc skip service"
-            }
+            Screen::RemoteSetupSelection(screen) => screen.help(),
             Screen::KeyBrowser { .. } => {
                 "↑/↓ select   Enter directory   Backspace parent   s choose file   Esc back"
             }
@@ -199,20 +255,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 "↑/↓ or PgUp/PgDn scroll   c confirm and save   Esc Destinations"
             }
         }
-    };
-    let mut footer = vec![Line::from(help)];
-    if let Some(message) = &app.message {
-        footer.push(Line::from(vec![
-            Span::styled(
-                "Message: ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(safe_text(message)),
-        ]));
     }
-    frame.render_widget(Paragraph::new(footer), areas[2]);
 }
 
 fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
@@ -220,6 +263,8 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
         Screen::Management(screen) => screen.render(frame, area, app),
         Screen::Connections(screen) => screen.render(frame, area),
         Screen::ProjectEdit(screen) => screen.render(frame, area),
+        Screen::ManualComponent(screen) => screen.render(frame, area),
+        Screen::Reinitialize(screen) => screen.render(frame, area),
         Screen::Projects => render_projects(frame, area, app),
         Screen::Browser(browser) => render_project_browser(frame, area, browser),
         Screen::Overview { root, config } => {
@@ -276,7 +321,7 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             render_authentication_pending(frame, area, draft);
         }
         Screen::RemoteSetupSelection(selection) => {
-            render_remote_setup_selection(frame, area, selection);
+            selection.render(frame, area);
         }
         Screen::KeyBrowser { browser, .. } => render_key_browser(frame, area, browser),
         Screen::SetupReview {
@@ -325,7 +370,10 @@ fn render_project_browser(
                 .title(" Select project directory ")
                 .borders(Borders::ALL),
         )
-        .wrap(Wrap { trim: false });
+        .scroll((
+            choice_scroll(browser.selected.saturating_add(1), area.height),
+            0,
+        ));
     frame.render_widget(content, area);
 }
 
@@ -646,55 +694,6 @@ fn render_authentication_pending(
     );
 }
 
-fn render_remote_setup_selection(
-    frame: &mut Frame<'_>,
-    area: ratatui::layout::Rect,
-    selection: &app::RemoteSetupSelectionState,
-) {
-    let root_state = match selection.root_state {
-        crate::application::SetupRootState::Missing => {
-            "missing (created on deployment if parent permissions allow)"
-        }
-        crate::application::SetupRootState::WritableDirectory => "writable directory",
-        crate::application::SetupRootState::ReadOnlyDirectory => "read-only directory",
-        crate::application::SetupRootState::NotDirectory => "exists but is not a directory",
-    };
-    let mut lines = vec![
-        Line::from(format!("Component: {}", selection.component)),
-        Line::from(format!("Default root: {}", selection.root)),
-        Line::from(format!("Remote status: {root_state}")),
-        Line::from(""),
-        Line::from("Optional systemd service:"),
-        selected_line(selection.cursor == 0, "Do not manage a service"),
-    ];
-    lines.extend(
-        selection
-            .systemd_units
-            .iter()
-            .enumerate()
-            .map(|(index, unit)| selected_line(selection.cursor == index + 1, unit)),
-    );
-    if selection.systemd_units.is_empty() {
-        lines.push(Line::from("  No service candidates were discovered"));
-    }
-    lines.extend(selection.notices.iter().map(|notice| {
-        Line::from(vec![Span::styled(
-            format!("Note: {notice}"),
-            Style::default().fg(Color::Yellow),
-        )])
-    }));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" Remote setup candidates ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
 fn render_key_browser(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
@@ -708,7 +707,11 @@ fn render_key_browser(
         lines.push(Line::from("  No files or directories"));
     } else {
         lines.extend(browser.entries.iter().enumerate().map(|(index, path)| {
-            let suffix = if path.is_dir() { "/" } else { "" };
+            let suffix = if browser.directories.contains(path) {
+                "/"
+            } else {
+                ""
+            };
             let name = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -723,7 +726,10 @@ fn render_key_browser(
                     .title(" Select SSH private key ")
                     .borders(Borders::ALL),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((
+                choice_scroll(browser.selected.saturating_add(1), area.height),
+                0,
+            )),
         area,
     );
 }
@@ -740,14 +746,11 @@ fn render_new_ssh_destination(
         form_line("User", &draft.user, draft.field == app::SshField::User),
         form_line("Port", &draft.port, draft.field == app::SshField::Port),
         Line::from(""),
-        Line::from(Span::styled(
-            &draft.agent_status,
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(safe_text(&draft.agent_status)),
     ];
     if draft.credentials.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No modern SSH identity found in the Agent, saved credentials, or ~/.ssh.",
+            "No identities are available in this form. Press F3 to choose a key file.",
             Style::default().fg(Color::Yellow),
         )));
     } else {
@@ -771,6 +774,13 @@ fn render_new_ssh_destination(
             draft.connections.len()
         )));
     }
+    let focused_row = match draft.field {
+        app::SshField::Host => 2,
+        app::SshField::User => 3,
+        app::SshField::Port => 4,
+        app::SshField::Credential if draft.credentials.is_empty() => 7,
+        app::SshField::Credential => 8 + draft.credential_cursor.min(draft.credentials.len() - 1),
+    };
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -778,7 +788,7 @@ fn render_new_ssh_destination(
                     .title(" New SSH Destination ")
                     .borders(Borders::ALL),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((choice_scroll(focused_row, area.height), 0)),
         area,
     );
 }
@@ -868,7 +878,10 @@ fn render_destination_setup(
                     .title(" First-time setup · Destinations ")
                     .borders(Borders::ALL),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((
+                choice_scroll(setup.destination_cursor.saturating_add(2), area.height),
+                0,
+            )),
         area,
     );
 }
@@ -880,7 +893,7 @@ fn render_component_setup(
 ) {
     let mut lines = vec![Line::from(format!("Root: {}", setup.root.display()))];
     if setup.report.components.is_empty() {
-        lines.push(Line::from("No deployable Components were inferred."));
+        lines.push(Line::from("No deployable Components were inferred. Press a to add one manually, or Esc to choose another project."));
     }
     for (index, candidate) in setup.report.components.iter().enumerate() {
         let checked = if setup.selected.contains(&candidate.name) {
@@ -910,17 +923,34 @@ fn render_component_setup(
                     .title(" First-time setup · Components ")
                     .borders(Borders::ALL),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((
+                choice_scroll(setup.cursor.saturating_add(1), area.height),
+                0,
+            )),
         area,
     );
 }
 
 fn render_projects(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let mut lines = Vec::new();
+    let area = if app.recent_unavailable {
+        let height = area.height.min(2);
+        frame.render_widget(Paragraph::new("Recent projects unavailable; cached entries are disabled. f retries; o browses directories.").wrap(Wrap { trim: false }),
+            ratatui::layout::Rect::new(area.x, area.y, area.width, height));
+        ratatui::layout::Rect::new(
+            area.x,
+            area.y.saturating_add(height),
+            area.width,
+            area.height.saturating_sub(height),
+        )
+    } else {
+        area
+    };
     if let Some(notice) = app.attention_notice() {
         lines.push(Line::styled(notice, Style::default().fg(Color::Yellow)));
         lines.push(Line::from(""));
     }
+    let selected_row = lines.len().saturating_add(app.selected_recent);
     for (index, status) in app.recent.iter().enumerate() {
         let suffix = if status.available {
             ""
@@ -939,7 +969,7 @@ fn render_projects(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(" Projects ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+            .scroll((choice_scroll(selected_row, area.height), 0)),
         area,
     );
 }
@@ -949,13 +979,15 @@ fn selected_line(selected: bool, text: &str) -> Line<'static> {
     if selected {
         Line::from(Span::styled(
             format!("> {text}"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
         ))
     } else {
         Line::from(format!("  {text}"))
     }
+}
+
+fn choice_scroll(row: usize, height: u16) -> u16 {
+    u16::try_from(row.saturating_sub(usize::from(height.saturating_sub(3)))).unwrap_or(u16::MAX)
 }
 
 fn panel(title: &'static str, content: String) -> Paragraph<'static> {

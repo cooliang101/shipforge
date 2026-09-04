@@ -7,6 +7,7 @@ mod render;
 mod retired_tests;
 #[cfg(test)]
 mod rollback_tests;
+mod search;
 #[cfg(test)]
 mod tests;
 

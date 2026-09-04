@@ -62,6 +62,14 @@ pub struct RemoteSetupCandidates {
     pub notices: Vec<String>,
 }
 
+/// One explicitly requested directory and its observed direct child directories.
+/// Enumeration is not proof of write access, deployment ownership or service health.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDirectoryCandidates {
+    pub directory: String,
+    pub directories: Vec<String>,
+}
+
 #[async_trait]
 pub trait DestinationSetupGateway: fmt::Debug + Send + Sync {
     fn driver_kind(&self) -> DriverKind;
@@ -85,6 +93,19 @@ pub trait DestinationSetupGateway: fmt::Debug + Send + Sync {
         command_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<RemoteSetupCandidates, DestinationSetupError>;
+
+    async fn browse_directories(
+        &self,
+        _request: &DestinationSetupRequest,
+        _connect_timeout: Duration,
+        _command_timeout: Duration,
+        _cancellation: &CancellationToken,
+    ) -> Result<RemoteDirectoryCandidates, DestinationSetupError> {
+        Err(DestinationSetupError::operation(
+            "directory browsing",
+            "directory browsing is unavailable for this connection",
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +165,31 @@ impl DestinationSetupService {
         self.ensure_driver(&request.driver)?;
         self.gateway
             .authenticate_and_probe(request, connect_timeout, command_timeout, cancellation)
+            .await
+    }
+
+    /// Lists only the direct directories under the explicitly requested remote path.
+    /// The gateway authenticates the saved host-key pin; no paths are created.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported browsing, invalid/noncanonical paths,
+    /// unavailable or incomplete directory evidence, timeout or cancellation.
+    pub async fn browse_directories(
+        &self,
+        request: &DestinationSetupRequest,
+        connect_timeout: Duration,
+        command_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteDirectoryCandidates, DestinationSetupError> {
+        self.ensure_driver(&request.driver)?;
+        if cancellation.is_cancelled() {
+            return Err(DestinationSetupError::operation(
+                "directory browsing",
+                "cancelled",
+            ));
+        }
+        self.gateway
+            .browse_directories(request, connect_timeout, command_timeout, cancellation)
             .await
     }
 
@@ -308,5 +354,54 @@ mod tests {
             remote_root: "/srv/example".into(),
         };
         assert!(!format!("{request:?}").contains("private-path-or-token"));
+    }
+
+    #[tokio::test]
+    async fn directory_service_checks_driver_cancellation_and_explicit_unsupported_default() {
+        let service = DestinationSetupService::new(Arc::new(FakeSetupGateway));
+        let mut request = DestinationSetupRequest {
+            driver: DriverKind::parse("other").unwrap(),
+            destination: endpoint(DriverKind::parse("fake").unwrap()).destination,
+            credential: SetupCredential::new(7_u8),
+            remote_root: "/srv".into(),
+        };
+        let cancellation = CancellationToken::new();
+        assert!(matches!(
+            service
+                .browse_directories(
+                    &request,
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    &cancellation
+                )
+                .await,
+            Err(DestinationSetupError::UnsupportedDriver { .. })
+        ));
+        request.driver = DriverKind::parse("fake").unwrap();
+        let unsupported = service
+            .browse_directories(
+                &request,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            unsupported
+                .to_string()
+                .contains("directory browsing is unavailable")
+        );
+        cancellation.cancel();
+        let cancelled = service
+            .browse_directories(
+                &request,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert!(cancelled.to_string().contains("cancelled"));
     }
 }

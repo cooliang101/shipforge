@@ -12,18 +12,18 @@
 
 `shipforge.yaml` 必须位于项目根目录，不得包含密码、Token、私钥正文或个人 SSH Key 路径。`_shipforge` 保存 Project/Environment ID，以及每个 Environment/Component 的 generation 和固化 root；不得绕过 TUI 手工修改。
 
-配置文件不存在时，该目录作为新 Project 初始化并生成新身份，不从用户目录缓存或远端恢复。配置存在但 `_shipforge` 缺失或损坏时必须停止；只有用户在 TUI 明确确认“作为新项目重新初始化”后才能生成全新身份。远端 Deployment Marker 只用于目标冲突检查，不是配置备份。
+配置文件不存在时，该目录作为新 Project 初始化并生成新身份，不从用户目录缓存或远端恢复。配置存在但 `_shipforge` 缺失或损坏时必须停止；TUI 可在校验用户配置与连接引用后生成完整 YAML 预览，只有用户明确确认“作为新项目重新初始化”后才能保存全新身份。可靠的固化 root 保留，含糊或冲突的路径拒绝猜测；保存前复核原文件和连接快照。远端 Deployment Marker 只用于目标冲突检查，不是配置备份。
 
 ## 选择优先的首次设置
 
 1. 让用户选择项目目录；若已有 `shipforge.yaml`，立即加载并校验。
-2. 扫描 `package.json`、`Cargo.toml`、`go.mod`、Dockerfile 和构建脚本，展示推断出的 Component、构建命令与构建输出路径，供用户勾选或修正。
+2. 从 `package.json` 的 build script、`Cargo.toml` 和 `go.mod` 推断 Component、构建命令与构建输出路径，供用户勾选或修正；Dockerfile 只提示镜像构建不在 MVP 范围，其他构建方式可手动配置。无候选或发现失败不要求先修改项目文件以通过发现。
 3. 展示已有 Destination 和 SSH config 中的 Host；新建连接时优先让用户选择 SSH Agent、`IdentityFile` 或发现的 Key。
-4. 首次连接前展示 Host Key 指纹；连接成功后展示可用目录和 systemd unit 候选。
-5. 用户为每个 Component 选择 Destination；同一 Destination 可被任意 Project 的多个 Component 复用。
-6. 展示规范化计划，确认后原子写入项目根目录的 `shipforge.yaml`。
+4. 首次连接前展示 Host Key 指纹；确认并认证成功后保存本机连接。用户可只读浏览目录、探测 systemd 候选，也可选择默认 root 或手动覆盖；探测结果不表示部署预检或健康已通过。
+5. 用户为每个 Component 选择 Destination、独立 root 和可选服务；同一 Destination 可被任意 Project 的多个 Component 复用，不共用组件部署设置。
+6. 展示规范化 YAML，确认后原子写入项目根目录的 `shipforge.yaml`；部署预检和执行另行确认。
 
-除主机地址、特殊部署目录等无法可靠发现的值外，应使用选择、确认和默认值完成设置。Project/Environment/Destination/Deployment ID 和 Release 版本均由系统生成，用户无需命名连接。取消向导不得留下半成品配置或 Destination。
+除主机地址、特殊部署目录等无法可靠发现的值外，应使用选择、确认和默认值完成设置。Project/Environment/Destination/Deployment ID 和 Release 版本均由系统生成，用户无需命名连接。取消不保存未确认草稿；已经明确确认并保存的连接保留，不随项目向导取消而删除。写入结果不确定时要求重新加载，不宣称没有保存，也不盲目回退独立注册表。
 
 MVP 中用户只选择 SSH 连接，不选择 Driver。TUI 根据连接记录自动使用内置 `linux-ssh` 实现；Driver 名称、能力标识符和 SFTP 参数不进入项目配置。
 
@@ -91,7 +91,7 @@ environments:
 
 ## 默认值
 
-- Component 工作目录默认为 `./<component-name>`；`artifact` 相对于该工作目录，而非固定相对于 Project 根目录。
+- YAML 省略 Component 工作目录时默认为 `./<component-name>`；`artifact` 相对于该工作目录，而非固定相对于 Project 根目录。首次设置的手动添加表单预填显式 `.`，表示使用所选项目根目录，不改变 YAML 的省略规则。
 - `artifact: dist` 始终只是一个构建输出路径；构建后自动识别文件或目录，不存在或为空时报错。用户无需填写产物类型。
 - Destination ID 由系统生成且不可变，例如 `dst_…0002`；TUI 直接显示 `deploy@app.example.com:22` 等端点摘要，不要求填写连接名称，也不提供别名字段。
 - Project、Environment、Component 使用配置名称；Destination 在项目 YAML 中只使用系统 ID，TUI 自动显示 `user@host:port` 摘要。

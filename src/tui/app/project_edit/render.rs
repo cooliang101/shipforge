@@ -53,44 +53,102 @@ impl ProjectEditScreen {
 
     pub(in crate::tui) fn help(&self) -> &'static str {
         match &self.page {
-            ProjectEditPage::Home => {
-                "n project name   c Components   e Environments   p preview YAML   Esc leave/discard"
+            ProjectEditPage::Home if self.draft.is_none() => {
+                "Esc return   r retry loading configuration"
             }
+            ProjectEditPage::Home => {
+                "Esc leave/discard   n name   c Components   e Environments   p YAML preview"
+            }
+            ProjectEditPage::Loading {
+                cancelling: true, ..
+            } => "CANCELLING   Wait for the worker result before leaving (no detach)",
             ProjectEditPage::Loading { .. } => {
-                "Esc / Ctrl+C request cancellation; wait for the worker (no detach)"
+                "Esc / Ctrl+C cancel   Wait for the worker before leaving (no detach)"
+            }
+            ProjectEditPage::Components { .. }
+                if self
+                    .draft
+                    .as_ref()
+                    .is_none_or(|draft| draft.setup.components.is_empty()) =>
+            {
+                "Esc back   f discover candidates   a add Component"
+            }
+            ProjectEditPage::Components { .. }
+                if self
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.setup.components.len() == 1) =>
+            {
+                "Esc back   F4 search   ↑/↓ choose   Enter edit   f discover   a add"
             }
             ProjectEditPage::Components { .. } => {
-                "↑/↓ choose   Enter edit   f discover candidates   a add manually   d remove from draft   Esc back"
+                "Esc back   F4 search   ↑/↓ choose   Enter edit   f discover   a add   d remove"
+            }
+            ProjectEditPage::Environments { .. }
+                if self
+                    .draft
+                    .as_ref()
+                    .is_none_or(|draft| draft.setup.environments.is_empty()) =>
+            {
+                "Esc back   a add Environment"
+            }
+            ProjectEditPage::Environments { .. }
+                if self
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.setup.environments.len() == 1) =>
+            {
+                "Esc back   F4 search   ↑/↓ choose   Enter edit/rename   a add"
             }
             ProjectEditPage::Environments { .. } => {
-                "↑/↓ choose   Enter edit/rename   a add   d remove from draft   Esc back"
+                "Esc back   F4 search   ↑/↓ choose   Enter edit/rename   a add   d remove"
+            }
+            ProjectEditPage::Commands { form, .. } if form.commands.is_empty() => {
+                "Esc Component   a add executable"
             }
             ProjectEditPage::Commands { .. } => {
-                "↑/↓ command   Enter edit argv   a add executable   d remove command   Esc Component"
+                "Esc Component   F4 search   ↑/↓ command   Enter edit argv   a add   d remove"
             }
             ProjectEditPage::Command { .. } => {
-                "↑/↓ argv item   Enter edit one item   a add argument   d remove argument   Esc commands"
+                "Esc commands   F4 search   ↑/↓ argv item   Enter edit   a add   d remove arg"
             }
             ProjectEditPage::Environment { .. } => {
-                "↑/↓ field/Component   Space toggle Component   Enter edit / apply draft   Esc discard this form"
+                "Esc discard form   F4 search   ↑/↓ field   Space toggle   Enter edit/apply"
+            }
+            ProjectEditPage::Target { .. } => {
+                "F4 search · ↑↓ field · Enter edit/apply · b remote choices · Esc back"
+            }
+            ProjectEditPage::Dependencies { names, .. } if names.is_empty() => {
+                "Esc cancel   Enter apply no dependencies"
             }
             ProjectEditPage::Dependencies { .. } => {
-                "↑/↓ Component   Space toggle ordering dependency   Enter apply   Esc cancel"
+                "Esc cancel   F4 search   ↑/↓ Component   Space toggle   Enter apply"
+            }
+            ProjectEditPage::Discovery { report, .. } if report.components.is_empty() => {
+                "Esc Components   Then a adds manually or f retries discovery"
+            }
+            ProjectEditPage::Destination { .. }
+                if self
+                    .draft
+                    .as_ref()
+                    .is_none_or(|draft| draft.destinations().is_empty()) =>
+            {
+                "Esc target   Add a connection from Projects after leaving the editor"
             }
             ProjectEditPage::Discovery { .. } | ProjectEditPage::Destination { .. } => {
-                "↑/↓ choose existing candidate   Enter use selected   Esc cancel"
+                "Esc cancel   F4 search   ↑/↓ choose   Enter use selected"
             }
             ProjectEditPage::Text(_) => {
-                "Type one value   Backspace erase   Delete clear   Enter apply to form   Esc cancel field (never saves YAML)"
+                "Esc cancel field   Type value   Backspace erase   Delete clear   Enter apply"
             }
             ProjectEditPage::Preview(_) => {
-                "↑/↓ PgUp/PgDn scroll   c confirm exact YAML save   Esc reject preview"
+                "Esc reject preview   ↑/↓ PgUp/PgDn scroll   c confirm exact YAML save"
             }
             ProjectEditPage::Delete(_) => {
-                "c confirm removal from draft only   Esc cancel (remote files/services are untouched)"
+                "Esc cancel   c remove from draft only (remote resources untouched)"
             }
             ProjectEditPage::Discard => "c discard unsaved draft and leave   Esc keep editing",
-            _ => "↑/↓ field   Enter edit / apply to draft   Esc discard this form",
+            _ => "Esc discard form   F4 search   ↑/↓ field   Enter edit / apply to draft",
         }
     }
 
@@ -118,7 +176,7 @@ impl ProjectEditScreen {
     fn content(&self) -> (&'static str, String, Option<usize>) {
         match &self.page {
             ProjectEditPage::Home => ("Edit project configuration", self.home(), None),
-            ProjectEditPage::Loading { label, started, cancelling } => ("Working", format!("{label}\nElapsed: {}s\n{}", started.elapsed().as_secs(), if *cancelling { "Cancellation requested; waiting for a safe completion." } else { "The interface remains responsive." }), None),
+            ProjectEditPage::Loading { label, started, cancelling } => ("Working", format!("{label}\nElapsed: {}s\n{}", started.elapsed().as_secs(), if *cancelling { "CANCELLING: waiting for the worker result before leaving." } else { "RUNNING: Esc requests cancellation. The interface remains responsive." }), None),
             ProjectEditPage::Text(edit) => ("Edit one value", format!("{}\n\n{}\n\nNo IDs or secrets should be entered. Changes remain in memory until YAML preview is confirmed.", edit.field.label(), safe_text(&edit.value)), None),
             ProjectEditPage::Discard => ("Discard unsaved draft?", "No file has been saved. Press c to discard all in-memory edits; Esc keeps editing.".into(), None),
             ProjectEditPage::Delete(kind) => ("Confirm draft removal", delete_text(kind), None),
@@ -128,7 +186,7 @@ impl ProjectEditScreen {
             ProjectEditPage::Discovery { report, cursor } => {
                 let mut text = "Local discovery only; selecting a candidate opens an editable argv form.\n\n".to_owned();
                 for (index, candidate) in report.components.iter().enumerate() { let _ = writeln!(text, "{} {} · {:?} · {}", mark(index == *cursor), candidate.name, candidate.confidence, safe_text(&candidate.source.display().to_string())); }
-                if report.components.is_empty() { text.push_str("No supported candidates were found. Esc returns to manual addition.\n"); }
+                if report.components.is_empty() { text.push_str("No supported candidates were found.\nEsc returns to Components; press a there to add manually or f to retry discovery.\n"); }
                 for notice in &report.notices { let _ = writeln!(text, "NOTICE: {}", safe_text(notice)); }
                 ("Choose discovered Component", text, Some(cursor + 2))
             }
@@ -171,6 +229,13 @@ impl ProjectEditScreen {
                 );
             }
         }
+        if self
+            .draft
+            .as_ref()
+            .is_none_or(|draft| draft.setup.components.is_empty())
+        {
+            text.push_str("No Components in the draft.\nPress f to discover candidates, a to add one, or Esc to return.\n");
+        }
         text.push_str("\nThe last Component cannot be deleted. Removing one also removes its Environment assignments and ordering links in the draft.");
         ("Components", text, Some(cursor + 2))
     }
@@ -188,6 +253,13 @@ impl ProjectEditScreen {
                     environment.components.len()
                 );
             }
+        }
+        if self
+            .draft
+            .as_ref()
+            .is_none_or(|draft| draft.setup.environments.is_empty())
+        {
+            text.push_str("No Environments in the draft.\nPress a to add one or Esc to return.\n");
         }
         text.push_str("\nThe last Environment cannot be deleted. Config removal never removes remote files or stops services.");
         ("Environments", text, Some(cursor + 2))
@@ -254,7 +326,11 @@ impl ProjectEditScreen {
                     .collect::<Vec<_>>();
                 (
                     "Choose saved connection (no manual ID entry)",
-                    fields(&rows, *cursor),
+                    if rows.is_empty() {
+                        "No saved connections were available when this editor loaded.\nEsc returns to the target form. Save or discard the editor, add a connection from Projects, then reopen this editor.".into()
+                    } else {
+                        fields(&rows, *cursor)
+                    },
                     Some(*cursor),
                 )
             }
@@ -277,7 +353,7 @@ impl ProjectEditScreen {
                 (
                     "Choose ordering dependencies",
                     if rows.is_empty() {
-                        "No other Component is selected in this Environment. Enter applies no dependencies.".into()
+                        "No other Component is selected in this Environment.\nEnter applies no dependencies; Esc cancels.".into()
                     } else {
                         fields(&rows, *cursor)
                     },
@@ -502,7 +578,11 @@ fn command_form(
     cursor: usize,
 ) -> (&'static str, String, Option<usize>) {
     let Some(command) = form.commands.get(index) else {
-        return ("Build argv", "Command unavailable".into(), None);
+        return (
+            "Build argv",
+            "Command unavailable. Press Esc to return to build commands.".into(),
+            None,
+        );
     };
     let mut rows = vec![format!("Executable: {}", safe_text(&command.program))];
     rows.extend(

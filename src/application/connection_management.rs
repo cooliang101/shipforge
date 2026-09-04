@@ -1,6 +1,7 @@
 //! Explicit, previewed local registration edits. No remote deployment mutation.
 
 mod files;
+mod target_setup;
 
 use std::{
     path::{Path, PathBuf},

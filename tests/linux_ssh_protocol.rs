@@ -38,6 +38,8 @@ use tokio_util::sync::CancellationToken;
 mod deployment_service;
 #[path = "support/preflight_protocol.rs"]
 mod preflight_protocol;
+#[path = "support/remote_directory_protocol.rs"]
+mod remote_directory_protocol;
 
 const SENTINEL: &str = "literal;$(not-executed) ' value";
 

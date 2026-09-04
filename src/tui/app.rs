@@ -17,13 +17,23 @@ mod connections;
 mod management;
 mod navigation;
 mod project_edit;
+mod reinitialize;
+mod remote_target;
+mod search;
+mod setup_async;
+mod setup_diagnostics;
+#[cfg(test)]
+mod setup_flow_tests;
+mod setup_manual;
+mod setup_save;
 use attention::{AttentionRequest, AttentionState, LocalAttentionGateway, TuiAttentionGateway};
+use remote_target::RemoteSetupSelectionState;
 
 use crate::{
     application::{
         DeploymentPlan, DeploymentReport, DeploymentSelection, DeploymentService,
         DeploymentSession, DestinationSetupRequest, DestinationSetupService, EndpointProbeRequest,
-        LocalIdentityCandidate, RemoteSetupCandidates, SetupCredential, SetupRootState,
+        LocalIdentityCandidate, RemoteSetupCandidates, SetupCredential,
     },
     config::{
         CredentialRegistry, DestinationRegistry, DestinationSettings, DestinationSummary,
@@ -75,20 +85,26 @@ pub(super) enum Screen {
         logs: VecDeque<DriverLog>,
     },
     SetupComponents(ComponentSetupState),
+    ManualComponent(setup_manual::ManualComponentScreen),
+    Reinitialize(reinitialize::ReinitializeScreen),
     SetupDestinations(DestinationSetupState),
     NewSshDestination(NewSshDestinationState),
     HostKeyPending {
+        request_id: uuid::Uuid,
         draft: NewSshDestinationState,
         cancellation: tokio_util::sync::CancellationToken,
+        cancellation_requested: bool,
     },
     HostKeyConfirm {
         draft: NewSshDestinationState,
         fingerprint: HostKeyFingerprint,
     },
     SshAuthenticationPending {
+        request_id: uuid::Uuid,
         draft: NewSshDestinationState,
         fingerprint: HostKeyFingerprint,
         cancellation: tokio_util::sync::CancellationToken,
+        cancellation_requested: bool,
     },
     RemoteSetupSelection(RemoteSetupSelectionState),
     KeyBrowser {
@@ -221,6 +237,7 @@ impl TuiDeploymentGateway for LocalDeploymentGateway {
 
 #[derive(Clone, Debug)]
 pub(super) struct NewSshDestinationState {
+    pub identity_request: Option<uuid::Uuid>,
     pub destinations: DestinationSetupState,
     pub connections: Vec<SshCandidate>,
     pub connection_cursor: usize,
@@ -257,13 +274,18 @@ enum BackgroundEvent {
     Management(uuid::Uuid, Result<management::ManagementPage, String>),
     Connections(uuid::Uuid, Result<connections::ConnectionsPage, String>),
     ProjectEdit(uuid::Uuid, Result<project_edit::ProjectEditPage, String>),
+    Reinitialize(uuid::Uuid, Result<reinitialize::ReinitializeResult, String>),
+    RemoteTarget(
+        uuid::Uuid,
+        Result<remote_target::RemoteTargetResult, String>,
+    ),
     LocalAttention(
         AttentionRequest,
         Result<crate::application::LocalAttentionSummary, String>,
     ),
-    AgentIdentities(Result<Vec<LocalIdentityCandidate>, String>),
-    HostKey(Result<String, String>),
-    Authentication(Result<RemoteSetupCandidates, String>),
+    AgentIdentities(uuid::Uuid, Result<Vec<LocalIdentityCandidate>, String>),
+    HostKey(uuid::Uuid, Result<String, String>),
+    Authentication(uuid::Uuid, Result<RemoteSetupCandidates, String>),
     DeploymentPlan(uuid::Uuid, Result<DeploymentPlan, String>),
     DeploymentProgress(DriverLog),
     DeploymentFinished(Result<DeploymentReport, String>),
@@ -289,18 +311,8 @@ pub(super) struct DestinationSetupState {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ComponentTargetSettings {
+    pub root: Option<String>,
     pub systemd: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct RemoteSetupSelectionState {
-    pub destinations: DestinationSetupState,
-    pub component: ComponentName,
-    pub root: String,
-    pub root_state: SetupRootState,
-    pub systemd_units: Vec<String>,
-    pub cursor: usize,
-    pub notices: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -315,18 +327,30 @@ pub(super) struct KeyFileBrowser {
     pub directory: PathBuf,
     pub entries: Vec<PathBuf>,
     pub selected: usize,
+    pub directories: BTreeSet<PathBuf>,
 }
 
 impl KeyFileBrowser {
     fn open(directory: &Path) -> Result<Self, std::io::Error> {
         let directory = std::fs::canonicalize(directory)?;
-        let mut entries = std::fs::read_dir(&directory)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        let mut directories = BTreeSet::new();
+        for (index, entry) in std::fs::read_dir(&directory)?.take(4097).enumerate() {
+            if index == 4096 {
+                return Err(std::io::Error::other(
+                    "Directory has too many entries to browse safely",
+                ));
+            }
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                directories.insert(path.clone());
+            }
+            entries.push(path);
+        }
         entries.sort_by_cached_key(|path| {
             (
-                !path.is_dir(),
+                !directories.contains(path),
                 path.file_name()
                     .map(|name| name.to_string_lossy().to_lowercase())
                     .unwrap_or_default(),
@@ -336,6 +360,7 @@ impl KeyFileBrowser {
             directory,
             entries,
             selected: 0,
+            directories,
         })
     }
 
@@ -348,17 +373,25 @@ impl DirectoryBrowser {
     fn open(directory: &Path) -> Result<Self, ProjectRegistryError> {
         let directory = std::fs::canonicalize(directory)
             .map_err(|source| ProjectRegistryError::browser(directory, source))?;
-        let mut children = std::fs::read_dir(&directory)
-            .map_err(|source| ProjectRegistryError::browser(&directory, source))?
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                entry
-                    .file_type()
-                    .ok()
-                    .filter(std::fs::FileType::is_dir)
-                    .map(|_| entry.path())
-            })
-            .collect::<Vec<_>>();
+        let mut children = Vec::new();
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|source| ProjectRegistryError::browser(&directory, source))?;
+        for (index, entry) in entries.take(4097).enumerate() {
+            if index == 4096 {
+                return Err(ProjectRegistryError::browser(
+                    &directory,
+                    std::io::Error::other("Directory has too many entries to browse safely"),
+                ));
+            }
+            let entry =
+                entry.map_err(|source| ProjectRegistryError::browser(&directory, source))?;
+            let kind = entry
+                .file_type()
+                .map_err(|source| ProjectRegistryError::browser(&directory, source))?;
+            if kind.is_dir() {
+                children.push(entry.path());
+            }
+        }
         children.sort_by_cached_key(|path| {
             path.file_name()
                 .map(|name| name.to_string_lossy().to_lowercase())
@@ -380,6 +413,7 @@ impl DirectoryBrowser {
 pub(super) struct App {
     pub screen: Screen,
     pub recent: Vec<ProjectStatus>,
+    pub recent_unavailable: bool,
     pub selected_recent: usize,
     pub message: Option<String>,
     pub deployment_session: Arc<DeploymentSession>,
@@ -392,6 +426,7 @@ pub(super) struct App {
     background_sender: SyncSender<BackgroundEvent>,
     background_receiver: Receiver<BackgroundEvent>,
     setup_service: DestinationSetupService,
+    setup_task: Option<setup_async::SetupTask>,
     deployment_gateway: Arc<dyn TuiDeploymentGateway>,
     attention_gateway: Arc<dyn TuiAttentionGateway>,
     attention: AttentionState,
@@ -400,7 +435,12 @@ pub(super) struct App {
     connections_task: Option<connections::ConnectionsTask>,
     project_edit_gateway: Arc<dyn project_edit::ProjectEditGateway>,
     project_edit_task: Option<project_edit::ProjectEditTask>,
+    reinitialize_task: Option<reinitialize::ReinitializeTask>,
+    remote_target_task: Option<remote_target::RemoteTargetTask>,
     navigation: navigation::ProjectNavigation,
+    pub picker: Option<crate::tui::picker::Picker>,
+    pub help_open: bool,
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -452,7 +492,10 @@ impl App {
     ) -> Result<Self, ProjectRegistryError> {
         let initial_directory = std::fs::canonicalize(initial_directory)
             .map_err(|source| ProjectRegistryError::browser(initial_directory, source))?;
-        let recent = ProjectRegistry::load(&registry_path)?.statuses();
+        let (recent, recent_unavailable) = match ProjectRegistry::load(&registry_path) {
+            Ok(registry) => (registry.statuses(), false),
+            Err(_) => (Vec::new(), true),
+        };
         let credential_registry_path = destination_registry_path.with_file_name("credentials.yaml");
         let (background_sender, background_receiver) = mpsc::sync_channel(256);
         let deployment_session = Arc::new(DeploymentSession::default());
@@ -469,8 +512,9 @@ impl App {
         let mut app = Self {
             screen: Screen::Projects,
             recent,
+            recent_unavailable,
             selected_recent: 0,
-            message: None,
+            message: recent_unavailable.then(|| "Recent projects could not be loaded. The registry was not changed; f retries, or o opens directory browsing.".into()),
             deployment_session,
             registry_path,
             destination_registry_path,
@@ -481,6 +525,7 @@ impl App {
             background_sender,
             background_receiver,
             setup_service,
+            setup_task: None,
             deployment_gateway,
             attention_gateway,
             attention: AttentionState::default(),
@@ -489,7 +534,12 @@ impl App {
             connections_task: None,
             project_edit_gateway,
             project_edit_task: None,
+            reinitialize_task: None,
+            remote_target_task: None,
             navigation: navigation::ProjectNavigation::default(),
+            picker: None,
+            help_open: false,
+            help_scroll: 0,
         };
         app.refresh_attention(None);
         Ok(app)
@@ -504,78 +554,17 @@ impl App {
                 BackgroundEvent::Management(id, result) => self.finish_management(id, result),
                 BackgroundEvent::Connections(id, result) => self.finish_connections(id, result),
                 BackgroundEvent::ProjectEdit(id, result) => self.finish_project_edit(id, result),
+                BackgroundEvent::Reinitialize(id, result) => self.finish_reinitialize(id, result),
+                BackgroundEvent::RemoteTarget(id, result) => self.finish_remote_target(id, result),
                 BackgroundEvent::LocalAttention(request, result) => {
                     self.finish_attention(&request, result);
                 }
-                BackgroundEvent::AgentIdentities(result) => match &mut self.screen {
-                    Screen::NewSshDestination(draft) | Screen::KeyBrowser { draft, .. } => {
-                        apply_agent_identities(draft, result);
-                    }
-                    _ => {}
-                },
-                BackgroundEvent::HostKey(result) => {
-                    let Screen::HostKeyPending { draft, .. } = self.screen.clone() else {
-                        continue;
-                    };
-                    match result {
-                        Ok(fingerprint) => match HostKeyFingerprint::parse(fingerprint) {
-                            Ok(fingerprint) => {
-                                self.screen = Screen::HostKeyConfirm { draft, fingerprint };
-                            }
-                            Err(error) => {
-                                self.screen = Screen::NewSshDestination(draft);
-                                self.message = Some(error.to_string());
-                            }
-                        },
-                        Err(error) => {
-                            self.screen = Screen::NewSshDestination(draft);
-                            self.message = Some(error);
-                        }
-                    }
+                BackgroundEvent::AgentIdentities(id, result) => {
+                    self.finish_setup_identities(id, result);
                 }
-                BackgroundEvent::Authentication(result) => {
-                    let Screen::SshAuthenticationPending {
-                        draft, fingerprint, ..
-                    } = self.screen.clone()
-                    else {
-                        continue;
-                    };
-                    match result {
-                        Ok(candidates) => match self.commit_ssh_destination(&draft, &fingerprint) {
-                            Ok(setup) => {
-                                let Some(component) = selected_components(&setup)
-                                    .get(setup.component_cursor)
-                                    .cloned()
-                                else {
-                                    self.screen = Screen::SetupDestinations(setup);
-                                    continue;
-                                };
-                                let root = default_remote_root(
-                                    &suggest_project_name(&setup.components.root),
-                                    "production",
-                                    &component,
-                                );
-                                self.screen =
-                                    Screen::RemoteSetupSelection(RemoteSetupSelectionState {
-                                        destinations: setup,
-                                        component,
-                                        root,
-                                        root_state: candidates.root,
-                                        systemd_units: candidates.services,
-                                        cursor: 0,
-                                        notices: candidates.notices,
-                                    });
-                            }
-                            Err(error) => {
-                                self.screen = Screen::HostKeyConfirm { draft, fingerprint };
-                                self.message = Some(error);
-                            }
-                        },
-                        Err(error) => {
-                            self.screen = Screen::HostKeyConfirm { draft, fingerprint };
-                            self.message = Some(error);
-                        }
-                    }
+                BackgroundEvent::HostKey(id, result) => self.finish_setup_host_key(id, result),
+                BackgroundEvent::Authentication(id, result) => {
+                    self.finish_setup_authentication(id, result);
                 }
                 BackgroundEvent::DeploymentPlan(completed_id, result) => {
                     self.finish_deployment_plan(completed_id, result);
@@ -600,12 +589,17 @@ impl App {
         let Screen::DeploymentPlanning {
             request_id,
             selection,
-            ..
+            cancellation,
         } = self.screen.clone()
         else {
             return;
         };
         if completed_id != request_id {
+            return;
+        }
+        if cancellation.is_cancelled() {
+            self.screen = Screen::DeploySelection(selection);
+            self.message = Some("Deployment check cancelled. The completed plan was discarded; review the selection before checking again.".into());
             return;
         }
         match result {
@@ -618,9 +612,15 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.handle_overlay_key(key) {
+            return false;
+        }
         // In raw mode Ctrl+C is an input event, not a process signal. Never
         // let modified shortcuts fall through to plain confirmation keys.
         if self.guard_key(key) {
+            return false;
+        }
+        if self.handle_search_key(key) {
             return false;
         }
         self.message = None;
@@ -628,6 +628,7 @@ impl App {
             Screen::Management(screen) => self.handle_management(key.code, screen),
             Screen::Connections(screen) => self.handle_connections(key.code, screen),
             Screen::ProjectEdit(screen) => self.handle_project_edit(key.code, screen),
+            Screen::Reinitialize(screen) => self.handle_reinitialize(key.code, screen),
             Screen::Projects => {
                 if key.code == KeyCode::Char('q') {
                     return true;
@@ -636,34 +637,23 @@ impl App {
             }
             Screen::Browser(browser) => self.handle_browser(key.code, &browser),
             Screen::SetupComponents(setup) => self.handle_setup_components(key.code, &setup),
+            Screen::ManualComponent(mut screen) => {
+                self.screen = screen
+                    .handle_key(key)
+                    .map_or_else(|| Screen::ManualComponent(screen), Screen::SetupComponents);
+            }
             Screen::SetupDestinations(setup) => self.handle_setup_destinations(key.code, &setup),
             Screen::NewSshDestination(draft) => {
                 self.handle_new_ssh_destination(key.code, &draft);
             }
-            Screen::HostKeyPending {
-                draft,
-                cancellation,
-            } => {
-                if key.code == KeyCode::Esc {
-                    cancellation.cancel();
-                    self.screen = Screen::NewSshDestination(draft);
-                }
+            Screen::HostKeyPending { .. } | Screen::SshAuthenticationPending { .. } => {
+                self.cancel_setup_on_escape(key.code);
             }
             Screen::HostKeyConfirm { draft, fingerprint } => {
                 self.handle_host_key_confirm(key.code, &draft, &fingerprint);
             }
-            Screen::SshAuthenticationPending {
-                draft,
-                fingerprint,
-                cancellation,
-            } => {
-                if key.code == KeyCode::Esc {
-                    cancellation.cancel();
-                    self.screen = Screen::HostKeyConfirm { draft, fingerprint };
-                }
-            }
             Screen::RemoteSetupSelection(selection) => {
-                self.handle_remote_setup_selection(key.code, &selection);
+                self.handle_remote_setup_selection(key, selection);
             }
             Screen::KeyBrowser { draft, browser } => {
                 self.handle_key_browser(key.code, &draft, &browser);
@@ -687,14 +677,9 @@ impl App {
             Screen::DeploySelection(selection) => {
                 self.handle_deploy_selection(key.code, &selection);
             }
-            Screen::DeploymentPlanning {
-                selection,
-                cancellation,
-                ..
-            } => {
+            Screen::DeploymentPlanning { cancellation, .. } => {
                 if key.code == KeyCode::Esc {
                     cancellation.cancel();
-                    self.screen = Screen::DeploySelection(selection);
                 }
             }
             Screen::DeploymentReview { plan, .. } => {
@@ -722,6 +707,35 @@ impl App {
         false
     }
 
+    fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::F(1) && key.modifiers.is_empty() {
+            self.help_open = !self.help_open;
+            self.help_scroll = 0;
+            return true;
+        }
+        if self.help_open {
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                self.request_deployment_cancellation();
+            } else if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Esc => self.help_open = false,
+                    KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                    KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                    KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
+                    KeyCode::Home => self.help_scroll = 0,
+                    _ => {}
+                }
+            }
+            return true;
+        }
+        if self.picker.is_some() {
+            self.handle_search_key(key);
+            return true;
+        }
+        false
+    }
+
     fn guard_key(&mut self, key: KeyEvent) -> bool {
         if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -736,6 +750,9 @@ impl App {
         if self.management_task.is_some()
             || self.connections_task.is_some()
             || self.project_edit_task.is_some()
+            || self.reinitialize_task.is_some()
+            || self.remote_target_task.is_some()
+            || self.setup_task.is_some()
         {
             if key.code == KeyCode::Esc {
                 self.request_deployment_cancellation();
@@ -753,6 +770,9 @@ impl App {
             Screen::Management(screen) => screen.requires_plain_confirmation(),
             Screen::Connections(screen) => screen.requires_plain_confirmation(),
             Screen::ProjectEdit(screen) => screen.requires_plain_confirmation(),
+            Screen::ManualComponent(screen) => screen.requires_plain_confirmation(),
+            Screen::Reinitialize(screen) => screen.requires_plain_confirmation(),
+            Screen::RemoteSetupSelection(screen) => screen.requires_plain_confirmation(),
             _ => false,
         }
     }
@@ -761,6 +781,12 @@ impl App {
         self.cancel_management();
         self.cancel_connections();
         self.cancel_project_edit();
+        self.cancel_reinitialize();
+        self.cancel_remote_target();
+        self.cancel_setup();
+        if let Screen::DeploymentPlanning { cancellation, .. } = &self.screen {
+            cancellation.cancel();
+        }
         if let Screen::DeploymentRunning {
             cancellation,
             cancellation_requested,
@@ -786,6 +812,9 @@ impl App {
             || self.management_task.is_some()
             || self.connections_task.is_some()
             || self.project_edit_task.is_some()
+            || self.reinitialize_task.is_some()
+            || self.remote_target_task.is_some()
+            || self.setup_task.is_some()
         {
             self.poll_background();
             std::thread::sleep(Duration::from_millis(10));
@@ -1020,6 +1049,14 @@ impl App {
 
     fn handle_setup_components(&mut self, key: KeyCode, setup: &ComponentSetupState) {
         match key {
+            KeyCode::Char('a') => {
+                self.screen = Screen::ManualComponent(setup_manual::ManualComponentScreen::new(
+                    setup.clone(),
+                ));
+            }
+            KeyCode::Char('r') if setup.report.components.is_empty() => {
+                self.select_root(&setup.root);
+            }
             KeyCode::Up => {
                 if let Screen::SetupComponents(current) = &mut self.screen {
                     current.cursor = current.cursor.saturating_sub(1);
@@ -1055,7 +1092,7 @@ impl App {
                             destination_cursor: 0,
                         });
                     }
-                    Err(error) => self.message = Some(error.to_string()),
+                    Err(_) => self.message = Some("Saved connections could not be loaded. Check Connections and local file permissions, then retry.".into()),
                 }
             }
             KeyCode::Esc => self.show_projects(),
@@ -1104,6 +1141,10 @@ impl App {
                     current
                         .assignments
                         .insert(component.clone(), destination.key.clone());
+                    // A different server must not inherit this Component's previous service/root.
+                    if setup.assignments.get(component) != Some(&destination.key) {
+                        current.target_settings.remove(component);
+                    }
                 } else if setup.destinations.is_empty() {
                     self.message = Some("Create an SSH Destination before continuing".into());
                 }
@@ -1117,7 +1158,8 @@ impl App {
                     return;
                 }
                 match prepare_setup(setup, &components).and_then(|project| {
-                    prepare_initialize(project).map_err(|error| error.to_string())
+                    prepare_initialize(project)
+                        .map_err(|error| setup_diagnostics::configuration_error(&error))
                 }) {
                     Ok(prepared) => {
                         self.screen = Screen::SetupReview {
@@ -1130,6 +1172,7 @@ impl App {
                 }
             }
             KeyCode::Char('a') => self.open_new_ssh_destination(setup),
+            KeyCode::Char('e') => self.open_initial_remote_target(setup.clone(), None),
             KeyCode::Esc => self.screen = Screen::SetupComponents(setup.components.clone()),
             _ => {}
         }
@@ -1144,17 +1187,14 @@ impl App {
         let local = match local {
             Ok(Some(local)) => local,
             Ok(None) => crate::config::LocalSshDiscovery::default(),
-            Err(error) => {
-                self.message = Some(error.to_string());
+            Err(_) => {
+                self.message = Some("Local SSH candidates could not be read; availability is unknown. Check SSH config permissions and encoding, then press a to retry. No connection was changed.".into());
                 return;
             }
         };
-        let registry = match CredentialRegistry::load(&self.credential_registry_path) {
-            Ok(registry) => registry,
-            Err(error) => {
-                self.message = Some(error.to_string());
-                return;
-            }
+        let Ok(registry) = CredentialRegistry::load(&self.credential_registry_path) else {
+            self.message = Some("Saved SSH identities could not be loaded; availability is unknown. Check the identity registry format and permissions, then press a to retry. No connection was changed.".into());
+            return;
         };
         let mut credentials = registry
             .summaries()
@@ -1174,6 +1214,7 @@ impl App {
         }));
         deduplicate_credentials(&mut credentials);
         let mut draft = NewSshDestinationState {
+            identity_request: None,
             destinations: destinations.clone(),
             connections: local.connections,
             connection_cursor: 0,
@@ -1191,21 +1232,7 @@ impl App {
     }
 
     fn start_agent_probe(&mut self) {
-        let Some(runtime) = &self.runtime else {
-            if let Screen::NewSshDestination(draft) = &mut self.screen {
-                draft.agent_status = "SSH Agent: unavailable in this runtime".into();
-            }
-            return;
-        };
-        let sender = self.background_sender.clone();
-        let setup_service = self.setup_service.clone();
-        runtime.spawn(async move {
-            let result = setup_service
-                .discover_local_identities(&tokio_util::sync::CancellationToken::new())
-                .await
-                .map_err(|error| error.to_string());
-            let _ = sender.send(BackgroundEvent::AgentIdentities(result));
-        });
+        self.launch_setup_identities();
     }
 
     fn handle_new_ssh_destination(&mut self, key: KeyCode, draft: &NewSshDestinationState) {
@@ -1286,7 +1313,7 @@ impl App {
                     browser,
                 };
             }
-            Err(error) => self.message = Some(format!("Cannot browse SSH keys: {error}")),
+            Err(_) => self.message = Some("SSH key directory could not be opened. Check its path and permissions, then use F3 to retry; the selected identity was not changed.".into()),
         }
     }
 
@@ -1320,15 +1347,12 @@ impl App {
             }
             KeyCode::Char('s') => {
                 let Some(path) = browser.selected_entry().filter(|path| path.is_file()) else {
-                    self.message = Some("Select a private-key file, not a directory".into());
+                    self.message = Some("Selected entry is not an available regular file. Choose an existing private-key file; the selected identity was not changed.".into());
                     return;
                 };
-                let path = match std::fs::canonicalize(path) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.message = Some(format!("Cannot select SSH key: {error}"));
-                        return;
-                    }
+                let Ok(path) = std::fs::canonicalize(path) else {
+                    self.message = Some("The selected key file could not be resolved. Check that it still exists and is readable, then choose it again; the selected identity was not changed.".into());
+                    return;
                 };
                 let mut draft = draft.clone();
                 let label = path.file_name().map_or_else(
@@ -1356,7 +1380,7 @@ impl App {
                     browser,
                 };
             }
-            Err(error) => self.message = Some(format!("Cannot browse SSH keys: {error}")),
+            Err(_) => self.message = Some("SSH key directory could not be opened. Check its path and permissions, then choose a directory again; the previous list and identity were retained.".into()),
         }
     }
 
@@ -1385,31 +1409,13 @@ impl App {
             );
             return;
         }
-        let Some(runtime) = &self.runtime else {
-            self.message = Some("SSH probe runtime is unavailable".into());
-            return;
-        };
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let task_cancellation = cancellation.clone();
-        let sender = self.background_sender.clone();
-        let setup_service = self.setup_service.clone();
         let request = EndpointProbeRequest {
             driver: DriverKind::linux_ssh(),
             destination: DriverDestinationInput {
                 value: serde_json::json!({ "host": draft.host, "port": port }),
             },
         };
-        runtime.spawn(async move {
-            let result = setup_service
-                .capture_endpoint_identity(&request, Duration::from_secs(10), &task_cancellation)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = sender.send(BackgroundEvent::HostKey(result));
-        });
-        self.screen = Screen::HostKeyPending {
-            draft: draft.clone(),
-            cancellation,
-        };
+        self.launch_setup_host_key(draft, request);
     }
 
     fn handle_host_key_confirm(
@@ -1432,16 +1438,9 @@ impl App {
         draft: &NewSshDestinationState,
         fingerprint: &HostKeyFingerprint,
     ) {
-        let Some(runtime) = &self.runtime else {
-            self.message = Some("SSH authentication runtime is unavailable".into());
+        let Ok(credential) = self.resolve_draft_credential(draft) else {
+            self.message = Some("The selected SSH identity could not be loaded. Return to the form and choose an available identity.".into());
             return;
-        };
-        let credential = match self.resolve_draft_credential(draft) {
-            Ok(credential) => credential,
-            Err(error) => {
-                self.message = Some(error);
-                return;
-            }
         };
         let destination = DriverDestinationInput {
             value: serde_json::json!({
@@ -1451,10 +1450,6 @@ impl App {
                 "hostKey": fingerprint.as_str(),
             }),
         };
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let task_cancellation = cancellation.clone();
-        let sender = self.background_sender.clone();
-        let setup_service = self.setup_service.clone();
         let component = selected_components(&draft.destinations)
             .get(draft.destinations.component_cursor)
             .cloned();
@@ -1469,59 +1464,7 @@ impl App {
             credential: SetupCredential::new(credential),
             remote_root: default_remote_root(&project, "production", &component),
         };
-        runtime.spawn(async move {
-            let result = setup_service
-                .authenticate_and_probe(
-                    &request,
-                    Duration::from_secs(15),
-                    Duration::from_secs(10),
-                    &task_cancellation,
-                )
-                .await
-                .map_err(|error| error.to_string());
-            let _ = sender.send(BackgroundEvent::Authentication(result));
-        });
-        self.screen = Screen::SshAuthenticationPending {
-            draft: draft.clone(),
-            fingerprint: fingerprint.clone(),
-            cancellation,
-        };
-    }
-
-    fn handle_remote_setup_selection(
-        &mut self,
-        key: KeyCode,
-        selection: &RemoteSetupSelectionState,
-    ) {
-        match key {
-            KeyCode::Up => {
-                if let Screen::RemoteSetupSelection(current) = &mut self.screen {
-                    current.cursor = current.cursor.saturating_sub(1);
-                }
-            }
-            KeyCode::Down => {
-                if let Screen::RemoteSetupSelection(current) = &mut self.screen {
-                    current.cursor = (current.cursor + 1).min(current.systemd_units.len());
-                }
-            }
-            KeyCode::Enter => {
-                let mut destinations = selection.destinations.clone();
-                let systemd = selection
-                    .cursor
-                    .checked_sub(1)
-                    .and_then(|index| selection.systemd_units.get(index))
-                    .cloned();
-                destinations.target_settings.insert(
-                    selection.component.clone(),
-                    ComponentTargetSettings { systemd },
-                );
-                self.screen = Screen::SetupDestinations(destinations);
-            }
-            KeyCode::Esc => {
-                self.screen = Screen::SetupDestinations(selection.destinations.clone());
-            }
-            _ => {}
-        }
+        self.launch_setup_authentication(draft, fingerprint, request);
     }
 
     fn resolve_draft_credential(
@@ -1534,7 +1477,7 @@ impl App {
         {
             CredentialChoice::Saved { handle, .. } => {
                 CredentialRegistry::load(&self.credential_registry_path)
-                    .map_err(|error| error.to_string())?
+                    .map_err(|_| "SSH identities could not be loaded. Check Connections and local file permissions before retrying.".to_owned())?
                     .resolve(handle)
                     .cloned()
                     .ok_or_else(|| "The selected SSH identity no longer exists".into())
@@ -1563,7 +1506,9 @@ impl App {
             .filter(|port| *port != 0)
             .ok_or_else(|| "SSH port must be between 1 and 65535".to_owned())?;
         let original_credentials = CredentialRegistry::load(&self.credential_registry_path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| {
+                "SSH identities could not be loaded. No connection was saved.".to_owned()
+            })?;
         let mut credentials = original_credentials.clone();
         let (credential, created_credential) = match choice {
             CredentialChoice::Saved { handle, .. } => {
@@ -1577,18 +1522,28 @@ impl App {
                     .create(SshCredential::Agent {
                         fingerprint: fingerprint.clone(),
                     })
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|_| {
+                        "The Agent identity is invalid. No identity or connection was saved."
+                            .to_owned()
+                    })?,
                 true,
             ),
             CredentialChoice::IdentityFile { path, .. } => (
                 credentials
                     .create(SshCredential::IdentityFile { path: path.clone() })
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|_| {
+                        "The key-file identity is invalid. No identity or connection was saved."
+                            .to_owned()
+                    })?,
                 true,
             ),
         };
-        let mut destinations = DestinationRegistry::load(&self.destination_registry_path)
-            .map_err(|error| error.to_string())?;
+        let mut destinations =
+            DestinationRegistry::load(&self.destination_registry_path).map_err(|_| {
+                "Saved connections could not be loaded. No identity or connection was saved."
+                    .to_owned()
+            })?;
+        let original_destinations = destinations.clone();
         let key = DestinationKey::new();
         destinations
             .create(
@@ -1601,24 +1556,21 @@ impl App {
                     host_key: fingerprint.clone(),
                 },
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| {
+                "The SSH connection settings are invalid. No identity or connection was saved."
+                    .to_owned()
+            })?;
 
-        if created_credential {
-            credentials
-                .save(&self.credential_registry_path)
-                .map_err(|error| error.to_string())?;
+        setup_save::Registration {
+            credential_path: &self.credential_registry_path,
+            destination_path: &self.destination_registry_path,
+            original_credentials: &original_credentials,
+            credentials: &credentials,
+            original_destinations: &original_destinations,
+            destinations: &destinations,
+            created_credential,
         }
-        if let Err(error) = destinations.save(&self.destination_registry_path) {
-            if created_credential
-                && let Err(rollback_error) =
-                    original_credentials.save(&self.credential_registry_path)
-            {
-                return Err(format!(
-                    "Destination was not saved: {error}; credential rollback also failed: {rollback_error}"
-                ));
-            }
-            return Err(error.to_string());
-        }
+        .persist()?;
 
         let mut setup = draft.destinations.clone();
         setup.destinations = destinations.summaries();
@@ -1629,6 +1581,7 @@ impl App {
             .unwrap_or_default();
         if let Some(component) = selected_components(&setup).get(setup.component_cursor) {
             setup.assignments.insert(component.clone(), key);
+            setup.target_settings.remove(component);
         }
         Ok(setup)
     }
@@ -1664,18 +1617,15 @@ impl App {
                 let root = destinations.components.root.clone();
                 match prepared.clone().commit(&root) {
                     Ok(config) => {
-                        if let Err(error) =
-                            register_initialized_project(&self.registry_path, &root, now_unix_ms())
+                        if register_initialized_project(&self.registry_path, &root, now_unix_ms()).is_err()
                         {
-                            self.message = Some(format!(
-                                "Configuration saved, but recent-project registration failed: {error}"
-                            ));
+                            self.message = Some("Configuration saved, but recent-project registration failed. Open this directory again; check local registry permissions.".into());
                         } else {
                             self.refresh_recent();
                         }
                         self.show_overview(root, config);
                     }
-                    Err(error) => self.message = Some(error.to_string()),
+                    Err(_) => self.message = Some("Configuration save was not confirmed. Reopen this directory to check shipforge.yaml before retrying; no deployment was started.".into()),
                 }
             }
             KeyCode::Esc => self.screen = Screen::SetupDestinations(destinations.clone()),
@@ -1688,6 +1638,7 @@ impl App {
         match key {
             KeyCode::Char('c') => self.open_connections(),
             KeyCode::Char('x') => self.preview_recent_removal(),
+            KeyCode::Char('f') => self.refresh_recent(),
             KeyCode::Up => self.selected_recent = self.selected_recent.saturating_sub(1),
             KeyCode::Down => {
                 self.selected_recent = (self.selected_recent + 1).min(item_count - 1);
@@ -1697,15 +1648,11 @@ impl App {
                 if project.available {
                     self.select_root(&project.project.root);
                 } else {
-                    self.message =
-                        Some("Project directory or shipforge.yaml is unavailable".into());
+                    self.message = Some("Cached project entry cannot be opened. Press f to refresh, or reselect its directory to check current state.".into());
                 }
             }
             KeyCode::Enter | KeyCode::Char('o') => {
-                match DirectoryBrowser::open(&self.initial_directory) {
-                    Ok(browser) => self.screen = Screen::Browser(browser),
-                    Err(error) => self.message = Some(error.to_string()),
-                }
+                self.open_browser(&self.initial_directory.clone());
             }
             _ => {}
         }
@@ -1743,7 +1690,7 @@ impl App {
     fn open_browser(&mut self, directory: &Path) {
         match DirectoryBrowser::open(directory) {
             Ok(browser) => self.screen = Screen::Browser(browser),
-            Err(error) => self.message = Some(error.to_string()),
+            Err(_) => self.message = Some("Project directory could not be opened. Check its path and permissions, then choose a directory again; the previous page was retained.".into()),
         }
     }
 
@@ -1768,16 +1715,34 @@ impl App {
                         cursor: 0,
                     });
                 }
-                Err(error) => self.message = Some(error.to_string()),
+                Err(_) => {
+                    self.screen = Screen::SetupComponents(ComponentSetupState {
+                        root,
+                        report: DiscoveryReport { components: Vec::new(), notices: vec!["Component discovery failed. Check manifest format, size and permissions; r retries, or a defines a Component manually. No build code was run.".into()] },
+                        selected: BTreeSet::new(),
+                        cursor: 0,
+                    });
+                }
             },
-            Err(error) => self.message = Some(error.to_string()),
+            Err(ProjectRegistryError::Config(_)) => self.open_reinitialize(root.to_owned()),
+            Err(_) => self.message = Some("Project could not be opened or registered. Check the selected directory and local registry permissions, then retry. Configuration was not changed.".into()),
         }
     }
 
     fn refresh_recent(&mut self) {
-        match ProjectRegistry::load(&self.registry_path) {
-            Ok(registry) => self.recent = registry.statuses(),
-            Err(error) => self.message = Some(error.to_string()),
+        if let Ok(registry) = ProjectRegistry::load(&self.registry_path) {
+            self.recent_unavailable = false;
+            self.recent = registry.statuses();
+            self.selected_recent = self.selected_recent.min(self.recent.len());
+            if self.message.as_deref() == Some(setup_diagnostics::RECENT_REFRESH_FAILED) {
+                self.message = None;
+            }
+        } else {
+            self.recent_unavailable = true;
+            for status in &mut self.recent {
+                status.available = false;
+            }
+            self.message = Some(setup_diagnostics::RECENT_REFRESH_FAILED.into());
         }
     }
 }
@@ -2022,7 +1987,10 @@ fn prepare_setup(
                 component.clone(),
                 TargetSetup {
                     destination,
-                    root: None,
+                    root: setup
+                        .target_settings
+                        .get(component)
+                        .and_then(|settings| settings.root.clone()),
                     systemd: setup
                         .target_settings
                         .get(component)
@@ -2055,6 +2023,8 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod planning_cancellation;
+    use crate::application::SetupRootState;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -2359,6 +2329,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeSetupGateway {
         mode: FakeSetupMode,
+        probe_started: AtomicBool,
         cancellation_observed: Arc<AtomicBool>,
     }
 
@@ -2382,6 +2353,7 @@ mod tests {
             _timeout: Duration,
             cancellation: &tokio_util::sync::CancellationToken,
         ) -> Result<String, crate::application::DestinationSetupError> {
+            self.probe_started.store(true, Ordering::SeqCst);
             if matches!(self.mode, FakeSetupMode::WaitForCancellation) {
                 cancellation.cancelled().await;
                 self.cancellation_observed.store(true, Ordering::SeqCst);
@@ -2417,7 +2389,7 @@ mod tests {
 
     fn app_with_fake_setup(
         mode: FakeSetupMode,
-    ) -> (TempDir, App, NewSshDestinationState, Arc<AtomicBool>) {
+    ) -> (TempDir, App, NewSshDestinationState, Arc<FakeSetupGateway>) {
         let directory = tempdir().unwrap();
         std::fs::write(
             directory.path().join("package.json"),
@@ -2427,10 +2399,12 @@ mod tests {
         let identity = directory.path().join("id_ed25519");
         std::fs::write(&identity, "test fixture only").unwrap();
         let cancellation_observed = Arc::new(AtomicBool::new(false));
-        let service = DestinationSetupService::new(Arc::new(FakeSetupGateway {
+        let gateway = Arc::new(FakeSetupGateway {
             mode,
+            probe_started: AtomicBool::new(false),
             cancellation_observed: cancellation_observed.clone(),
-        }));
+        });
+        let service = DestinationSetupService::new(gateway.clone());
         let mut app = App::new_with_setup(
             directory.path().join("projects.yaml"),
             directory.path().join("destinations.yaml"),
@@ -2445,6 +2419,7 @@ mod tests {
             panic!("expected Destination setup");
         };
         let draft = NewSshDestinationState {
+            identity_request: None,
             destinations,
             connections: Vec::new(),
             connection_cursor: 0,
@@ -2459,7 +2434,7 @@ mod tests {
             credential_cursor: 0,
             agent_status: String::new(),
         };
-        (directory, app, draft, cancellation_observed)
+        (directory, app, draft, gateway)
     }
 
     async fn allow_background_task_to_run(app: &mut App) {
@@ -2605,6 +2580,7 @@ mod tests {
             setup.target_settings.insert(
                 ComponentName::parse("web").unwrap(),
                 ComponentTargetSettings {
+                    root: None,
                     systemd: Some("web.service".into()),
                 },
             );
@@ -2720,6 +2696,7 @@ mod tests {
             panic!("expected Destination setup");
         };
         let draft = NewSshDestinationState {
+            identity_request: None,
             destinations,
             connections: Vec::new(),
             connection_cursor: 0,
@@ -2735,24 +2712,36 @@ mod tests {
             agent_status: String::new(),
         };
         let fingerprint = HostKeyFingerprint::parse("SHA256:confirmed-host").unwrap();
+        let request_id = uuid::Uuid::now_v7();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        app.setup_task = Some(setup_async::SetupTask::fixture(
+            request_id,
+            setup_async::SetupKind::Authentication,
+            cancellation.clone(),
+        ));
         app.screen = Screen::SshAuthenticationPending {
+            request_id,
             draft,
             fingerprint,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation,
+            cancellation_requested: false,
         };
         app.background_sender
-            .send(BackgroundEvent::Authentication(Ok(RemoteSetupCandidates {
-                root: SetupRootState::Missing,
-                services: Vec::new(),
-                notices: Vec::new(),
-            })))
+            .send(BackgroundEvent::Authentication(
+                request_id,
+                Ok(RemoteSetupCandidates {
+                    root: SetupRootState::Missing,
+                    services: Vec::new(),
+                    notices: Vec::new(),
+                }),
+            ))
             .unwrap();
         app.poll_background();
 
         let Screen::RemoteSetupSelection(selection) = &app.screen else {
             panic!("expected remote setup selection after authentication");
         };
-        assert_eq!(selection.root_state, SetupRootState::Missing);
+        assert_eq!(selection.root_state, Some(SetupRootState::Missing));
         app.handle_key(key(KeyCode::Enter));
         let Screen::SetupDestinations(setup) = &app.screen else {
             panic!("expected Destination setup after selecting remote settings");
@@ -2775,6 +2764,7 @@ mod tests {
     fn failed_authentication_does_not_write_registries() {
         let directory = tempdir().unwrap();
         let draft = NewSshDestinationState {
+            identity_request: None,
             destinations: DestinationSetupState {
                 components: ComponentSetupState {
                     root: directory.path().to_owned(),
@@ -2805,15 +2795,25 @@ mod tests {
             directory.path(),
         )
         .unwrap();
+        let request_id = uuid::Uuid::now_v7();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        app.setup_task = Some(setup_async::SetupTask::fixture(
+            request_id,
+            setup_async::SetupKind::Authentication,
+            cancellation.clone(),
+        ));
         app.screen = Screen::SshAuthenticationPending {
+            request_id,
             draft,
             fingerprint,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation,
+            cancellation_requested: false,
         };
         app.background_sender
-            .send(BackgroundEvent::Authentication(Err(
-                "SSH server rejected the selected identity".into(),
-            )))
+            .send(BackgroundEvent::Authentication(
+                request_id,
+                Err("SSH server rejected the selected identity".into()),
+            ))
             .unwrap();
 
         app.poll_background();
@@ -2833,6 +2833,7 @@ mod tests {
         )
         .unwrap();
         let draft = NewSshDestinationState {
+            identity_request: None,
             destinations: DestinationSetupState {
                 components: ComponentSetupState {
                     root: directory.path().to_owned(),
@@ -2877,6 +2878,7 @@ mod tests {
         )
         .unwrap();
         let draft = NewSshDestinationState {
+            identity_request: None,
             destinations: DestinationSetupState {
                 components: ComponentSetupState {
                     root: directory.path().to_owned(),
@@ -2900,17 +2902,26 @@ mod tests {
             credential_cursor: 0,
             agent_status: "checking".into(),
         };
+        let request_id = uuid::Uuid::now_v7();
+        let mut draft = draft;
+        draft.identity_request = Some(request_id);
+        app.setup_task = Some(setup_async::SetupTask::fixture(
+            request_id,
+            setup_async::SetupKind::Identities,
+            tokio_util::sync::CancellationToken::new(),
+        ));
         app.screen = Screen::KeyBrowser {
             draft,
             browser: KeyFileBrowser::open(directory.path()).unwrap(),
         };
         app.background_sender
-            .send(BackgroundEvent::AgentIdentities(Ok(vec![
-                LocalIdentityCandidate {
+            .send(BackgroundEvent::AgentIdentities(
+                request_id,
+                Ok(vec![LocalIdentityCandidate {
                     reference: "SHA256:agent-key".into(),
                     label: "deploy".into(),
-                },
-            ])))
+                }]),
+            ))
             .unwrap();
 
         app.poll_background();
@@ -2937,7 +2948,10 @@ mod tests {
         let Screen::RemoteSetupSelection(selection) = &app.screen else {
             panic!("expected remote setup candidates");
         };
-        assert_eq!(selection.root_state, SetupRootState::WritableDirectory);
+        assert_eq!(
+            selection.root_state,
+            Some(SetupRootState::WritableDirectory)
+        );
         assert_eq!(selection.systemd_units, vec!["web.service"]);
     }
 
@@ -2956,7 +2970,7 @@ mod tests {
         assert!(
             app.message
                 .as_deref()
-                .is_some_and(|message| message.contains("rejected"))
+                .is_some_and(|message| message.contains("authentication"))
         );
         assert!(!directory.path().join("destinations.yaml").exists());
         assert!(!directory.path().join("credentials.yaml").exists());
@@ -2964,14 +2978,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_tui_probe_propagates_to_setup_service_and_ignores_late_result() {
-        let (_directory, mut app, draft, cancellation_observed) =
+        let (_directory, mut app, draft, gateway) =
             app_with_fake_setup(FakeSetupMode::WaitForCancellation);
         app.start_host_key_probe(&draft);
         assert!(matches!(app.screen, Screen::HostKeyPending { .. }));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !gateway.probe_started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the capture must enter the gateway before testing in-flight cancellation");
         app.handle_key(key(KeyCode::Esc));
-        allow_background_task_to_run(&mut app).await;
+        wait_for_screen(&mut app, |screen| {
+            matches!(screen, Screen::NewSshDestination(_))
+        })
+        .await;
 
-        assert!(cancellation_observed.load(Ordering::SeqCst));
+        assert!(gateway.cancellation_observed.load(Ordering::SeqCst));
         assert!(matches!(app.screen, Screen::NewSshDestination(_)));
     }
 }
