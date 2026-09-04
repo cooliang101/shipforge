@@ -43,3 +43,5 @@ Use imperative Conventional Commits, such as `feat: validate release paths`; the
 ## Security & Deployment Safety
 
 Never store secrets in `shipforge.yaml`. Validate SSH host keys, separate arguments from Shell text, redact Driver data, and preserve protected Component Releases.
+
+History schema and query rules are in `docs/architecture.md`: persist only non-secret snapshots and receipts, distinguish unknown observation from confirmed absence, and retain known remote outcomes when post-effect history writes fail.

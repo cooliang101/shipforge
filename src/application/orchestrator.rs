@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     time::Duration,
 };
@@ -88,15 +89,21 @@ pub struct DeploymentOrchestrator<'a> {
     history: &'a HistoryStore,
     redactor: Redactor,
     clock: MonotonicClock,
+    history_warnings: RefCell<Vec<String>>,
 }
 
 impl<'a> DeploymentOrchestrator<'a> {
+    pub(super) fn clock(&self) -> &MonotonicClock {
+        &self.clock
+    }
+
     #[must_use]
     pub fn new(history: &'a HistoryStore, redactor: Redactor) -> Self {
         Self {
             history,
             redactor,
             clock: MonotonicClock::default(),
+            history_warnings: RefCell::new(Vec::new()),
         }
     }
 
@@ -119,6 +126,27 @@ impl<'a> DeploymentOrchestrator<'a> {
     ) -> Result<DeploymentReport, OrchestrationError> {
         let checked = validate_components(components.clone(), activation_order)?;
         let deployment = self.start_deployment(&checked)?;
+        let setup = (|| {
+            self.history.record_deployment_metadata(
+                &deployment.id,
+                &crate::history::DeploymentMetadata {
+                    git_branch: None,
+                    git_revision: None,
+                    git_worktree: crate::history::GitWorktree::Unknown,
+                    operator: std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).ok(),
+                },
+                &self.redactor,
+            )?;
+            self.snapshot_components(
+                &deployment.id,
+                activation_order.iter().map(|name| &checked[name].planned),
+                false,
+            )?;
+            Ok::<(), OrchestrationError>(())
+        })();
+        if let Err(error) = setup {
+            return Err(self.before_effect_error(&deployment.id, error));
+        }
         self.deploy_started(
             deployment,
             components,
@@ -142,6 +170,11 @@ impl<'a> DeploymentOrchestrator<'a> {
         // the execution token, not the token retained by the read-only plan.
         for component in components.values_mut() {
             component.planned.context.cancellation = cancellation.clone();
+        }
+        for component in components.values() {
+            if let Err(error) = self.record_package(&deployment.id, component) {
+                return Err(self.before_effect_error(&deployment.id, error));
+            }
         }
 
         if cancellation.is_cancelled() {
@@ -198,19 +231,23 @@ impl<'a> DeploymentOrchestrator<'a> {
                 },
             );
         }
-        self.persist_results(&deployment, None, &BTreeMap::new())?;
-        self.history.transition_deployment(
-            &deployment.id,
-            DeploymentState::Running,
-            DeploymentState::Succeeded,
-            self.timestamp()?,
-        )?;
+        self.persist_results(&deployment, None, &BTreeMap::new());
+        self.remember_history_error(
+            self.history
+                .transition_deployment(
+                    &deployment.id,
+                    DeploymentState::Running,
+                    DeploymentState::Succeeded,
+                    self.timestamp()?,
+                )
+                .map_err(Into::into),
+        );
         deployment.succeed().map_err(OrchestrationError::Domain)?;
         Ok(DeploymentReport {
             deployment,
             failure: None,
             compensation_failures: BTreeMap::new(),
-            warnings: Vec::new(),
+            warnings: self.history_warnings.take(),
         })
     }
 
@@ -230,6 +267,7 @@ impl<'a> DeploymentOrchestrator<'a> {
         &self,
         context: &ComponentExecutionContext,
     ) -> Result<Deployment, OrchestrationError> {
+        self.history_warnings.borrow_mut().clear();
         let mut deployment = Deployment::new();
         self.history.create_deployment(
             &deployment.id,
@@ -245,6 +283,120 @@ impl<'a> DeploymentOrchestrator<'a> {
         )?;
         deployment.start().map_err(OrchestrationError::Domain)?;
         Ok(deployment)
+    }
+
+    pub(super) fn snapshot_components<'b>(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        components: impl IntoIterator<Item = &'b PlannedComponent>,
+        includes_build: bool,
+    ) -> Result<(), OrchestrationError> {
+        let snapshots = components
+            .into_iter()
+            .enumerate()
+            .map(|(index, planned)| {
+                let release = planned_release_ref(planned);
+                Ok(crate::history::DeploymentComponentSnapshot {
+                    release: release.clone(),
+                    expected_current: planned.plan.expected_current.clone(),
+                    target: Some(release),
+                    execution_order: u32::try_from(index).map_err(|_| {
+                        OrchestrationError::InvalidInput("too many selected Components".into())
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, OrchestrationError>>()?;
+        self.history
+            .record_component_snapshots(deployment, &snapshots)?;
+        for snapshot in &snapshots {
+            let steps: &[&str] = if includes_build {
+                &["build-package", "prepare", "activate", "compensate"]
+            } else {
+                &["prepare", "activate", "compensate"]
+            };
+            self.history
+                .plan_steps(deployment, &snapshot.release.component, steps)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_package(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        component: &DeploymentComponent,
+    ) -> Result<(), OrchestrationError> {
+        self.history.record_release_package(
+            deployment,
+            &planned_release_ref(&component.planned),
+            component.package.manifest(),
+            component.package.sha256(),
+            component.package.size(),
+        )?;
+        Ok(())
+    }
+
+    fn before_effect_error(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        source: OrchestrationError,
+    ) -> OrchestrationError {
+        let persistence = self
+            .timestamp()
+            .and_then(|timestamp| {
+                self.history
+                    .transition_deployment(
+                        deployment,
+                        DeploymentState::Running,
+                        DeploymentState::Failed,
+                        timestamp,
+                    )
+                    .map_err(Into::into)
+            })
+            .err()
+            .map(|error| error.to_string());
+        OrchestrationError::Execution {
+            deployment: deployment.clone(),
+            source: Box::new(source),
+            persistence,
+        }
+    }
+
+    // These writes follow a remote effect. Retain its in-memory receipt and
+    // allow compensation even when auxiliary history cannot be persisted.
+    fn remember_history_error(&self, result: Result<(), OrchestrationError>) {
+        if let Err(error) = result {
+            self.history_warnings.borrow_mut().push(self.redactor.redact(&format!(
+                "Local history incomplete: {error}. Inspect history and remote state before retrying."
+            )));
+        }
+    }
+
+    fn observation(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        component: &ComponentName,
+        stage: &str,
+        observed: &Result<Option<ReleaseRef>, DriverError>,
+        healthy: Option<bool>,
+    ) {
+        let diagnostic = observed.as_ref().err().map(ToString::to_string);
+        let observed = match observed {
+            Ok(release) => Ok(release.as_ref()),
+            Err(_) => Err(diagnostic.as_deref().unwrap_or("observation failed")),
+        };
+        self.remember_history_error(self.timestamp().and_then(|timestamp| {
+            self.history
+                .record_observation(
+                    deployment,
+                    component,
+                    stage,
+                    observed,
+                    healthy,
+                    timestamp,
+                    &self.redactor,
+                )
+                .map_err(Into::into)
+        }));
     }
 
     async fn prepare_all(
@@ -302,7 +454,25 @@ impl<'a> DeploymentOrchestrator<'a> {
                 namespace: "activate.started".into(),
                 message: format!("Activating {name} and checking health"),
             });
-            match self.activate(deployment, name, component, receipt).await? {
+            let result = match self.activate(deployment, name, component, receipt).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let message = format!(
+                        "Local activation intent could not be persisted; no activation attempted for {name}: {error}"
+                    );
+                    self.remember_history_error(Err(error));
+                    return Ok((
+                        activated,
+                        Some(DeploymentFailure::Contract {
+                            component: name.clone(),
+                            stage: OrchestrationStage::Activate,
+                            message,
+                            observed_release: None,
+                        }),
+                    ));
+                }
+            };
+            match result {
                 Ok(activation) => {
                     events.emit(crate::drivers::DriverLog {
                         namespace: "activate.finished".into(),
@@ -319,16 +489,15 @@ impl<'a> DeploymentOrchestrator<'a> {
                             observed: activation.current.clone(),
                         });
                     } else {
-                        return Ok((
-                            activated,
-                            Some(DeploymentFailure::Contract {
-                                component: name.clone(),
-                                stage: OrchestrationStage::Activate,
-                                message: "Driver activation receipt does not point to the candidate Release"
-                                    .into(),
-                                observed_release: activation.current.map(|release| release.version),
-                            }),
-                        ));
+                        let failure = self
+                            .invalid_activation_receipt(
+                                deployment,
+                                component,
+                                receipt,
+                                &mut activated,
+                            )
+                            .await;
+                        return Ok((activated, Some(failure)));
                     }
                     if !activation.healthy {
                         return Ok((
@@ -343,14 +512,61 @@ impl<'a> DeploymentOrchestrator<'a> {
                     }
                 }
                 Err(error) => {
-                    let failure =
-                        activation_failure(component, receipt, error, cancellation, &mut activated)
-                            .await;
+                    let observed =
+                        observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+                    self.observation(&deployment.id, name, "activate.failure", &observed, None);
+                    let failure = activation_failure(
+                        component,
+                        receipt,
+                        error,
+                        cancellation,
+                        &mut activated,
+                        observed,
+                    );
                     return Ok((activated, Some(failure)));
                 }
             }
+            if !self.history_warnings.borrow().is_empty() {
+                return Ok((activated, Some(DeploymentFailure::Contract {
+                    component: name.clone(),
+                    stage: OrchestrationStage::Activate,
+                    message: "Local history could not record the activation; stopped forward deployment and requested compensation".into(),
+                    observed_release: Some(receipt.release.version.clone()),
+                })));
+            }
         }
         Ok((activated, None))
+    }
+
+    async fn invalid_activation_receipt(
+        &self,
+        deployment: &Deployment,
+        component: &DeploymentComponent,
+        receipt: &PreparedRelease,
+        activated: &mut Vec<ActivatedComponent>,
+    ) -> DeploymentFailure {
+        let name = &component.planned.context.component;
+        let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+        self.observation(
+            &deployment.id,
+            name,
+            "activate.invalid_receipt",
+            &observed,
+            None,
+        );
+        if observed.as_ref().ok().and_then(Option::as_ref) == Some(&receipt.release) {
+            activated.push(ActivatedComponent {
+                name: name.clone(),
+                previous: component.planned.plan.expected_current.clone(),
+                observed: Some(receipt.release.clone()),
+            });
+        }
+        DeploymentFailure::Contract {
+            component: name.clone(),
+            stage: OrchestrationStage::Activate,
+            message: "Driver activation receipt does not point to the candidate Release".into(),
+            observed_release: observed.ok().flatten().map(|release| release.version),
+        }
     }
 
     async fn prepare(
@@ -387,6 +603,26 @@ impl<'a> DeploymentOrchestrator<'a> {
                 name,
                 "Driver returned a Release identity different from the frozen plan",
             ));
+        }
+        if let Ok(receipt) = &result {
+            let persisted = self.timestamp().and_then(|timestamp| {
+                self.history
+                    .record_release_receipt(
+                        &deployment.id,
+                        name,
+                        "prepare",
+                        &receipt.release,
+                        timestamp,
+                    )
+                    .map_err(Into::into)
+            });
+            if let Err(error) = persisted {
+                result = Err(contract_driver_error(
+                    "history.prepare",
+                    name,
+                    &format!("prepared Release receipt could not be persisted: {error}"),
+                ));
+            }
         }
         let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
         self.complete_intent(intent, &outcome)?;
@@ -429,7 +665,34 @@ impl<'a> DeploymentOrchestrator<'a> {
             )),
             Err(error) => Err(error.clone()),
         };
-        self.complete_intent(intent, &outcome)?;
+        match &result {
+            Ok(receipt) if receipt.current.as_ref() == Some(&prepared.release) => self.observation(
+                &deployment.id,
+                name,
+                "activate.receipt",
+                &Ok(receipt.current.clone()),
+                Some(receipt.healthy),
+            ),
+            Ok(_) => self.observation(
+                &deployment.id,
+                name,
+                "activate.receipt",
+                &Err(contract_driver_error(
+                    "activate",
+                    name,
+                    "Driver returned an out-of-plan receipt",
+                )),
+                None,
+            ),
+            Err(error) => self.observation(
+                &deployment.id,
+                name,
+                "activate.receipt",
+                &Err(error.clone()),
+                None,
+            ),
+        }
+        self.remember_history_error(self.complete_intent(intent, &outcome));
         Ok(result)
     }
 
@@ -496,8 +759,9 @@ impl<'a> DeploymentOrchestrator<'a> {
             &deployment,
             Some(&failure.diagnostic()),
             &compensation_failures,
-        )?;
+        );
         let terminal = if matches!(failure, DeploymentFailure::Cancelled)
+            && self.history_warnings.borrow().is_empty()
             && !deployment
                 .components
                 .values()
@@ -507,12 +771,16 @@ impl<'a> DeploymentOrchestrator<'a> {
         } else {
             DeploymentState::Failed
         };
-        self.history.transition_deployment(
-            &deployment.id,
-            DeploymentState::Running,
-            terminal,
-            self.timestamp()?,
-        )?;
+        self.remember_history_error(
+            self.history
+                .transition_deployment(
+                    &deployment.id,
+                    DeploymentState::Running,
+                    terminal,
+                    self.timestamp()?,
+                )
+                .map_err(Into::into),
+        );
         match terminal {
             DeploymentState::Cancelled => deployment.cancel(),
             DeploymentState::Failed => deployment.fail(),
@@ -523,7 +791,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             deployment,
             failure: Some(failure),
             compensation_failures,
-            warnings: Vec::new(),
+            warnings: self.history_warnings.take(),
         })
     }
 
@@ -546,9 +814,23 @@ impl<'a> DeploymentOrchestrator<'a> {
                 &deployment.id,
                 &activated.name,
                 OrchestrationStage::Compensate.intent_name(),
-                component.package.release().version.as_str(),
+                activated
+                    .previous
+                    .as_ref()
+                    .map_or("not_deployed", |release| release.version.as_str()),
                 self.timestamp()?,
-            )?;
+            );
+            let intent = match intent {
+                Ok(intent) => intent,
+                Err(error) => {
+                    let (result, error) = self
+                        .blocked_compensation(deployment, component, error)
+                        .await;
+                    results.insert(activated.name.clone(), result);
+                    failures.insert(activated.name.clone(), error);
+                    continue;
+                }
+            };
             let context = recovery_context(&component.planned.context);
             let rollback = component
                 .planned
@@ -572,28 +854,34 @@ impl<'a> DeploymentOrchestrator<'a> {
                 }
             });
             let intent_outcome = rollback.as_ref().map(|_| ()).map_err(Clone::clone);
-            self.complete_intent(intent, &intent_outcome)?;
-            let (outcome, observed) =
-                match rollback {
-                    Ok(receipt) => (
-                        ComponentOutcome::Compensated,
-                        receipt.current.map(|release| release.version),
-                    ),
-                    Err(error) => {
-                        let (error, observed) =
-                            match observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT)
-                                .await
-                            {
-                                Ok(observed) => (error, observed),
-                                Err(observation) => (unobserved_failure(error, &observation), None),
-                            };
-                        failures.insert(activated.name.clone(), error);
-                        (
-                            ComponentOutcome::CompensationFailed,
-                            observed.map(|release| release.version),
-                        )
-                    }
-                };
+            self.compensation_observation(&deployment.id, &activated.name, &rollback);
+            self.remember_history_error(self.complete_intent(intent, &intent_outcome));
+            let (outcome, observed) = match rollback {
+                Ok(receipt) => (
+                    ComponentOutcome::Compensated,
+                    receipt.current.map(|release| release.version),
+                ),
+                Err(error) => {
+                    let observation =
+                        observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+                    self.observation(
+                        &deployment.id,
+                        &activated.name,
+                        "compensate.failure",
+                        &observation,
+                        None,
+                    );
+                    let (error, observed) = match observation {
+                        Ok(observed) => (error, observed),
+                        Err(observation) => (unobserved_failure(error, &observation), None),
+                    };
+                    failures.insert(activated.name.clone(), error);
+                    (
+                        ComponentOutcome::CompensationFailed,
+                        observed.map(|release| release.version),
+                    )
+                }
+            };
             results.insert(
                 activated.name.clone(),
                 ComponentDeploymentResult {
@@ -606,12 +894,61 @@ impl<'a> DeploymentOrchestrator<'a> {
         Ok(failures)
     }
 
+    fn compensation_observation(
+        &self,
+        deployment: &crate::domain::DeploymentId,
+        name: &ComponentName,
+        rollback: &Result<ActivationReceipt, DriverError>,
+    ) {
+        match rollback {
+            Ok(receipt) => self.observation(
+                deployment,
+                name,
+                "compensate.receipt",
+                &Ok(receipt.current.clone()),
+                Some(receipt.healthy),
+            ),
+            Err(error) => self.observation(
+                deployment,
+                name,
+                "compensate.receipt",
+                &Err(error.clone()),
+                None,
+            ),
+        }
+    }
+
+    async fn blocked_compensation(
+        &self,
+        deployment: &Deployment,
+        component: &DeploymentComponent,
+        error: HistoryError,
+    ) -> (ComponentDeploymentResult, DriverError) {
+        // Journal failure forbids this mutation, not other independently journalable recovery.
+        let name = &component.planned.context.component;
+        let error = contract_driver_error(
+            "compensate",
+            name,
+            &format!("cannot persist recovery intent: {error}; no recovery mutation attempted"),
+        );
+        let observed = observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await;
+        self.observation(&deployment.id, name, "compensate.blocked", &observed, None);
+        (
+            ComponentDeploymentResult {
+                outcome: ComponentOutcome::CompensationFailed,
+                attempted_release: Some(component.package.release().version.clone()),
+                observed_release: observed.ok().flatten().map(|release| release.version),
+            },
+            error,
+        )
+    }
+
     fn persist_results(
         &self,
         deployment: &Deployment,
         error: Option<&str>,
         compensation_failures: &BTreeMap<ComponentName, DriverError>,
-    ) -> Result<(), OrchestrationError> {
+    ) {
         for (component, result) in &deployment.components {
             let compensation_error = compensation_failures
                 .get(component)
@@ -621,19 +958,38 @@ impl<'a> DeploymentOrchestrator<'a> {
                     .then_some(error)
                     .flatten()
             });
-            self.history.record_component_result(
-                &deployment.id,
-                component,
-                result,
-                diagnostic,
-                &self.redactor,
-            )?;
+            self.remember_history_error(
+                self.history
+                    .record_component_result(
+                        &deployment.id,
+                        component,
+                        result,
+                        diagnostic,
+                        &self.redactor,
+                    )
+                    .map_err(Into::into),
+            );
         }
-        Ok(())
     }
 
     fn timestamp(&self) -> Result<u64, OrchestrationError> {
         self.clock.timestamp()
+    }
+}
+
+pub(super) fn planned_release_ref(planned: &PlannedComponent) -> ReleaseRef {
+    let release = &planned.plan.release;
+    ReleaseRef {
+        driver: planned.driver.kind(),
+        project_id: release.project_id.clone(),
+        environment_id: release.environment_id.clone(),
+        component: release.component.clone(),
+        generation: release.generation,
+        version: release.version.clone(),
+        destination: release.destination.clone(),
+        destination_revision: release.destination_revision,
+        endpoint_fingerprint: planned.context.endpoint_fingerprint.clone(),
+        effective_capabilities: planned.plan.effective_capabilities.clone(),
     }
 }
 
@@ -656,6 +1012,11 @@ fn validate_components(
             || release.component != context.component
             || release.project_id != context.project_id
             || release.environment_id != context.environment_id
+            || release.generation != context.generation
+            || release.destination != context.destination
+            || release.destination_revision != context.destination_revision
+            || component.planned.driver.kind() != *context.target.driver_kind()
+            || context.destination_settings.driver_kind() != context.target.driver_kind()
         {
             return Err(OrchestrationError::InvalidInput(
                 "planned context, plan, and Release package identities must match".into(),
@@ -698,15 +1059,16 @@ fn recovery_context(context: &ComponentExecutionContext) -> ComponentExecutionCo
     context
 }
 
-async fn activation_failure(
+fn activation_failure(
     component: &DeploymentComponent,
     receipt: &PreparedRelease,
     error: DriverError,
     cancellation: &CancellationToken,
     activated: &mut Vec<ActivatedComponent>,
+    observed: Result<Option<ReleaseRef>, DriverError>,
 ) -> DeploymentFailure {
     let name = &component.planned.context.component;
-    match observe_after_failure(component, RECOVERY_OBSERVATION_TIMEOUT).await {
+    match observed {
         Ok(observed) => {
             if observed.as_ref() == Some(&receipt.release) {
                 activated.push(ActivatedComponent {
@@ -829,6 +1191,13 @@ fn prepared_matches(component: &DeploymentComponent, release: &ReleaseRef) -> bo
 
 #[derive(Debug, Error)]
 pub enum OrchestrationError {
+    #[error("Deployment {deployment}: {source}; terminal persistence failure: {persistence:?}")]
+    Execution {
+        deployment: crate::domain::DeploymentId,
+        #[source]
+        source: Box<Self>,
+        persistence: Option<String>,
+    },
     #[error("invalid Deployment input: {0}")]
     InvalidInput(String),
     #[error(transparent)]

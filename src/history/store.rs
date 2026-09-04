@@ -14,7 +14,10 @@ use crate::domain::{
 };
 use crate::telemetry::Redactor;
 
-const LATEST_SCHEMA_VERSION: u32 = 4;
+mod details;
+pub use details::*;
+
+const LATEST_SCHEMA_VERSION: u32 = 5;
 const MIGRATION_1: &str = r"
 CREATE TABLE deployments (
  id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL,
@@ -140,6 +143,12 @@ impl HistoryStore {
             let transaction = self.connection.transaction()?;
             transaction.execute_batch(MIGRATION_4)?;
             transaction.pragma_update(None, "user_version", 4_u32)?;
+            transaction.commit()?;
+        }
+        if self.schema_version()? == 4 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(details::MIGRATION_5)?;
+            transaction.pragma_update(None, "user_version", 5_u32)?;
             transaction.commit()?;
         }
         Ok(())
@@ -302,7 +311,8 @@ impl HistoryStore {
         if !valid_transition(expected, next) {
             return Err(HistoryError::InvalidTransition { expected, next });
         }
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             "UPDATE deployments SET state=?1,updated_at_ms=?2 WHERE id=?3 AND state=?4 AND updated_at_ms<=?2",
             params![
                 state(next),
@@ -312,6 +322,16 @@ impl HistoryStore {
             ],
         )?;
         if updated == 1 {
+            if matches!(
+                next,
+                DeploymentState::Succeeded | DeploymentState::Failed | DeploymentState::Cancelled
+            ) {
+                transaction.execute(
+                    "UPDATE deployment_steps SET status='skipped',completed_at_ms=?2 WHERE deployment_id=?1 AND status='pending'",
+                    params![deployment.to_string(), timestamp(updated_at_ms)?],
+                )?;
+            }
+            transaction.commit()?;
             Ok(())
         } else {
             Err(HistoryError::StateConflict(deployment.clone()))
@@ -333,13 +353,24 @@ impl HistoryStore {
     ) -> Result<IntentId, HistoryError> {
         validate_text("stage", stage)?;
         validate_text("target", target)?;
-        let inserted = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let inserted = transaction.execute(
             "INSERT INTO operation_intents (deployment_id,component,stage,target,status,created_at_ms)
-             SELECT id,?2,?3,?4,'pending',?5 FROM deployments WHERE id=?1 AND state='running'",
+             SELECT id,?2,?3,?4,'pending',?5 FROM deployments WHERE id=?1 AND state='running' AND created_at_ms<=?5",
             params![deployment.to_string(), component.as_str(), stage, target, timestamp(created_at_ms)?],
         )?;
         if inserted == 1 {
-            Ok(IntentId(self.connection.last_insert_rowid()))
+            let intent = IntentId(transaction.last_insert_rowid());
+            details::begin_step(
+                &transaction,
+                deployment,
+                component,
+                stage,
+                intent,
+                created_at_ms,
+            )?;
+            transaction.commit()?;
+            Ok(intent)
         } else {
             Err(HistoryError::NotRunning(deployment.clone()))
         }
@@ -364,11 +395,18 @@ impl HistoryStore {
             (IntentStatus::Failed, Some(error)) => ("failed", Some(error)),
             _ => return Err(HistoryError::InvalidOutcome),
         };
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        details::validate_step_links(&transaction, None, Some(intent))?;
+        let updated = transaction.execute(
             "UPDATE operation_intents SET status=?1,completed_at_ms=?2,error=?3 WHERE id=?4 AND status='pending'",
             params![status, timestamp(completed_at_ms)?, error, intent.0],
         )?;
         if updated == 1 {
+            transaction.execute(
+                "UPDATE deployment_steps SET status=?1,completed_at_ms=?2,error=?3 WHERE intent_id=?4 AND status='running'",
+                params![status, timestamp(completed_at_ms)?, error, intent.0],
+            )?;
+            transaction.commit()?;
             Ok(())
         } else {
             Err(HistoryError::IntentConflict(intent))
@@ -427,6 +465,7 @@ impl HistoryStore {
         redactor: &Redactor,
     ) -> Result<(), HistoryError> {
         let error = error.map(|value| sanitize_diagnostic(&redactor.redact(value)));
+        details::validate_component_result(&self.connection, deployment, component, result)?;
         let inserted = self.connection.execute(
             "INSERT INTO component_results
              (deployment_id,component,outcome,attempted_release,observed_release,error)
@@ -471,7 +510,7 @@ impl HistoryStore {
         })?;
         rows.map(|row| {
             let (component, outcome, attempted, observed, error) = row?;
-            Ok(PersistedComponentResult {
+            let record = PersistedComponentResult {
                 component: ComponentName::parse(component).map_err(|error| corrupt(&error))?,
                 result: ComponentDeploymentResult {
                     outcome: parse_outcome(&outcome)?,
@@ -485,7 +524,15 @@ impl HistoryStore {
                         .map_err(|error| corrupt(&error))?,
                 },
                 error,
-            })
+            };
+            details::validate_component_result(
+                &self.connection,
+                deployment,
+                &record.component,
+                &record.result,
+            )
+            .map_err(|_| corrupt(&"Component result differs from frozen target"))?;
+            Ok(record)
         })
         .collect()
     }
@@ -700,6 +747,10 @@ pub enum HistoryError {
     InvalidTimestamp(u64),
     #[error("history database contains invalid data: {0}")]
     Corrupt(String),
+    #[error("invalid history metadata: {0}")]
+    InvalidMetadata(&'static str),
+    #[error("history pagination requires a limit of 1-100 and offset at most 1000000")]
+    InvalidPage,
 }
 
 #[cfg(test)]
@@ -724,11 +775,11 @@ mod tests {
         let path = directory.path().join("nested/history.sqlite3");
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            4
+            5
         );
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            4
+            5
         );
     }
 
@@ -771,7 +822,7 @@ mod tests {
             )
             .unwrap();
         let persisted = store.component_results(&deployment).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
         assert_eq!(persisted[0].result, result);
         assert_eq!(persisted[0].error.as_deref(), Some("[REDACTED] failed"));
     }

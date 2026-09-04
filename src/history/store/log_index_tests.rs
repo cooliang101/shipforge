@@ -27,7 +27,7 @@ fn registered_log_round_trips_generated_relative_path_and_rotation_limits() {
     assert_eq!(registered.deployment, deployment);
     drop(store);
     let reopened = HistoryStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(reopened.schema_version().unwrap(), 5);
     assert_eq!(
         reopened.deployment_log(&deployment).unwrap(),
         Some(registered)
@@ -89,7 +89,7 @@ fn migration_from_version_three_preserves_existing_deployments() {
     ).unwrap();
     drop(connection);
     let store = HistoryStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     assert_eq!(
         store.deployment_state(&deployment).unwrap().as_deref(),
         Some("created")

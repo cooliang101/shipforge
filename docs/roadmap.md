@@ -8,7 +8,7 @@
 
 `HLT-00` 现已实现：`linux-ssh` 可在 Destination 端执行带重试和限时的 HTTP/HTTPS 检查，建立 systemd `NRestarts` 基线并验证稳定窗口，健康失败可使用激活凭证进入独立令牌补偿。配置采用内置默认值，不增加必填项。
 
-`RBK-00` 现已实现：显式回滚创建关联原发布的 Rollback Deployment，在副作用前校验全部所选 Component，并按部署拓扑逆序恢复到指定 Release 或 `not_deployed`；漂移、部分失败、补偿失败和取消均保留逐 Component 事实与人工处理信息。当前 SQLite schema v4 保留 v3 的操作类型、关联发布和可空目标版本，并增加 Deployment 日志索引。
+`RBK-00` 现已实现：显式回滚创建关联原发布的 Rollback Deployment，在副作用前校验全部所选 Component，并按部署拓扑逆序恢复到指定 Release 或 `not_deployed`；漂移、部分失败、补偿失败和取消均保留逐 Component 事实与人工处理信息。操作类型、关联发布、可空目标版本及日志索引由后续 `HIS-01` schema v5 延续。
 
 `RUN-01` 现已实现：TUI 会话持有唯一的内存执行门，部署与显式回滚共用；第二个操作在执行前被拒绝，完成、失败或取消均自动释放。该机制不使用文件锁、远端锁，也不提供多进程或跨机器协调。
 
@@ -72,6 +72,8 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 完成门槛：每个远端副作用都有前置日志，并校验 Destination revision、端点指纹和 Component generation；当前 TUI 会话不会同时运行两个 Deployment；上传或哈希失败不改变 `current`；首次部署可只选择一个 Component；无外部端口的 Worker 可由 systemd 稳定性检查验证；激活后失败会把已操作 Component 补偿到原 Release 或未部署状态，恢复失败会产生人工指引。
 
 ## M2：历史、对账与保留
+
+`HIS-01` 已实现本地 SQLite schema v5、冻结的所选 Component/目标/能力快照、源码和操作者信息、Release manifest/大小/SHA-256、准备回执、带时间的步骤以及明确区分未知与未部署的观察记录。部署与显式回滚已接入；查询采用有界分页，终态中的未完成意图仍可发现。验收范围见 [HIS-01 记录](validation/his-01.md)。这不代表 M2 完成；下一工作包是 `HIS-02`，不提前宣称恢复界面或远端库存已可用。
 
 - `HIS-01`：扩展 SQLite Deployment、Step、逐 Component Release Receipt、Environment Observation、Component generation、能力快照及日志索引模型。
 - `HIS-02`：实现 `linux-ssh` Release 库存重建和追加式远端 JSONL 审计记录；Release manifest 由 `ART-01` 创建，由 `REL-01` 和恢复流程读取。

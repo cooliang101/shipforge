@@ -263,15 +263,29 @@ pub struct ComponentRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleasePackage {
     release: ComponentRelease,
+    manifest: crate::domain::ReleaseManifest,
     path: PathBuf,
     sha256: String,
     size: u64,
 }
 
 impl ReleasePackage {
+    #[cfg(test)]
     pub(crate) fn new(release: ComponentRelease, path: PathBuf, sha256: String, size: u64) -> Self {
+        let manifest = crate::domain::ReleaseManifest::new(&release, 0, None);
+        Self::with_manifest(release, manifest, path, sha256, size)
+    }
+
+    pub(crate) fn with_manifest(
+        release: ComponentRelease,
+        manifest: crate::domain::ReleaseManifest,
+        path: PathBuf,
+        sha256: String,
+        size: u64,
+    ) -> Self {
         Self {
             release,
+            manifest,
             path,
             sha256,
             size,
@@ -281,6 +295,12 @@ impl ReleasePackage {
     #[must_use]
     pub fn release(&self) -> &ComponentRelease {
         &self.release
+    }
+
+    /// Returns the exact metadata embedded by the core packager.
+    #[must_use]
+    pub fn manifest(&self) -> &crate::domain::ReleaseManifest {
+        &self.manifest
     }
 
     #[must_use]

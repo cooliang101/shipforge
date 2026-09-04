@@ -279,20 +279,23 @@ async fn execute_plan(
         DeploymentServiceError::InvalidSelection("select at least one Component".into())
     })?;
     let deployment = orchestrator.start_for_context(&first.planned.context)?;
-    let clock = super::clock::MonotonicClock::default();
-    let logs = match open_deployment_log(
-        &service.history_path,
-        &history,
-        &deployment.id,
-        events,
-        cancellation,
-    ) {
+    let clock = orchestrator.clock();
+    let setup = snapshot_plan(&history, &orchestrator, &deployment.id, &plan).and_then(|()| {
+        open_deployment_log(
+            &service.history_path,
+            &history,
+            &deployment.id,
+            events,
+            cancellation,
+        )
+    });
+    let logs = match setup {
         Ok(logs) => logs,
         Err(error) => {
             return Err(before_remote_failure(
                 &history,
                 &deployment.id,
-                &clock,
+                clock,
                 crate::domain::DeploymentState::Failed,
                 error,
                 None,
@@ -312,7 +315,7 @@ async fn execute_plan(
         cancellation,
         &history,
         &deployment.id,
-        &clock,
+        clock,
     )
     .await;
     let components = match built {
@@ -331,7 +334,7 @@ async fn execute_plan(
             return Err(before_remote_failure(
                 &history,
                 &deployment.id,
-                &clock,
+                clock,
                 terminal,
                 error,
                 log_failure,
@@ -355,15 +358,63 @@ async fn execute_plan(
             return Err(execution_error(&deployment_id, error.into(), log_failure));
         }
     };
+    emit_finished(&report, events);
+    attach_log_failure(&mut report, logs.finish().await);
+    Ok(report)
+}
+
+fn emit_finished(report: &DeploymentReport, events: &dyn EventSink) {
     events.emit(DriverLog {
         namespace: "deployment.finished".into(),
         message: format!(
             "Deployment {} finished with {:?}",
-            report.deployment.id, report.deployment.state
+            report.deployment.id, report.deployment.state,
         ),
     });
-    attach_log_failure(&mut report, logs.finish().await);
-    Ok(report)
+}
+
+fn snapshot_plan(
+    history: &HistoryStore,
+    orchestrator: &DeploymentOrchestrator<'_>,
+    deployment: &crate::domain::DeploymentId,
+    plan: &DeploymentPlan,
+) -> Result<(), DeploymentServiceError> {
+    let ordered = plan
+        .activation_order
+        .iter()
+        .map(|name| {
+            plan.entries
+                .iter()
+                .find(|entry| &entry.component == name)
+                .map(|entry| &entry.planned)
+                .ok_or_else(|| {
+                    DeploymentServiceError::InvalidSelection(
+                        "activation order contains an unselected Component".into(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ordered.len() != plan.entries.len() {
+        return Err(DeploymentServiceError::InvalidSelection(
+            "activation order must include every selected Component".into(),
+        ));
+    }
+    orchestrator.snapshot_components(deployment, ordered, true)?;
+    history.record_deployment_metadata(
+        deployment,
+        &crate::history::DeploymentMetadata {
+            git_branch: plan.git_metadata.branch.clone(),
+            git_revision: plan.git_metadata.revision.clone(),
+            git_worktree: match &plan.git {
+                GitWorktreeState::Clean => crate::history::GitWorktree::Clean,
+                GitWorktreeState::Dirty { .. } => crate::history::GitWorktree::Dirty,
+                GitWorktreeState::NotRepository => crate::history::GitWorktree::NotRepository,
+            },
+            operator: std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).ok(),
+        },
+        &Redactor::default(),
+    )?;
+    Ok(())
 }
 
 fn open_deployment_log<'a>(
@@ -491,6 +542,11 @@ async fn build_plan(
             cancellation,
         )
         .await;
+        let result = result.and_then(|component| {
+            DeploymentOrchestrator::new(history, Redactor::default())
+                .record_package(deployment, &component)?;
+            Ok(component)
+        });
         let (status, diagnostic) = match &result {
             Ok(_) => (crate::history::IntentStatus::Succeeded, None),
             Err(error) => (
@@ -498,13 +554,24 @@ async fn build_plan(
                 Some(error.to_string()),
             ),
         };
-        history.complete_intent(
-            intent,
-            status,
-            diagnostic.as_deref(),
-            clock.timestamp()?,
-            &Redactor::default(),
-        )?;
+        let completed = history
+            .complete_intent(
+                intent,
+                status,
+                diagnostic.as_deref(),
+                clock.timestamp()?,
+                &Redactor::default(),
+            )
+            .map_err(DeploymentServiceError::from);
+        if let Err(persistence) = completed {
+            return Err(match result {
+                Ok(_) => persistence,
+                Err(original) => DeploymentServiceError::PersistenceAfterFailure {
+                    original: Box::new(original),
+                    persistence: Box::new(persistence),
+                },
+            });
+        }
         components.push(result?);
     }
     validate_saved_plan(plan, destinations_path)?;
@@ -735,12 +802,130 @@ mod version_tests {
     #[derive(Debug)]
     struct InspectBuildIntent(PathBuf);
 
+    #[tokio::test]
+    async fn setup_history_failure_is_terminal_and_identified_before_build() {
+        let directory = tempfile::tempdir().unwrap();
+        let (plan, destinations) = failing_build_plan(directory.path());
+        let path = directory.path().join("history.sqlite3");
+        let history = HistoryStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER fail_metadata BEFORE INSERT ON deployment_metadata BEGIN SELECT RAISE(ABORT,'injected metadata failure'); END;"
+        ).unwrap();
+        let service = DeploymentService::new(Arc::new(DriverRegistry::default()), path);
+        let error = service
+            .execute(
+                plan,
+                &destinations,
+                &NoTestEvents,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let DeploymentServiceError::Execution { deployment, .. } = error else {
+            panic!("error must identify Deployment");
+        };
+        assert_eq!(
+            history.deployment(&deployment).unwrap().unwrap().state,
+            crate::domain::DeploymentState::Failed
+        );
+        assert!(history.pending_intents(&deployment).unwrap().is_empty());
+        assert!(
+            history
+                .steps(&deployment)
+                .unwrap()
+                .iter()
+                .all(|step| step.status == crate::history::StepStatus::Skipped)
+        );
+    }
+
+    #[derive(Debug)]
+    struct NoTestEvents;
+
+    impl EventSink for NoTestEvents {
+        fn emit(&self, _: DriverLog) {}
+    }
+
+    #[tokio::test]
+    async fn package_metadata_failure_closes_build_step_without_starting_remote_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut plan, destinations) = failing_build_plan(directory.path());
+        let config_path = directory.path().join("shipforge.yaml");
+        let yaml = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "shipforge-test-nonexistent-executable, ci",
+                "rustc, --version",
+            )
+            .replace(
+                "shipforge-test-nonexistent-executable, run, build",
+                "rustc, --version",
+            );
+        std::fs::write(config_path, yaml).unwrap();
+        let crate::config::ProjectConfigState::Loaded(config) =
+            crate::config::load(directory.path()).unwrap()
+        else {
+            panic!("valid config");
+        };
+        plan.entries[0].config = config.components[&plan.entries[0].component].clone();
+        plan.selection.config = config;
+        let output = directory.path().join("frontend/dist");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("index.html"), "fixture").unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let history = HistoryStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER fail_package BEFORE INSERT ON release_packages BEGIN SELECT RAISE(ABORT,'injected package failure'); END;"
+        ).unwrap();
+        let service = DeploymentService::new(Arc::new(DriverRegistry::default()), path);
+        let error = service
+            .execute(
+                plan,
+                &destinations,
+                &NoTestEvents,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected package failure"));
+        let DeploymentServiceError::Execution { deployment, .. } = error else {
+            panic!("Deployment ID required");
+        };
+        assert_eq!(
+            history.deployment(&deployment).unwrap().unwrap().state,
+            crate::domain::DeploymentState::Failed
+        );
+        assert!(history.pending_intents(&deployment).unwrap().is_empty());
+        let steps = history.steps(&deployment).unwrap();
+        assert_eq!(steps[0].name, "build-package");
+        assert_eq!(steps[0].status, crate::history::StepStatus::Failed);
+        assert!(
+            steps[1..]
+                .iter()
+                .all(|step| step.status == crate::history::StepStatus::Skipped)
+        );
+    }
+
     impl EventSink for InspectBuildIntent {
         fn emit(&self, event: DriverLog) {
             if event.namespace == "build.started" {
                 let connection = rusqlite::Connection::open(&self.0).unwrap();
                 let count: i64 = connection.query_row("SELECT count(*) FROM operation_intents WHERE stage='build-package' AND status='pending'", [], |row| row.get(0)).unwrap();
                 assert_eq!(count, 1, "intent must be durable before starting the build");
+                let count: i64 = connection
+                    .query_row("SELECT count(*) FROM component_snapshots", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "selected target must be durable before starting the build"
+                );
+                let count: i64 = connection
+                    .query_row("SELECT count(*) FROM deployment_metadata", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 1, "confirmed source context must precede the build");
             }
         }
     }

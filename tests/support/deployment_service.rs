@@ -135,12 +135,17 @@ pub async fn validate(
     assert!(project.join("server.bin").metadata().unwrap().len() > 0);
     let deployment = report.deployment.id.to_string();
     verify_history(&history, &deployment);
+    verify_detailed_history(&history, &report.deployment.id, &revision, &component);
     verify_remote(&*transfer.lock().await, &version, &revision, &component);
     assert!(
         commands.lock().unwrap().iter().any(
             |command| command.contains(&format!("{REMOTE_ROOT}/temporary/{deployment}.tar.gz"))
         )
     );
+    verify_events(&events);
+}
+
+fn verify_events(events: &Events) {
     let events = events.events.lock().unwrap();
     assert!(
         events
@@ -342,6 +347,44 @@ where
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn verify_detailed_history(
+    history: &Path,
+    deployment: &shipforge::domain::DeploymentId,
+    revision: &str,
+    component: &ComponentName,
+) {
+    let store = shipforge::history::HistoryStore::open(history).unwrap();
+    let snapshots = store.component_snapshots(deployment).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(&snapshots[0].release.component, component);
+    assert!(snapshots[0].expected_current.is_none());
+    let metadata = store.deployment_metadata(deployment).unwrap().unwrap();
+    assert_eq!(metadata.git_revision.as_deref(), Some(revision));
+    assert_eq!(
+        metadata.git_worktree,
+        shipforge::history::GitWorktree::Clean
+    );
+    let packages = store.release_packages(deployment).unwrap();
+    assert_eq!(packages.len(), 1);
+    assert_eq!(
+        packages[0].manifest.source_revision.as_deref(),
+        Some(revision)
+    );
+    assert_eq!(packages[0].release, snapshots[0].release);
+    assert!(packages[0].size > 0);
+    assert_eq!(packages[0].sha256.len(), 64);
+    let receipts = store.release_receipts(deployment).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].release, packages[0].release);
+    let observed = store.observations(deployment).unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].observed, Ok(Some(packages[0].release.clone())));
+    assert_eq!(observed[0].healthy, Some(true));
+    let steps = store.steps(deployment).unwrap();
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[3].status, shipforge::history::StepStatus::Skipped);
 }
 
 fn verify_history(history: &Path, deployment: &str) {

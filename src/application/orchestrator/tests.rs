@@ -427,6 +427,379 @@ async fn prepares_every_component_before_topological_activation() {
 }
 
 #[tokio::test]
+async fn history_reopens_frozen_component_packages_receipts_and_timed_steps() {
+    let fixture = Fixture::new();
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert!(report.warnings.is_empty());
+    let reopened = HistoryStore::open(&fixture.directory.path().join("history.sqlite3")).unwrap();
+    let id = &report.deployment.id;
+    let snapshots = reopened.component_snapshots(id).unwrap();
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.release.component.as_str())
+            .collect::<Vec<_>>(),
+        ["worker", "backend", "frontend"]
+    );
+    for snapshot in &snapshots {
+        assert_eq!(snapshot.release.generation, ComponentGeneration::INITIAL);
+        assert_eq!(
+            snapshot.release.destination_revision,
+            DestinationRevision::INITIAL
+        );
+        assert_eq!(snapshot.target.as_ref(), Some(&snapshot.release));
+        assert!(snapshot.expected_current.is_none());
+    }
+    let packages = reopened.release_packages(id).unwrap();
+    assert_eq!(packages.len(), 3);
+    for package in packages {
+        assert_eq!(package.sha256, "a".repeat(64));
+        assert_eq!(package.size, 1);
+        assert_eq!(package.release.version, package.manifest.version);
+    }
+    assert_eq!(reopened.release_receipts(id).unwrap().len(), 3);
+    let observed = reopened.observations(id).unwrap();
+    assert_eq!(observed.len(), 3);
+    assert!(
+        observed
+            .iter()
+            .all(|row| matches!(&row.observed, Ok(Some(_))) && row.healthy == Some(true))
+    );
+    let steps = reopened.steps(id).unwrap();
+    assert_eq!(steps.len(), 9);
+    for step in steps {
+        if step.name == "compensate" {
+            assert_eq!(step.status, crate::history::StepStatus::Skipped);
+            assert!(step.started_at_ms.is_none());
+        } else {
+            assert_eq!(step.status, crate::history::StepStatus::Succeeded);
+            assert!(step.started_at_ms.unwrap() <= step.completed_at_ms.unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn prepare_failure_preserves_plan_and_skips_unattempted_activation() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_prepare = Some(ComponentName::parse("backend").unwrap());
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(
+        fixture
+            .history
+            .component_snapshots(&report.deployment.id)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        fixture
+            .history
+            .release_packages(&report.deployment.id)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        fixture
+            .history
+            .release_receipts(&report.deployment.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .history
+            .observations(&report.deployment.id)
+            .unwrap()
+            .is_empty()
+    );
+    let steps = fixture.history.steps(&report.deployment.id).unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step.status == crate::history::StepStatus::Failed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step.status == crate::history::StepStatus::Skipped)
+            .count(),
+        8
+    );
+}
+
+fn inject_history_failure(fixture: &Fixture, sql: &str) {
+    rusqlite::Connection::open(fixture.directory.path().join("history.sqlite3"))
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn activation_outcome_write_failure_compensates_before_returning_known_report() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_activation_outcome BEFORE UPDATE ON operation_intents WHEN OLD.stage='activate' BEGIN SELECT RAISE(ABORT,'injected history failure'); END;",
+    );
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(
+        fixture.actions(),
+        [
+            "prepare:backend",
+            "prepare:frontend",
+            "prepare:worker",
+            "activate:worker",
+            "rollback:worker"
+        ]
+    );
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(
+        report.deployment.components[&ComponentName::parse("worker").unwrap()].outcome,
+        ComponentOutcome::Compensated
+    );
+    assert!(!report.warnings.is_empty());
+    assert!(fixture.state.lock().unwrap().current.is_empty());
+    assert_eq!(
+        fixture
+            .history
+            .pending_intents(&report.deployment.id)
+            .unwrap()
+            .len(),
+        1
+    );
+    let observations = fixture.history.observations(&report.deployment.id).unwrap();
+    assert!(
+        observations
+            .iter()
+            .any(|row| row.stage == "compensate.receipt"
+                && row.observed == Ok(None)
+                && row.healthy == Some(true))
+    );
+}
+
+#[tokio::test]
+async fn observation_write_failure_stops_forward_deploy_without_losing_compensation() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_observation BEFORE INSERT ON deployment_observations WHEN NEW.stage='activate.receipt' BEGIN SELECT RAISE(ABORT,'injected observation failure'); END;",
+    );
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert!(!report.warnings.is_empty());
+    assert_eq!(fixture.actions().last().unwrap(), "rollback:worker");
+    assert!(!fixture.actions().contains(&"activate:backend".into()));
+    assert!(fixture.state.lock().unwrap().current.is_empty());
+}
+
+#[tokio::test]
+async fn later_activation_intent_failure_recovers_preceding_component() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_intent BEFORE INSERT ON operation_intents WHEN NEW.stage='activate' AND NEW.component='backend' BEGIN SELECT RAISE(ABORT,'injected pre-effect failure'); END;",
+    );
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(fixture.actions().last().unwrap(), "rollback:worker");
+    assert!(!fixture.actions().contains(&"activate:backend".into()));
+    assert!(fixture.state.lock().unwrap().current.is_empty());
+}
+
+#[tokio::test]
+async fn recovery_outcome_write_failure_does_not_skip_remaining_compensation() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_activate = Some(ComponentName::parse("frontend").unwrap());
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_recovery_outcome BEFORE UPDATE ON operation_intents WHEN OLD.stage='compensate' BEGIN SELECT RAISE(ABORT,'injected recovery history failure'); END;",
+    );
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(
+        &fixture.actions()[6..],
+        ["rollback:backend", "rollback:worker"]
+    );
+    assert!(fixture.state.lock().unwrap().current.is_empty());
+    assert!(report.compensation_failures.is_empty());
+    assert_eq!(report.warnings.len(), 2);
+    assert!(
+        fixture
+            .history
+            .pending_intents(&report.deployment.id)
+            .unwrap()
+            .iter()
+            .all(|intent| intent.target == "not_deployed")
+    );
+}
+
+#[tokio::test]
+async fn compensation_intent_names_the_actual_previous_release() {
+    let fixture = Fixture::new();
+    let mut component = fixture.component("worker");
+    let name = component.planned.context.component.clone();
+    let previous = fixture.driver.release(
+        &component.planned.context,
+        ReleaseVersion::parse("previous").unwrap(),
+    );
+    component.planned.plan.expected_current = Some(previous.clone());
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .current
+        .insert(name.clone(), previous);
+    fixture.state.lock().unwrap().cancel_after_activate = Some(name.clone());
+    let report = DeploymentOrchestrator::new(&fixture.history, Redactor::default())
+        .deploy(vec![component], &[name], &NoEvents, &fixture.cancellation)
+        .await
+        .unwrap();
+    assert_eq!(report.deployment.state, DeploymentState::Cancelled);
+    let connection =
+        rusqlite::Connection::open(fixture.directory.path().join("history.sqlite3")).unwrap();
+    let target: String = connection
+        .query_row(
+            "SELECT target FROM operation_intents WHERE stage='compensate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(target, "previous");
+}
+
+#[tokio::test]
+async fn unknown_post_failure_observation_is_never_confirmed_absence() {
+    let fixture = Fixture::new();
+    let name = ComponentName::parse("worker").unwrap();
+    fixture.state.lock().unwrap().fail_activate = Some(name.clone());
+    fixture.state.lock().unwrap().fail_current = Some(name);
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    let observations = fixture.history.observations(&report.deployment.id).unwrap();
+    assert_eq!(observations.len(), 2);
+    assert!(
+        observations
+            .iter()
+            .all(|row| row.observed.is_err() && row.healthy.is_none())
+    );
+}
+
+#[tokio::test]
+async fn terminal_history_failure_preserves_successful_remote_outcomes_with_warning() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_terminal BEFORE UPDATE ON deployments WHEN NEW.state='succeeded' BEGIN SELECT RAISE(ABORT,'injected terminal history failure'); END;",
+    );
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Succeeded);
+    assert_eq!(fixture.state.lock().unwrap().current.len(), 3);
+    assert!(!report.warnings.is_empty());
+    assert_eq!(
+        fixture
+            .history
+            .deployment(&report.deployment.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DeploymentState::Running
+    );
+}
+
+#[tokio::test]
+async fn snapshot_failure_rejects_all_effects() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_snapshot BEFORE INSERT ON component_snapshots BEGIN SELECT RAISE(ABORT,'injected snapshot failure'); END;",
+    );
+    let component = fixture.component("worker");
+    let result = DeploymentOrchestrator::new(&fixture.history, Redactor::default())
+        .deploy(
+            vec![component],
+            &[ComponentName::parse("worker").unwrap()],
+            &NoEvents,
+            &fixture.cancellation,
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(fixture.actions().is_empty());
+}
+
+#[tokio::test]
+async fn package_history_failure_finalizes_direct_deployment_before_any_remote_effect() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_package BEFORE INSERT ON release_packages BEGIN SELECT RAISE(ABORT,'injected package history failure'); END;",
+    );
+    let result = DeploymentOrchestrator::new(&fixture.history, Redactor::default())
+        .deploy(
+            vec![fixture.component("worker")],
+            &[ComponentName::parse("worker").unwrap()],
+            &NoEvents,
+            &fixture.cancellation,
+        )
+        .await;
+    let Err(OrchestrationError::Execution { deployment, .. }) = result else {
+        panic!("error must identify the failed Deployment");
+    };
+    assert_eq!(
+        fixture
+            .history
+            .deployment(&deployment)
+            .unwrap()
+            .unwrap()
+            .state,
+        DeploymentState::Failed
+    );
+    assert!(fixture.actions().is_empty());
+    assert!(
+        fixture
+            .history
+            .pending_intents(&deployment)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn prepared_receipt_history_failure_completes_failed_step_and_never_activates() {
+    let fixture = Fixture::new();
+    inject_history_failure(
+        &fixture,
+        "CREATE TRIGGER fail_receipt BEFORE INSERT ON release_receipts BEGIN SELECT RAISE(ABORT,'injected receipt history failure'); END;",
+    );
+    let report = fixture.deploy(&["worker", "backend", "frontend"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(fixture.actions(), ["prepare:backend"]);
+    assert!(
+        fixture
+            .history
+            .pending_intents(&report.deployment.id)
+            .unwrap()
+            .is_empty()
+    );
+    let steps = fixture.history.steps(&report.deployment.id).unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step.status == crate::history::StepStatus::Failed)
+            .count(),
+        1
+    );
+    assert!(
+        steps
+            .iter()
+            .filter(|step| step.name == "activate")
+            .all(|step| step.status == crate::history::StepStatus::Skipped)
+    );
+}
+
+#[tokio::test]
 async fn execution_cancellation_replaces_the_read_only_plan_token() {
     let fixture = Fixture::new();
     fixture.state.lock().unwrap().cancel_during_prepare = true;
@@ -456,6 +829,9 @@ async fn remote_orchestration_continues_the_persisted_build_deployment() {
         .start_for_context(&component.planned.context)
         .unwrap();
     let id = deployment.id.clone();
+    orchestrator
+        .snapshot_components(&id, [&component.planned], true)
+        .unwrap();
     let build = fixture
         .history
         .record_intent(
@@ -592,6 +968,9 @@ async fn activation_receipt_drift_is_failed_without_blind_rollback() {
     let worker = &report.deployment.components[&ComponentName::parse("worker").unwrap()];
     assert_eq!(report.deployment.state, DeploymentState::Failed);
     assert_eq!(worker.outcome, ComponentOutcome::Failed);
+    let observations = fixture.history.observations(&report.deployment.id).unwrap();
+    assert!(observations.iter().all(|row| row.healthy.is_none()));
+    assert!(observations.iter().any(|row| row.observed.is_err()));
     assert_eq!(
         worker.observed_release.as_ref().unwrap().as_str(),
         "external"

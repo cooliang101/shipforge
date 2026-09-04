@@ -1,5 +1,9 @@
 # Integration Tests
 
+## Local history and query model
+
+The default suite includes schema v1–v5 migration/reopen tests, frozen Component context and Release receipts, explicit unknown/absent observations, and fault-injected history writes during deployment and compensation. The production service protocol fixture also verifies Git metadata, package/Prepare references, timed steps and health observations after reopening SQLite. See [HIS-01 evidence and limits](../docs/validation/his-01.md); these internal APIs do not add a user-facing CLI or complete the history management screens.
+
 ## Two disposable Linux deployment targets
 
 On Windows with PowerShell 7, WSL Docker, `ssh-keygen`, Git and the repository's Rust toolchain available, run:

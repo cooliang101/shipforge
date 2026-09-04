@@ -123,8 +123,9 @@ pub fn package_release(
         }
     })?;
 
-    Ok(ReleasePackage::new(
+    Ok(ReleasePackage::with_manifest(
         release.clone(),
+        manifest,
         final_path,
         sha256,
         size,
@@ -643,6 +644,7 @@ mod tests {
         let manifest: ReleaseManifest = serde_json::from_slice(&entries[MANIFEST_PATH].1).unwrap();
         assert_eq!(manifest.version.as_str(), "v1.2.3");
         assert_eq!(manifest.source_revision.as_deref(), Some("abc1234"));
+        assert_eq!(package.manifest(), &manifest);
     }
 
     #[test]

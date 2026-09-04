@@ -229,7 +229,7 @@ impl DeploymentDriver for FakeDriver {
 }
 
 struct Fixture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     history: HistoryStore,
     source: DeploymentId,
     project: ProjectId,
@@ -272,7 +272,7 @@ impl Fixture {
             cancellation: cancellation.clone(),
         });
         Self {
-            _directory: directory,
+            directory,
             history,
             source,
             project,
@@ -345,6 +345,13 @@ impl Fixture {
 
     fn actions(&self) -> Vec<String> {
         self.state.lock().unwrap().actions.clone()
+    }
+
+    fn inject_history_failure(&self, sql: &str) {
+        rusqlite::Connection::open(self.directory.path().join("history.sqlite3"))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
     }
 }
 
@@ -638,4 +645,397 @@ async fn failed_rollback_observation_has_a_finite_deadline() {
         .unwrap_err();
     assert_eq!(error.stage, "observe");
     assert!(error.message.contains("timed out"));
+}
+
+#[tokio::test]
+async fn frozen_rollback_refs_execution_order_and_evidence_survive_reopen() {
+    let fixture = Fixture::new();
+    let components = fixture.components();
+    let expected = components
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, component)| DeploymentComponentSnapshot {
+            release: component
+                .target
+                .as_ref()
+                .unwrap_or(&component.expected_current)
+                .clone(),
+            expected_current: Some(component.expected_current.clone()),
+            target: component.target.clone(),
+            execution_order: u32::try_from(index).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let order = ["database", "api", "worker"].map(|name| ComponentName::parse(name).unwrap());
+    let report = RollbackOrchestrator::new(&fixture.history, Redactor::default())
+        .rollback(&fixture.source, components, &order, &fixture.cancellation)
+        .await
+        .unwrap();
+    assert!(report.warnings.is_empty());
+    let reopened = HistoryStore::open(&fixture.directory.path().join("history.sqlite3")).unwrap();
+    assert_eq!(
+        reopened.component_snapshots(&report.deployment.id).unwrap(),
+        expected
+    );
+    let observations = reopened.observations(&report.deployment.id).unwrap();
+    let worker = observations
+        .iter()
+        .filter(|observation| observation.component.as_str() == "worker")
+        .collect::<Vec<_>>();
+    assert_eq!(worker.len(), 3);
+    assert_eq!(worker[0].stage, "rollback-preflight");
+    assert_eq!(worker[0].observed, Ok(expected[0].expected_current.clone()));
+    assert_eq!(worker[0].healthy, None);
+    assert_eq!(worker[1].stage, "rollback-before-mutation");
+    assert_eq!(worker[1].healthy, None);
+    assert_eq!(worker[2].stage, "rollback-receipt");
+    assert_eq!(worker[2].observed, Ok(None));
+    assert_eq!(worker[2].healthy, Some(true));
+    assert!(
+        observations
+            .windows(2)
+            .all(|pair| pair[0].observed_at_ms < pair[1].observed_at_ms)
+    );
+    let steps = reopened.steps(&report.deployment.id).unwrap();
+    assert_eq!(steps.len(), 6);
+    for step in steps {
+        assert!(step.planned);
+        assert_eq!(
+            step.status,
+            if step.name == "rollback" {
+                crate::history::StepStatus::Succeeded
+            } else {
+                crate::history::StepStatus::Skipped
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_distinguishes_failed_observation_from_confirmed_absence() {
+    let fixture = Fixture::new();
+    let worker = ComponentName::parse("worker").unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_component = Some(worker.clone());
+        state.fail_observation_after_error = Some(worker.clone());
+    }
+    let report = fixture.rollback().await;
+    let observations = fixture.history.observations(&report.deployment.id).unwrap();
+    let failure = observations
+        .iter()
+        .find(|observation| observation.stage == "rollback-after-failure")
+        .unwrap();
+    assert_eq!(failure.component, worker);
+    assert!(failure.observed.is_err());
+    assert_eq!(failure.healthy, None);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.observed != Ok(None))
+    );
+    assert_eq!(
+        fixture
+            .history
+            .component_snapshots(&report.deployment.id)
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn confirmed_absence_during_preflight_is_not_inferred_to_be_healthy() {
+    let fixture = Fixture::new();
+    let components = fixture.components();
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .current
+        .remove(&ComponentName::parse("worker").unwrap());
+    let order = ["database", "api", "worker"].map(|name| ComponentName::parse(name).unwrap());
+    let report = RollbackOrchestrator::new(&fixture.history, Redactor::default())
+        .rollback(&fixture.source, components, &order, &fixture.cancellation)
+        .await
+        .unwrap();
+    let observations = fixture.history.observations(&report.deployment.id).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].observed, Ok(None));
+    assert_eq!(observations[0].healthy, None);
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert!(fixture.actions().is_empty());
+}
+
+#[tokio::test]
+async fn failed_snapshot_write_prevents_even_preflight_and_all_effects() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_snapshot BEFORE INSERT ON component_snapshots WHEN NEW.component='api' BEGIN SELECT RAISE(FAIL,'snapshot failure'); END;");
+    let order = ["database", "api", "worker"].map(|name| ComponentName::parse(name).unwrap());
+    let error = RollbackOrchestrator::new(&fixture.history, Redactor::default())
+        .rollback(
+            &fixture.source,
+            fixture.components(),
+            &order,
+            &fixture.cancellation,
+        )
+        .await
+        .unwrap_err();
+    let diagnostic = error.to_string();
+    let OrchestrationError::Execution {
+        deployment,
+        source,
+        persistence,
+    } = error
+    else {
+        panic!("initialization failure must retain the Deployment ID");
+    };
+    assert!(diagnostic.contains(&deployment.to_string()));
+    assert!(matches!(*source, OrchestrationError::History(_)));
+    assert!(source.to_string().contains("snapshot failure"));
+    assert!(persistence.is_none());
+    let recorded = fixture.history.deployment(&deployment).unwrap().unwrap();
+    assert_eq!(recorded.state, DeploymentState::Cancelled);
+    assert_eq!(recorded.related_deployment, Some(fixture.source.clone()));
+    assert!(
+        fixture
+            .history
+            .component_snapshots(&deployment)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .history
+            .pending_intents(&deployment)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(fixture.actions().is_empty());
+    assert!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .observation_tokens_cancelled
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn initialization_and_cancellation_persistence_failures_retain_both_errors_and_id() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_metadata BEFORE INSERT ON deployment_metadata BEGIN SELECT RAISE(FAIL,'metadata failure'); END; CREATE TRIGGER fail_cancel BEFORE UPDATE OF state ON deployments WHEN OLD.kind='rollback' AND NEW.state='cancelled' BEGIN SELECT RAISE(FAIL,'cancellation persistence failure'); END;");
+    let order = ["database", "api", "worker"].map(|name| ComponentName::parse(name).unwrap());
+    let error = RollbackOrchestrator::new(&fixture.history, Redactor::default())
+        .rollback(
+            &fixture.source,
+            fixture.components(),
+            &order,
+            &fixture.cancellation,
+        )
+        .await
+        .unwrap_err();
+    let diagnostic = error.to_string();
+    let OrchestrationError::Execution {
+        deployment,
+        source,
+        persistence,
+    } = error
+    else {
+        panic!("initialization failure must retain the Deployment ID");
+    };
+    assert!(diagnostic.contains(&deployment.to_string()));
+    assert!(source.to_string().contains("metadata failure"));
+    assert!(
+        persistence
+            .unwrap()
+            .contains("cancellation persistence failure")
+    );
+    let recorded = fixture.history.deployment(&deployment).unwrap().unwrap();
+    assert_eq!(recorded.state, DeploymentState::Created);
+    assert_eq!(recorded.related_deployment, Some(fixture.source.clone()));
+    assert_eq!(
+        fixture
+            .history
+            .component_snapshots(&deployment)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        fixture
+            .history
+            .pending_intents(&deployment)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(fixture.actions().is_empty());
+    assert!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .observation_tokens_cancelled
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn preflight_observation_persistence_failure_forbids_forward_effects() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_observation BEFORE INSERT ON deployment_observations WHEN NEW.stage='rollback-preflight' BEGIN SELECT RAISE(FAIL,'observation failure'); END;");
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert!(fixture.actions().is_empty());
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("rollback-preflight"));
+}
+
+#[tokio::test]
+async fn receipt_observation_failure_still_compensates_the_known_effect() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_observation BEFORE INSERT ON deployment_observations WHEN NEW.stage='rollback-receipt' BEGIN SELECT RAISE(FAIL,'receipt observation failure'); END;");
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(
+        fixture.actions(),
+        ["rollback:worker->not_deployed", "rollback:worker->v3"]
+    );
+    assert_eq!(
+        report.deployment.components[&ComponentName::parse("worker").unwrap()].outcome,
+        ComponentOutcome::Compensated
+    );
+    assert!(report.compensation_failures.is_empty());
+    assert_eq!(report.warnings.len(), 1);
+}
+
+#[tokio::test]
+async fn intent_completion_failure_does_not_erase_effect_evidence() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_completion BEFORE UPDATE OF status ON operation_intents WHEN OLD.stage='rollback' BEGIN SELECT RAISE(FAIL,'intent completion failure'); END;");
+    let report = fixture.rollback().await;
+    assert_eq!(
+        fixture.actions(),
+        ["rollback:worker->not_deployed", "rollback:worker->v3"]
+    );
+    assert_eq!(
+        report.deployment.components[&ComponentName::parse("worker").unwrap()].outcome,
+        ComponentOutcome::Compensated
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("complete Rollback intent"))
+    );
+    assert_eq!(
+        fixture
+            .history
+            .pending_intents(&report.deployment.id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_later_forward_intent_compensates_prior_effects_without_unjournaled_write() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_forward_intent BEFORE INSERT ON operation_intents WHEN NEW.stage='rollback' AND NEW.component='api' BEGIN SELECT RAISE(FAIL,'intent failure'); END;");
+    let report = fixture.rollback().await;
+    assert_eq!(
+        fixture.actions(),
+        ["rollback:worker->not_deployed", "rollback:worker->v3"]
+    );
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert!(report.compensation_failures.is_empty());
+    assert_eq!(report.warnings.len(), 1);
+}
+
+#[tokio::test]
+async fn failed_compensation_intent_skips_only_that_effect_and_recovers_other_components() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_component = Some(ComponentName::parse("database").unwrap());
+    fixture.inject_history_failure("CREATE TRIGGER fail_compensation_intent BEFORE INSERT ON operation_intents WHEN NEW.stage='compensate' AND NEW.component='api' BEGIN SELECT RAISE(FAIL,'compensation intent failure'); END;");
+    let report = fixture.rollback().await;
+    assert_eq!(
+        fixture.actions(),
+        [
+            "rollback:worker->not_deployed",
+            "rollback:api->v2",
+            "rollback:database->v1",
+            "rollback:worker->v3"
+        ]
+    );
+    let api = ComponentName::parse("api").unwrap();
+    assert_eq!(
+        report.deployment.components[&api].outcome,
+        ComponentOutcome::CompensationFailed
+    );
+    assert_eq!(
+        report.deployment.components[&api]
+            .observed_release
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "v2"
+    );
+    assert!(
+        report.compensation_failures[&api]
+            .message
+            .contains("no mutation attempted")
+    );
+    assert_eq!(
+        report.deployment.components[&ComponentName::parse("worker").unwrap()].outcome,
+        ComponentOutcome::Compensated
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_compensation_write_failures_do_not_interrupt_other_recovery() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_component = Some(ComponentName::parse("database").unwrap());
+    fixture.inject_history_failure("CREATE TRIGGER fail_recovery_observation BEFORE INSERT ON deployment_observations WHEN NEW.stage LIKE 'compensation-%' BEGIN SELECT RAISE(FAIL,'recovery observation failure'); END; CREATE TRIGGER fail_recovery_completion BEFORE UPDATE OF status ON operation_intents WHEN OLD.stage='compensate' BEGIN SELECT RAISE(FAIL,'recovery completion failure'); END;");
+    let report = fixture.rollback().await;
+    assert!(report.compensation_failures.is_empty());
+    for name in ["api", "worker"] {
+        assert_eq!(
+            report.deployment.components[&ComponentName::parse(name).unwrap()].outcome,
+            ComponentOutcome::Compensated
+        );
+    }
+    assert_eq!(report.warnings.len(), 6);
+    assert!(
+        fixture
+            .actions()
+            .ends_with(&["rollback:api->v3".into(), "rollback:worker->v3".into()])
+    );
+}
+
+#[tokio::test]
+async fn terminal_persistence_failure_retains_known_successful_rollback_report() {
+    let fixture = Fixture::new();
+    fixture.inject_history_failure("CREATE TRIGGER fail_results BEFORE INSERT ON component_results BEGIN SELECT RAISE(FAIL,'result failure'); END; CREATE TRIGGER fail_terminal BEFORE UPDATE OF state ON deployments WHEN OLD.kind='rollback' AND NEW.state='succeeded' BEGIN SELECT RAISE(FAIL,'terminal failure'); END;");
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Succeeded);
+    assert!(report.failure.is_none());
+    assert!(report.compensation_failures.is_empty());
+    assert!(
+        report
+            .deployment
+            .components
+            .values()
+            .all(|result| result.outcome == ComponentOutcome::Succeeded)
+    );
+    assert_eq!(report.warnings.len(), 4);
+    assert_eq!(
+        fixture
+            .history
+            .deployment(&report.deployment.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DeploymentState::Running
+    );
 }

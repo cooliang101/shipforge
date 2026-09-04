@@ -5,7 +5,7 @@
 - 产品名称：ShipForge
 - 产品类型：本地运行的前后端应用发布部署助手
 - 目标形态：交互式终端界面（TUI）
-- 当前阶段：MVP 实施 / M1 安全部署闭环验收通过，M2 待实施（证据见路线图）
+- 当前阶段：MVP 实施 / M1 已验收，M2 的 HIS-01 本地历史模型已实现；远端库存、对账、保留与管理界面待实施（证据见路线图）
 - 文档版本：v0.8
 - 更新日期：2026-09-04
 
@@ -319,12 +319,14 @@ Release 本身是不可变的 `<version>.tar.gz` 压缩包及其中的 manifest�
 - Deployment ID 和各所选 Component 的 Release 版本；
 - Project/Environment ID、Component 名称、Destination ID/revision、端点指纹及 Component generation；
 - Git 分支、提交号及工作区状态；
-- 操作者和时间；
+- 操作者和时间；操作者自动取本机账号环境信息，无法获取时明确未知，不引入账号表单或身份认证体系；
 - 部署组件；
 - Release SHA-256；
 - Deployment、步骤及各 Component 的准备、激活、健康和补偿结果；
 - 各 Component 激活前的 Release；
 - 各步骤执行结果。
+
+历史查询必须区分“观察到 Release”“确认未部署”和“观察失败、状态未知”；不能把旧记录的空版本字段补写成未部署。计划和准备成功不代表版本健康。副作用之后的历史写入失败必须保留已知远端结果、停止后续前进并尝试有持久化意图的安全补偿；仍未完成的意图即使所属 Deployment 已终态，也必须能被查询到。旧数据库缺少的快照和源码信息保持未知。
 
 Release 只在 Driver 声明支持清理时处理。`linux-ssh` 清理必须保护：
 
