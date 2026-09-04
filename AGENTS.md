@@ -44,4 +44,4 @@ Use imperative Conventional Commits, such as `feat: validate release paths`; the
 
 Never store secrets in `shipforge.yaml`. Validate SSH host keys, separate arguments from Shell text, redact Driver data, and preserve protected Component Releases.
 
-History rules are in `docs/architecture.md`: persist only non-secret snapshots and receipts, distinguish unknown from absent, and retain known remote outcomes on history failures. Inventory is file evidence, not health or historical endpoint proof; remote JSONL is auxiliary and must not prevent compensation.
+History rules are in `docs/architecture.md`: distinguish unknown from absent and retain known outcomes on persistence failures. Keep `recovery_reports`/`recovery_report_components` and `deployment_revisions` separate from original outcomes; never complete old intents or reconstruct missing YAML/history. Inventory is not health or historical endpoint proof; auxiliary JSONL must not prevent compensation.

@@ -352,10 +352,12 @@ pub struct ActivationReceipt {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComponentInventory {
     pub releases: ReleaseInventory,
     pub audit: RemoteAuditHistory,
+    pub remnants: inventory::TemporaryRemnants,
 }
 
 #[derive(Clone, Debug)]

@@ -280,6 +280,14 @@ impl DeploymentDriver for LinuxSshDriver {
                 ],
                 incomplete: true,
             });
+        let remnants = session
+            .temporary_remnants(target, &marker, &context.cancellation)
+            .await
+            .unwrap_or_else(|error| crate::drivers::inventory::TemporaryRemnants {
+                entries: Vec::new(),
+                notices: vec![error.to_string()],
+                incomplete: true,
+            });
         if context.cancellation.is_cancelled() {
             return Err(error(
                 "inventory",
@@ -287,7 +295,11 @@ impl DeploymentDriver for LinuxSshDriver {
                 "inventory cancelled",
             ));
         }
-        Ok(ComponentInventory { releases, audit })
+        Ok(ComponentInventory {
+            releases,
+            audit,
+            remnants,
+        })
     }
 
     async fn prepare(

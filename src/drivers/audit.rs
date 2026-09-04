@@ -59,7 +59,8 @@ pub struct RemoteAuditRecord {
     pub package: Option<RemoteAuditPackage>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteAuditHistory {
     pub records: Vec<RemoteAuditRecord>,
     /// Sanitized explanations of absent, invalid, conflicting or omitted evidence.

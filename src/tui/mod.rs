@@ -212,13 +212,16 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             frame.render_widget(content, area);
         }
         Screen::Overview { root, config } => {
-            let content = format!(
+            let mut content = format!(
                 "Project: {}\nRoot: {}\nComponents: {}\nEnvironments: {}\n\nConfiguration loaded successfully.",
                 config.project,
                 root.display(),
                 config.components.len(),
                 config.environments.len()
             );
+            if let Some(notice) = app.attention_notice() {
+                let _ = write!(content, "\n\n{notice}");
+            }
             frame.render_widget(panel(" Project overview ", content), area);
         }
         Screen::DeploySelection(selection) => render_deploy_selection(frame, area, selection),
@@ -803,6 +806,10 @@ fn render_component_setup(
 
 fn render_projects(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let mut lines = Vec::new();
+    if let Some(notice) = app.attention_notice() {
+        lines.push(Line::styled(notice, Style::default().fg(Color::Yellow)));
+        lines.push(Line::from(""));
+    }
     for (index, status) in app.recent.iter().enumerate() {
         let suffix = if status.available {
             ""

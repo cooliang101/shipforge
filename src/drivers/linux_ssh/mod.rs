@@ -10,6 +10,7 @@ mod marker;
 mod preflight;
 mod prepare;
 mod probe;
+mod remnants;
 mod setup_gateway;
 mod setup_probe;
 mod space;
@@ -35,6 +36,7 @@ pub use prepare::{PrepareReleaseError, PrepareReleaseOptions, PreparedRemoteRele
 pub use probe::{
     AgentIdentitySummary, HostKeyVerifier, SshProbeError, capture_host_key, probe_agent_identities,
 };
+pub use remnants::RemnantsError;
 pub use setup_gateway::LinuxSshSetupGateway;
 pub use setup_probe::{
     RemoteRootState, RemoteSetupCandidates, RemoteSetupProbeError, probe_remote_setup,

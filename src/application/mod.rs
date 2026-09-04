@@ -9,6 +9,8 @@ mod destination_setup;
 mod execution_guard;
 mod orchestrator;
 mod planner;
+pub mod recovery;
+mod recovery_attention;
 mod rollback;
 mod session;
 
@@ -29,5 +31,7 @@ pub use orchestrator::{
     OrchestrationError, OrchestrationStage,
 };
 pub use planner::{ApplicationError, DeploymentPlanner, PlannedComponent};
+pub use recovery::{RecoveryError, RecoveryInspection, RecoveryService};
+pub use recovery_attention::{LocalAttentionSummary, local_attention};
 pub use rollback::{RollbackComponent, RollbackOrchestrator, RollbackReport};
 pub use session::{DeploymentSession, SessionBusy};

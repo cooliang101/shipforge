@@ -16,8 +16,10 @@ use crate::telemetry::Redactor;
 
 mod details;
 pub use details::*;
+mod recovery;
+pub use recovery::*;
 
-const LATEST_SCHEMA_VERSION: u32 = 5;
+const LATEST_SCHEMA_VERSION: u32 = 6;
 const MIGRATION_1: &str = r"
 CREATE TABLE deployments (
  id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL,
@@ -149,6 +151,12 @@ impl HistoryStore {
             let transaction = self.connection.transaction()?;
             transaction.execute_batch(details::MIGRATION_5)?;
             transaction.pragma_update(None, "user_version", 5_u32)?;
+            transaction.commit()?;
+        }
+        if self.schema_version()? == 5 {
+            let transaction = self.connection.transaction()?;
+            recovery::migrate(&transaction)?;
+            transaction.pragma_update(None, "user_version", 6_u32)?;
             transaction.commit()?;
         }
         Ok(())
@@ -751,6 +759,8 @@ pub enum HistoryError {
     InvalidMetadata(&'static str),
     #[error("history pagination requires a limit of 1-100 and offset at most 1000000")]
     InvalidPage,
+    #[error("source Deployment changed during inspection; inspect again before caching")]
+    StaleRecoveryBasis,
 }
 
 #[cfg(test)]
@@ -775,11 +785,11 @@ mod tests {
         let path = directory.path().join("nested/history.sqlite3");
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            5
+            6
         );
         assert_eq!(
             HistoryStore::open(&path).unwrap().schema_version().unwrap(),
-            5
+            6
         );
     }
 
@@ -822,7 +832,7 @@ mod tests {
             )
             .unwrap();
         let persisted = store.component_results(&deployment).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
         assert_eq!(persisted[0].result, result);
         assert_eq!(persisted[0].error.as_deref(), Some("[REDACTED] failed"));
     }

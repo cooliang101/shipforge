@@ -10,14 +10,21 @@ use std::{
 };
 
 use shipforge::{
-    application::{DeploymentSelection, DeploymentService, GitWorktreeState},
+    application::{
+        DeploymentPlan, DeploymentSelection, DeploymentService, DeploymentSession,
+        GitWorktreeState, RecoveryService,
+    },
     config::{
         ArtifactSpec, BuildCommand, ComponentSetup, CredentialRegistry, DestinationRegistry,
         DestinationSettings, EnvironmentSetup, HostKeyFingerprint, ProjectSetup, SshCredential,
         TargetSetup, initialize,
     },
-    domain::{ComponentName, DeploymentState, DestinationKey, ReleaseManifest, ReleaseVersion},
+    domain::{
+        ComponentName, DeploymentId, DeploymentState, DestinationKey, ReleaseManifest,
+        ReleaseVersion,
+    },
     drivers::{DriverLog, DriverRegistry, EventSink, linux_ssh::LinuxSshDriver},
+    history::{CurrentAlignment, DeploymentQuery, HistoryStore, PackageAlignment},
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -90,14 +97,15 @@ pub async fn validate(
         .register(Arc::new(LinuxSshDriver::new(Arc::new(credentials))))
         .unwrap();
     let history = directory.join("service-history/history.sqlite3");
-    let service = DeploymentService::new(Arc::new(registry), history.clone());
+    let registry = Arc::new(registry);
+    let service = DeploymentService::new(Arc::clone(&registry), history.clone());
     let component = ComponentName::parse("api").unwrap();
     let cancellation = CancellationToken::new();
     let plan = service
         .plan(
             DeploymentSelection {
                 project_root: project.clone(),
-                config,
+                config: config.clone(),
                 environment: "production".into(),
                 components: BTreeSet::from([component.clone()]),
             },
@@ -106,18 +114,7 @@ pub async fn validate(
         )
         .await
         .unwrap();
-    assert_eq!(plan.git, GitWorktreeState::Clean);
-    assert_eq!(
-        plan.git_metadata.revision.as_deref(),
-        Some(revision.as_str())
-    );
-    assert_eq!(plan.entries.len(), 1);
-    assert!(!plan.entries[0].notices.is_empty());
-    assert!(
-        !project.join("server.bin").exists(),
-        "planning must not run rustc"
-    );
-    assert!(!history.exists(), "planning must not create a Deployment");
+    verify_plan(&plan, &project, &history, &revision);
     assert!(!transfer.lock().await.directories.contains(REMOTE_ROOT));
     let version = plan.entries[0].release.clone();
     let events = Events {
@@ -143,6 +140,172 @@ pub async fn validate(
         )
     );
     verify_events(&events);
+    verify_reconciliation(
+        registry,
+        &history,
+        &report.deployment.id,
+        DeploymentSelection {
+            project_root: project,
+            config,
+            environment: "production".into(),
+            components: BTreeSet::from([component]),
+        },
+        &destinations_path,
+        transfer,
+    )
+    .await;
+}
+
+async fn verify_reconciliation(
+    registry: Arc<DriverRegistry>,
+    history_path: &Path,
+    completed: &DeploymentId,
+    selection: DeploymentSelection,
+    destinations_path: &Path,
+    transfer: &Arc<AsyncMutex<super::TransferState>>,
+) {
+    let history = HistoryStore::open(history_path).unwrap();
+    let interrupted = interrupted_copy(&history, completed);
+    let before = history.recovery_basis(&interrupted).unwrap();
+    let remote_before = {
+        let state = transfer.lock().await;
+        (
+            state.files.clone(),
+            state.directories.clone(),
+            state.links.clone(),
+        )
+    };
+    let recovery = RecoveryService::new(
+        Arc::clone(&registry),
+        history_path.to_owned(),
+        Arc::new(DeploymentSession::default()),
+    );
+    let inspected = recovery
+        .inspect(
+            selection.clone(),
+            Some(interrupted.clone()),
+            destinations_path,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(inspected.persistence_warning.is_none(), "{inspected:#?}");
+    assert_eq!(
+        inspected.report.components[0].alignment,
+        CurrentAlignment::Target
+    );
+    assert_eq!(
+        inspected.report.components[0].package_alignment,
+        PackageAlignment::Matches
+    );
+    assert_eq!(
+        history.recovery_basis(&interrupted).unwrap(),
+        before,
+        "inspection never completes interrupted history"
+    );
+    assert_eq!(
+        history.recovery_report(&inspected.report.id).unwrap(),
+        Some(inspected.report)
+    );
+
+    let empty_path = history_path.with_file_name("rebuilt-history.sqlite3");
+    let cache_service = RecoveryService::new(
+        registry,
+        empty_path.clone(),
+        Arc::new(DeploymentSession::default()),
+    );
+    let rebuilt = cache_service
+        .inspect(
+            selection.clone(),
+            None,
+            destinations_path,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(rebuilt.persistence_warning.is_none());
+    let reopened = HistoryStore::open(&empty_path).unwrap();
+    assert_eq!(
+        reopened.recovery_report(&rebuilt.report.id).unwrap(),
+        Some(rebuilt.report.clone())
+    );
+    assert_eq!(
+        rebuilt.report.components[0].alignment,
+        CurrentAlignment::Unplanned
+    );
+    assert!(
+        reopened
+            .deployments(
+                &selection.config.project_id,
+                &selection.config.environments["production"].id,
+                DeploymentQuery::default()
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let state = transfer.lock().await;
+    assert_eq!(
+        (&state.files, &state.directories, &state.links),
+        (&remote_before.0, &remote_before.1, &remote_before.2),
+        "all reconciliation paths are remote read-only"
+    );
+}
+
+fn interrupted_copy(history: &HistoryStore, completed: &DeploymentId) -> DeploymentId {
+    let original = history.recovery_basis(completed).unwrap();
+    let interrupted = DeploymentId::new();
+    history
+        .create_deployment(
+            &interrupted,
+            &original.record.project,
+            &original.record.environment,
+            1,
+        )
+        .unwrap();
+    history
+        .record_component_snapshots(&interrupted, &original.snapshots)
+        .unwrap();
+    history
+        .transition_deployment(
+            &interrupted,
+            DeploymentState::Created,
+            DeploymentState::Running,
+            2,
+        )
+        .unwrap();
+    for package in &original.packages {
+        history
+            .record_release_package(
+                &interrupted,
+                &package.release,
+                &package.manifest,
+                &package.sha256,
+                package.size,
+            )
+            .unwrap();
+        history
+            .record_intent(
+                &interrupted,
+                &package.release.component,
+                "activate",
+                package.release.version.as_str(),
+                3,
+            )
+            .unwrap();
+    }
+    interrupted
+}
+
+fn verify_plan(plan: &DeploymentPlan, project: &Path, history: &Path, revision: &str) {
+    assert_eq!(plan.git, GitWorktreeState::Clean);
+    assert_eq!(plan.git_metadata.revision.as_deref(), Some(revision));
+    assert_eq!(plan.entries.len(), 1);
+    assert!(!plan.entries[0].notices.is_empty());
+    assert!(
+        !project.join("server.bin").exists(),
+        "planning must not run rustc"
+    );
+    assert!(!history.exists(), "planning must not create a Deployment");
 }
 
 fn verify_events(events: &Events) {

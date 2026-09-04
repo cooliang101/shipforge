@@ -60,6 +60,7 @@ struct TransferState {
     files: HashMap<String, Vec<u8>>,
     directories: HashSet<String>,
     links: HashMap<String, String>,
+    hard_link_counts: HashMap<String, u64>,
     fail_writes_remaining: usize,
     fail_audit_appends_remaining: usize,
     removals: usize,
@@ -211,6 +212,14 @@ async fn release_command(
             Some((0, Vec::new()))
         }
         "stat" => match words.as_slice() {
+            ["stat", "--format=%h", "--", path] => {
+                let state = transfer.lock().await;
+                if !state.files.contains_key(*path) {
+                    return Some((1, Vec::new()));
+                }
+                let count = state.hard_link_counts.get(*path).copied().unwrap_or(1);
+                Some((0, format!("{count}\n").into_bytes()))
+            }
             ["stat", "--dereference", "--format=%d", "--", _, _] => Some((0, b"1\n1\n".to_vec())),
             ["stat", "--format=%d:%i:%s:%y:%z", "--", path] => {
                 let state = transfer.lock().await;
@@ -447,6 +456,12 @@ async fn audit_command(
     let marker_path = format!("{root}/.shipforge-project.json");
     if state.links.contains_key(&marker_path)
         || state
+            .hard_link_counts
+            .get(&marker_path)
+            .copied()
+            .unwrap_or(1)
+            != 1
+        || state
             .files
             .get(&marker_path)
             .is_none_or(|bytes| bytes.as_slice() != marker.as_bytes())
@@ -465,6 +480,9 @@ async fn audit_command(
     }
     let path = format!("{metadata}/{file}");
     if state.links.contains_key(&path) || state.directories.contains(&path) {
+        return Some((42, Vec::new()));
+    }
+    if state.hard_link_counts.get(&path).copied().unwrap_or(1) != 1 {
         return Some((42, Vec::new()));
     }
     if *mode == "read" {
@@ -1803,6 +1821,7 @@ async fn validate_production_driver(
     assert!(activated.healthy);
     assert!(activated.warnings.is_empty());
     validate_driver_inventory(&planned, &package, transfer).await;
+    validate_driver_remnants(&planned, transfer).await;
 
     let previous = ReleaseRef {
         driver: prepared.release.driver.clone(),
@@ -1921,6 +1940,77 @@ async fn validate_undeploy_preserves_original_audit_ref(
     assert_eq!(record.target, None);
     assert_eq!(record.observed, RemoteAuditObserved::NotDeployed);
     assert_eq!(record.healthy, None);
+}
+
+async fn validate_driver_remnants(
+    planned: &shipforge::application::PlannedComponent,
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) {
+    use shipforge::drivers::inventory::TemporaryRemnantKind;
+    let baseline = planned.driver.inventory(&planned.context).await.unwrap();
+    assert!(!baseline.remnants.incomplete, "{baseline:?}");
+    assert!(baseline.remnants.entries.is_empty());
+    let root = protocol_target().root;
+    let deployment = DeploymentId::new();
+    let upload = format!("{root}/temporary/{deployment}.tar.gz");
+    let extracted = format!("{root}/temporary/{deployment}.dir");
+    let activation = format!("{root}/temporary/{deployment}.current");
+    let marker = format!(
+        "{root}/.shipforge-marker-{}.tmp",
+        uuid::Uuid::now_v7().simple()
+    );
+    {
+        let mut state = transfer.lock().await;
+        state
+            .files
+            .insert(upload.clone(), b"partial upload".to_vec());
+        state.directories.insert(extracted.clone());
+        state
+            .links
+            .insert(activation.clone(), "/outside/never-follow".into());
+        state
+            .files
+            .insert(marker.clone(), b"marker candidate".to_vec());
+    }
+    let found = planned.driver.inventory(&planned.context).await.unwrap();
+    assert_eq!(found.releases, baseline.releases);
+    assert_eq!(found.audit, baseline.audit);
+    assert!(!found.remnants.incomplete);
+    assert_eq!(found.remnants.entries.len(), 4);
+    for entry in &found.remnants.entries {
+        assert_eq!(
+            entry.deployment.as_ref(),
+            (entry.kind != TemporaryRemnantKind::MarkerPublication).then_some(&deployment)
+        );
+    }
+    {
+        let mut state = transfer.lock().await;
+        assert_eq!(state.files[&upload], b"partial upload");
+        assert_eq!(state.links[&activation], "/outside/never-follow");
+        state
+            .hard_link_counts
+            .insert(format!("{root}/.shipforge-project.json"), 2);
+    }
+    let unknown = planned.driver.inventory(&planned.context).await.unwrap();
+    assert_eq!(unknown.releases, baseline.releases);
+    assert!(unknown.audit.incomplete);
+    assert!(unknown.remnants.entries.is_empty());
+    assert!(unknown.remnants.incomplete);
+    assert!(
+        unknown
+            .remnants
+            .notices
+            .iter()
+            .any(|notice| notice.contains("multiple hard links"))
+    );
+    let mut state = transfer.lock().await;
+    state
+        .hard_link_counts
+        .remove(&format!("{root}/.shipforge-project.json"));
+    state.files.remove(&upload);
+    state.directories.remove(&extracted);
+    state.links.remove(&activation);
+    state.files.remove(&marker);
 }
 
 async fn validate_driver_inventory(

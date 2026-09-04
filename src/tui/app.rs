@@ -12,6 +12,9 @@ use std::{
 use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod attention;
+use attention::{AttentionRequest, AttentionState, LocalAttentionGateway, TuiAttentionGateway};
+
 use crate::{
     application::{
         DeploymentPlan, DeploymentReport, DeploymentSelection, DeploymentService,
@@ -239,6 +242,10 @@ impl NewSshDestinationState {
 
 #[derive(Debug)]
 enum BackgroundEvent {
+    LocalAttention(
+        AttentionRequest,
+        Result<crate::application::LocalAttentionSummary, String>,
+    ),
     AgentIdentities(Result<Vec<LocalIdentityCandidate>, String>),
     HostKey(Result<String, String>),
     Authentication(Result<RemoteSetupCandidates, String>),
@@ -371,6 +378,8 @@ pub(super) struct App {
     background_receiver: Receiver<BackgroundEvent>,
     setup_service: DestinationSetupService,
     deployment_gateway: Arc<dyn TuiDeploymentGateway>,
+    attention_gateway: Arc<dyn TuiAttentionGateway>,
+    attention: AttentionState,
 }
 
 impl App {
@@ -399,12 +408,16 @@ impl App {
             credentials: credential_path,
             history: destination_registry_path.with_file_name("history.sqlite3"),
         });
+        let attention_gateway = Arc::new(LocalAttentionGateway {
+            history: destination_registry_path.with_file_name("history.sqlite3"),
+        });
         Self::new_with_services(
             registry_path,
             destination_registry_path,
             initial_directory,
             setup_service,
             deployment_gateway,
+            attention_gateway,
         )
     }
 
@@ -414,13 +427,14 @@ impl App {
         initial_directory: &Path,
         setup_service: DestinationSetupService,
         deployment_gateway: Arc<dyn TuiDeploymentGateway>,
+        attention_gateway: Arc<dyn TuiAttentionGateway>,
     ) -> Result<Self, ProjectRegistryError> {
         let initial_directory = std::fs::canonicalize(initial_directory)
             .map_err(|source| ProjectRegistryError::browser(initial_directory, source))?;
         let recent = ProjectRegistry::load(&registry_path)?.statuses();
         let credential_registry_path = destination_registry_path.with_file_name("credentials.yaml");
         let (background_sender, background_receiver) = mpsc::sync_channel(256);
-        Ok(Self {
+        let mut app = Self {
             screen: Screen::Projects,
             recent,
             selected_recent: 0,
@@ -436,7 +450,11 @@ impl App {
             background_receiver,
             setup_service,
             deployment_gateway,
-        })
+            attention_gateway,
+            attention: AttentionState::default(),
+        };
+        app.refresh_attention(None);
+        Ok(app)
     }
 
     pub fn poll_background(&mut self) {
@@ -445,6 +463,9 @@ impl App {
                 break;
             };
             match event {
+                BackgroundEvent::LocalAttention(request, result) => {
+                    self.finish_attention(&request, result);
+                }
                 BackgroundEvent::AgentIdentities(result) => match &mut self.screen {
                     Screen::NewSshDestination(draft) | Screen::KeyBrowser { draft, .. } => {
                         apply_agent_identities(draft, result);
@@ -612,7 +633,7 @@ impl App {
                 ..
             } => self.handle_setup_review(key.code, &destinations, &prepared),
             Screen::Overview { root, config } => match key.code {
-                KeyCode::Esc => self.screen = Screen::Projects,
+                KeyCode::Esc => self.show_projects(),
                 KeyCode::Char('q') => return true,
                 KeyCode::Char('d') => self.open_deployment(root, config),
                 _ => {}
@@ -640,7 +661,7 @@ impl App {
             }
             Screen::DeploymentFinished { root, config, .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                    self.screen = Screen::Overview { root, config };
+                    self.show_overview(root, config);
                 } else if let Screen::DeploymentFinished { scroll, .. } = &mut self.screen {
                     *scroll = match key.code {
                         KeyCode::Up => scroll.saturating_sub(1),
@@ -865,6 +886,7 @@ impl App {
             cancellation_requested: false,
             logs: VecDeque::new(),
         };
+        self.invalidate_attention();
     }
 
     fn finish_deployment(&mut self, result: Result<DeploymentReport, String>) {
@@ -878,6 +900,7 @@ impl App {
             Ok(report) => deployment_summary(&report),
             Err(error) => format!("Deployment did not complete: {error}"),
         };
+        let project = config.project_id.clone();
         self.screen = Screen::DeploymentFinished {
             root,
             config,
@@ -885,6 +908,7 @@ impl App {
             scroll: 0,
             logs,
         };
+        self.refresh_attention(Some(project));
     }
 
     fn handle_setup_components(&mut self, key: KeyCode, setup: &ComponentSetupState) {
@@ -927,7 +951,7 @@ impl App {
                     Err(error) => self.message = Some(error.to_string()),
                 }
             }
-            KeyCode::Esc => self.screen = Screen::Projects,
+            KeyCode::Esc => self.show_projects(),
             _ => {}
         }
     }
@@ -1542,7 +1566,7 @@ impl App {
                         } else {
                             self.refresh_recent();
                         }
-                        self.screen = Screen::Overview { root, config };
+                        self.show_overview(root, config);
                     }
                     Err(error) => self.message = Some(error.to_string()),
                 }
@@ -1602,7 +1626,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') => self.select_root(&browser.directory),
-            KeyCode::Esc => self.screen = Screen::Projects,
+            KeyCode::Esc => self.show_projects(),
             _ => {}
         }
     }
@@ -1615,9 +1639,10 @@ impl App {
     }
 
     fn select_root(&mut self, root: &Path) {
+        self.invalidate_attention();
         match select_project(&self.registry_path, root, now_unix_ms()) {
             Ok(ProjectSelection::Existing { root, config }) => {
-                self.screen = Screen::Overview { root, config };
+                self.show_overview(root, config);
                 self.refresh_recent();
             }
             Ok(ProjectSelection::New { root }) => match discover_components(&root) {

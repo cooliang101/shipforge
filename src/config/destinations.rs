@@ -369,6 +369,16 @@ impl DestinationRegistry {
             .and_then(DestinationEntry::current)
     }
 
+    /// Resolves an exact immutable historical revision, never the latest fallback.
+    #[must_use]
+    pub fn resolve_revision(
+        &self,
+        key: &DestinationKey,
+        revision: DestinationRevision,
+    ) -> Option<&DestinationRevisionRecord> {
+        self.destinations.get(key)?.revision(revision)
+    }
+
     #[must_use]
     pub fn summaries(&self) -> Vec<DestinationSummary> {
         self.destinations
@@ -668,11 +678,28 @@ mod tests {
         assert_eq!(second.revision.get(), 2);
         assert_ne!(second.endpoint_fingerprint, first_fingerprint);
         assert_eq!(
-            registry.destinations[&key]
-                .revision(DestinationRevision::INITIAL)
+            registry
+                .resolve_revision(&key, DestinationRevision::INITIAL)
                 .unwrap()
                 .endpoint_fingerprint,
             first_fingerprint
+        );
+        assert!(
+            registry
+                .resolve_revision(&DestinationKey::new(), DestinationRevision::INITIAL)
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve_revision(
+                    &key,
+                    DestinationRevision::INITIAL
+                        .checked_next()
+                        .unwrap()
+                        .checked_next()
+                        .unwrap()
+                )
+                .is_none()
         );
     }
 

@@ -75,11 +75,13 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 `HIS-01` 已实现本地 SQLite schema v5、冻结的所选 Component/目标/能力快照、源码和操作者信息、Release manifest/大小/SHA-256、准备回执、带时间的步骤以及明确区分未知与未部署的观察记录。部署与显式回滚已接入；查询采用有界分页，终态中的未完成意图仍可发现。验收范围见 [HIS-01 记录](validation/his-01.md)。
 
-`HIS-02` 已完成只读远端库存与追加式审计：校验版本归档、摘要、manifest 和目录事实，显式报告不完整条目与未知 current；审计保留原始非秘密引用，不从当前配置补造历史能力或健康。副作用后的辅助审计失败保留已知结果与补偿路径。默认测试、独立审查及真实双 Linux 复跑通过，证据和资源上限见 [HIS-02 记录](validation/his-02.md)。下一工作包为 `REC-01`；M2 尚未完成，恢复决策、清理及 TUI 管理入口仍未交付。
+`HIS-02` 已完成只读远端库存与追加式审计：校验版本归档、摘要、manifest 和目录事实，显式报告不完整条目与未知 current；审计保留原始非秘密引用，不从当前配置补造历史能力或健康。副作用后的辅助审计失败保留已知结果与补偿路径。默认测试、独立审查及真实双 Linux 复跑通过，证据和资源上限见 [HIS-02 记录](validation/his-02.md)。
+
+`REC-01` 已完成只读对账应用服务、独立不可变报告、历史修订校验、远端暂存残留诊断及 TUI 启动本地待核实提示。不重放旧意图、不改写原结果，也不从远端重建 YAML。独立审查、426 项单测、6 项协议测试、15 个真实子进程退出/模拟副作用场景和 486.50 秒双 Linux 验收通过；完整范围见 [REC-01 记录](validation/rec-01.md)。下一工作包为 `RET-01`；M2 尚未完成，清理及完整历史/恢复管理界面仍未交付。
 
 - `HIS-01`：扩展 SQLite Deployment、Step、逐 Component Release Receipt、Environment Observation、Component generation、能力快照及日志索引模型。
 - `HIS-02`：实现 `linux-ssh` Release 库存重建和追加式远端 JSONL 审计记录；Release manifest 由 `ART-01` 创建，由 `REL-01` 和恢复流程读取。
-- `REC-01`：在 `shipforge.yaml` 有效的前提下，通过 Driver `current/observe` 对账本地意图；`linux-ssh` 以每个 Component root 的静态 Deployment Marker 与远端文件系统事实处理非终态 Deployment、部分应用和数据库丢失，但不从远端重建 Project 配置。
+- `REC-01`：在 `shipforge.yaml` 有效的前提下，通过 Driver `inventory` 中的 current、归档及残留事实对账本地意图；`linux-ssh` 以每个 Component root 的静态 Deployment Marker 与远端文件系统事实解释非终态 Deployment、部分应用和数据库丢失，独立保存观察报告，不重放旧意图或从远端重建 Project 配置。
 - `RET-01`：实现基于引用的清理，自动保护每个 Component 的 current、上一健康版本及运行中操作引用的 Release。
 - `TUI-MGT-01`：实现项目与 Destination 管理、Release 查询、回滚、日志和恢复操作入口。
 

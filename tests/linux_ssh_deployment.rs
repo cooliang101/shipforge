@@ -10,7 +10,8 @@ use std::{
 use shipforge::{
     application::{
         DeploymentFailure, DeploymentReport, DeploymentSelection, DeploymentService,
-        OrchestrationStage, RollbackComponent, RollbackOrchestrator,
+        DeploymentSession, OrchestrationStage, RecoveryInspection, RecoveryService,
+        RollbackComponent, RollbackOrchestrator,
     },
     config::{
         ArtifactSpec, BuildCommand, ComponentSetup, CredentialRegistry, DestinationRegistry,
@@ -22,12 +23,15 @@ use shipforge::{
         ComponentExecutionContext, DeploymentDriver, DriverLog, DriverRegistry, EventSink,
         ReleaseRef,
         audit::{RemoteAuditOutcome, RemoteAuditPhase},
+        inventory::TemporaryRemnantKind,
         linux_ssh::{
             AuthenticatedSession, DeploymentMarker, LinuxSshDestination, LinuxSshDriver,
             LinuxSshTarget, connect_authenticated,
         },
     },
-    history::HistoryStore,
+    history::{
+        CurrentAlignment, DeploymentQuery, HistoryStore, PackageAlignment, ReleasePackageRecord,
+    },
     telemetry::{CommandArgument, CommandSpec, Redactor},
 };
 use tokio_util::sync::CancellationToken;
@@ -40,6 +44,8 @@ struct Fixture {
     destinations_path: PathBuf,
     history: PathBuf,
     driver: Arc<LinuxSshDriver>,
+    drivers: Arc<DriverRegistry>,
+    session: Arc<DeploymentSession>,
     service: DeploymentService,
 }
 
@@ -94,8 +100,9 @@ impl Fixture {
         let driver = Arc::new(LinuxSshDriver::new(Arc::new(credentials)));
         let mut registry = DriverRegistry::default();
         registry.register(driver.clone()).unwrap();
+        let drivers = Arc::new(registry);
         let history = scratch.path().join("history.sqlite3");
-        let service = DeploymentService::new(Arc::new(registry), history.clone());
+        let service = DeploymentService::new(Arc::clone(&drivers), history.clone());
         let destinations_path = scratch.path().join("destinations.yaml");
         destinations.save(&destinations_path).unwrap();
         let fixture = Self {
@@ -106,6 +113,8 @@ impl Fixture {
             destinations_path,
             history,
             driver,
+            drivers,
+            session: Arc::new(DeploymentSession::default()),
             service,
         };
         fixture.payload("frontend", "healthy");
@@ -143,9 +152,15 @@ impl Fixture {
             activation_events: Mutex::new(Vec::new()),
         };
         let report = self
-            .service
-            .execute(plan, &self.destinations_path, &progress, &cancellation)
+            .session
+            .run(Box::pin(self.service.execute(
+                plan,
+                &self.destinations_path,
+                &progress,
+                &cancellation,
+            )))
             .await
+            .expect("exclusive fixture Deployment session")
             .expect("real Linux deployment report");
         assert!(report.warnings.is_empty(), "{report:#?}");
         if cancel_on_backend {
@@ -373,6 +388,7 @@ async fn run_real_linux_acceptance() {
     assert!(cancelled.compensation_failures.is_empty());
     assert_eq!(fixture.observed().await, healthy);
     assert_history(&fixture.history);
+    verify_recovery_inspection(&fixture, &baseline.deployment.id).await;
     verify_inventory_and_audit(
         &fixture,
         &baseline.deployment.id,
@@ -380,6 +396,329 @@ async fn run_real_linux_acceptance() {
         &failure.deployment.id,
     )
     .await;
+}
+
+async fn verify_recovery_inspection(fixture: &Fixture, completed: &DeploymentId) {
+    let original = HistoryStore::open(&fixture.history)
+        .unwrap()
+        .recovery_basis(completed)
+        .unwrap();
+    let (history_path, interrupted, package) = interrupted_recovery_source(fixture, completed);
+    create_recovery_remnants(fixture, &interrupted).await;
+    let before_files = recovery_filesystem_snapshot(fixture).await;
+    let history = HistoryStore::open(&history_path).unwrap();
+    let before_history = history.recovery_basis(&interrupted).unwrap();
+    let selection = DeploymentSelection {
+        project_root: fixture.project.clone(),
+        config: fixture.config.clone(),
+        environment: "acceptance".into(),
+        components: [component("frontend")].into(),
+    };
+    let recovery = RecoveryService::new(
+        Arc::clone(&fixture.drivers),
+        history_path,
+        Arc::clone(&fixture.session),
+    );
+    let inspected = recovery
+        .inspect(
+            selection.clone(),
+            Some(interrupted.clone()),
+            &fixture.destinations_path,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("production recovery of an interrupted local source on real Linux");
+    assert_recovery_evidence(&inspected, &package, &interrupted, CurrentAlignment::Target);
+    assert_eq!(
+        inspected.report.components[0].package_alignment,
+        PackageAlignment::Matches
+    );
+    assert_eq!(
+        history.recovery_basis(&interrupted).unwrap(),
+        before_history
+    );
+    assert_eq!(history.pending_intents(&interrupted).unwrap().len(), 1);
+    assert_eq!(
+        history.deployment(&interrupted).unwrap().unwrap().state,
+        DeploymentState::Running
+    );
+    assert_eq!(
+        history.recovery_report(&inspected.report.id).unwrap(),
+        Some(inspected.report)
+    );
+    assert_eq!(
+        recovery_filesystem_snapshot(fixture).await,
+        before_files,
+        "inspection must not mutate remote filesystem facts"
+    );
+
+    verify_recovery_cache_only(fixture, &package, &interrupted, selection).await;
+    assert_eq!(
+        recovery_filesystem_snapshot(fixture).await,
+        before_files,
+        "cache rebuild must not change remote facts or remove remnants"
+    );
+    assert_eq!(
+        HistoryStore::open(&fixture.history)
+            .unwrap()
+            .recovery_basis(completed)
+            .unwrap(),
+        original
+    );
+    assert!(!fixture.session.is_active());
+}
+
+async fn verify_recovery_cache_only(
+    fixture: &Fixture,
+    package: &ReleasePackageRecord,
+    interrupted: &DeploymentId,
+    selection: DeploymentSelection,
+) {
+    let fresh_path = fixture.history.with_file_name("rebuilt-history.sqlite3");
+    assert!(!fresh_path.exists());
+    let service = RecoveryService::new(
+        Arc::clone(&fixture.drivers),
+        fresh_path.clone(),
+        Arc::clone(&fixture.session),
+    );
+    let inspected = service
+        .inspect(
+            selection,
+            None,
+            &fixture.destinations_path,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("production inventory-only cache rebuild on real Linux");
+    assert_recovery_evidence(
+        &inspected,
+        package,
+        interrupted,
+        CurrentAlignment::Unplanned,
+    );
+    assert_eq!(
+        inspected.report.components[0].package_alignment,
+        PackageAlignment::Unplanned
+    );
+    assert!(inspected.report.related_deployment.is_none());
+    let reopened = HistoryStore::open(&fresh_path).unwrap();
+    assert_eq!(
+        reopened.recovery_report(&inspected.report.id).unwrap(),
+        Some(inspected.report)
+    );
+    assert!(
+        reopened
+            .deployments(
+                &fixture.config.project_id,
+                &fixture.config.environments["acceptance"].id,
+                DeploymentQuery::default()
+            )
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn interrupted_recovery_source(
+    fixture: &Fixture,
+    completed: &DeploymentId,
+) -> (PathBuf, DeploymentId, ReleasePackageRecord) {
+    // Copy verified evidence into a separate fixture DB; never rewrite a completed Deployment.
+    let original = HistoryStore::open(&fixture.history).unwrap();
+    let mut snapshot = original
+        .component_snapshots(completed)
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.release.component == component("frontend"))
+        .unwrap();
+    snapshot.execution_order = 0;
+    let package = original
+        .release_packages(completed)
+        .unwrap()
+        .into_iter()
+        .find(|package| package.release.component == component("frontend"))
+        .unwrap();
+    assert_eq!(snapshot.target.as_ref(), Some(&package.release));
+    let path = fixture
+        .history
+        .with_file_name("interrupted-history.sqlite3");
+    assert!(!path.exists());
+    let history = HistoryStore::open(&path).unwrap();
+    let interrupted = DeploymentId::new();
+    history
+        .create_deployment(
+            &interrupted,
+            &snapshot.release.project_id,
+            &snapshot.release.environment_id,
+            1,
+        )
+        .unwrap();
+    history
+        .record_component_snapshots(&interrupted, &[snapshot])
+        .unwrap();
+    history
+        .plan_steps(&interrupted, &component("frontend"), &["activate"])
+        .unwrap();
+    history
+        .transition_deployment(
+            &interrupted,
+            DeploymentState::Created,
+            DeploymentState::Running,
+            2,
+        )
+        .unwrap();
+    history
+        .record_release_package(
+            &interrupted,
+            &package.release,
+            &package.manifest,
+            &package.sha256,
+            package.size,
+        )
+        .unwrap();
+    history
+        .record_intent(
+            &interrupted,
+            &component("frontend"),
+            "activate",
+            package.release.version.as_str(),
+            3,
+        )
+        .unwrap();
+    (path, interrupted, package)
+}
+
+async fn create_recovery_remnants(fixture: &Fixture, interrupted: &DeploymentId) {
+    let context = fixture.context("frontend");
+    let target = context
+        .target
+        .as_any()
+        .downcast_ref::<LinuxSshTarget>()
+        .unwrap();
+    assert_eq!(target.root, "/srv/shipforge-acceptance/frontend");
+    attest_fixture(
+        &fixture.destinations,
+        &context.destination,
+        &PathBuf::from(required_env("SHIPFORGE_TEST_KEY")),
+    )
+    .await;
+    let session = fixture.session("frontend").await;
+    assert!(
+        session
+            .check_deployment_marker(
+                target,
+                &DeploymentMarker::for_context(&context),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+    );
+    session.disconnect().await.unwrap();
+    // All destinations are inside the existing attested temporary directory. Link
+    // targets are deliberately dangling and never followed by either inventory or snapshot.
+    fixture
+        .remote(
+            "frontend",
+            "sh",
+            &[
+                "-c",
+                r#"set -eu
+test "$1" = /srv/shipforge-acceptance/frontend
+test -d "$1" && test ! -L "$1"
+test -d "$1/temporary" && test ! -L "$1/temporary"
+test -f "$1/.shipforge-project.json" && test ! -L "$1/.shipforge-project.json"
+for suffix in .tar.gz .dir .current .rollback-current; do
+  test ! -e "$1/temporary/$2$suffix" && test ! -L "$1/temporary/$2$suffix"
+done
+set -C
+printf '%s' fixture-partial-upload > "$1/temporary/$2.tar.gz"
+mkdir -- "$1/temporary/$2.dir"
+ln -s -- fixture-unpublished-current "$1/temporary/$2.current"
+ln -s -- fixture-unpublished-rollback "$1/temporary/$2.rollback-current"
+"#,
+                "fixture-recovery-remnants",
+                &target.root,
+                &interrupted.to_string(),
+            ],
+        )
+        .await;
+}
+
+async fn recovery_filesystem_snapshot(fixture: &Fixture) -> Vec<Vec<u8>> {
+    // atime is intentionally excluded: reads may update it. No-follow metadata
+    // (including inode/mtime/ctime/link targets) plus every regular-file digest
+    // detects replacement, publication, repair, cleanup, or payload writes.
+    let bytes = fixture
+        .remote(
+            "frontend",
+            "sh",
+            &[
+                "-c",
+                r#"set -eu
+test "$1" = /srv/shipforge-acceptance/frontend
+test -d "$1" && test ! -L "$1"
+find -P "$1" -xdev -printf '%P|%y|%i|%m|%U|%G|%s|%T@|%C@|%l\n'
+find -P "$1" -xdev -type f -exec sha256sum -- {} +
+"#,
+                "fixture-recovery-snapshot",
+                "/srv/shipforge-acceptance/frontend",
+            ],
+        )
+        .await;
+    // Sort locally, without a shell pipeline that could hide a failed remote scan.
+    let mut lines: Vec<_> = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+fn assert_recovery_evidence(
+    inspection: &RecoveryInspection,
+    package: &ReleasePackageRecord,
+    interrupted: &DeploymentId,
+    alignment: CurrentAlignment,
+) {
+    assert!(inspection.persistence_warning.is_none(), "{inspection:#?}");
+    assert_eq!(inspection.report.components.len(), 1);
+    let component = &inspection.report.components[0];
+    assert_eq!(component.scope, (&package.release).into());
+    assert_eq!(component.alignment, alignment);
+    let inventory = component
+        .inventory
+        .as_ref()
+        .expect("verified real Linux inventory");
+    assert_eq!(
+        inventory.releases.current,
+        Ok(Some(package.release.version.clone()))
+    );
+    let actual = inventory
+        .releases
+        .releases
+        .iter()
+        .find(|entry| entry.manifest.version == package.release.version)
+        .unwrap();
+    assert_eq!(actual.manifest, package.manifest);
+    assert_eq!(actual.sha256, package.sha256);
+    assert_eq!(actual.size, package.size);
+    assert!(actual.extracted);
+    assert!(!inventory.remnants.incomplete, "{inventory:#?}");
+    assert_eq!(inventory.remnants.entries.len(), 4);
+    for kind in [
+        TemporaryRemnantKind::UploadArchive,
+        TemporaryRemnantKind::ExtractedDirectory,
+        TemporaryRemnantKind::ActivationLink,
+        TemporaryRemnantKind::RollbackLink,
+    ] {
+        assert!(
+            inventory
+                .remnants
+                .entries
+                .iter()
+                .any(|entry| entry.kind == kind && entry.deployment.as_ref() == Some(interrupted)),
+            "{inventory:#?}"
+        );
+    }
 }
 
 async fn verify_inventory_and_audit(

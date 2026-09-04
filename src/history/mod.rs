@@ -5,9 +5,11 @@ mod store;
 
 pub use logs::{RollingLogError, RollingLogWriter};
 pub use store::{
-    DeploymentComponentSnapshot, DeploymentKind, DeploymentLogRecord, DeploymentMetadata,
-    DeploymentQuery, DeploymentRecord, GitWorktree, HistoryError, HistoryStore, IntentId,
-    IntentRecord, IntentStatus, ObservationRecord, PersistedComponentResult, ReleasePackageRecord,
+    CurrentAlignment, DeploymentComponentSnapshot, DeploymentKind, DeploymentLogRecord,
+    DeploymentMetadata, DeploymentQuery, DeploymentRecord, GitWorktree, HistoryError, HistoryStore,
+    InspectionScope, IntentId, IntentRecord, IntentStatus, LocalAttentionSummary,
+    ObservationRecord, PackageAlignment, PersistedComponentResult, RecoveryBasis,
+    RecoveryComponentReport, RecoveryQuery, RecoveryReport, ReleasePackageRecord,
     ReleaseReceiptRecord, StepRecord, StepStatus,
 };
 
