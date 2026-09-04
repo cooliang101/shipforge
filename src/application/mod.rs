@@ -11,6 +11,7 @@ mod orchestrator;
 mod planner;
 pub mod recovery;
 mod recovery_attention;
+mod retention;
 mod rollback;
 mod session;
 

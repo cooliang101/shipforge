@@ -212,6 +212,17 @@ impl DeploymentService {
                 },
             )
             .await?;
+        let mut notices = component_plan.notices.clone();
+        if component_plan
+            .plan
+            .effective_capabilities
+            .contains(Capability::Retention)
+        {
+            notices.push(format!(
+                "After success, keep the newest {} versions plus current, previous healthy, and referenced versions; safely eligible older versions may be removed.",
+                super::retention::DEFAULT_RETAIN_COUNT,
+            ));
+        }
         Ok(DeploymentPlanEntry {
             component: component.clone(),
             destination: summaries
@@ -226,7 +237,7 @@ impl DeploymentService {
                 .map(|release| release.version.clone()),
             release: component_plan.plan.release.version.clone(),
             config: component_config,
-            notices: component_plan.notices.clone(),
+            notices,
             planned: component_plan,
             destination_snapshot: destination_record.clone(),
         })

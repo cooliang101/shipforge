@@ -100,7 +100,8 @@ environments:
 - `systemd` 使用完整 `.service` unit 名，并自动增加一项必需的远端 systemd 稳定性检查。MVP 采用内置的 10 秒稳定窗口、1 秒间隔、5 次就绪尝试和单次 10 秒命令超时，不要求用户填写这些参数。
 - URL 形式的 `health` 是必需的 Destination 端 HTTP 检查；仅接受长度受限、无凭据和 fragment 的 `http://` 或 `https://` URL。检查由 Destination 上的 `curl` 发起且只接受 2xx；无外部接口的服务使用 systemd 稳定性检查。
 - `after` 只能引用同一 Environment 中已配置的 Component。它只排列本次同时选中的 Component，不会自动加入依赖项；只部署 `worker` 时，`after: [backend]` 不会部署 `backend`。未知引用、自引用和依赖环均为错误；无依赖项按名称稳定排序。
-- YAML 映射顺序不表示执行顺序；发布保留数量、版本格式和失败回滚使用产品默认值。
+- YAML 映射顺序不表示执行顺序；版本格式和失败回滚使用产品默认值。
+- 成功部署后默认保留每个所选 Component 最新 5 个 Release，并额外保护 current、上一健康版本及未结束/待核实操作的引用。无需填写保留数量；计划预览会提示自动清理，证据不足则保留，清理失败只警告、不回滚成功部署。
 
 加载阶段解析结构、默认值、身份和依赖图；构建完成后自动识别并校验构建输出类型，再冻结 Deployment Plan。任何校验错误都不得改写配置。
 

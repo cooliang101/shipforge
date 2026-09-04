@@ -11,6 +11,15 @@ use crate::{config::SshCredential, telemetry::CommandSpec};
 
 use super::{HostKeyVerifier, LinuxSshDestination, probe::connect_platform_agent};
 
+// Both fingerprint capture and authenticated sessions issue latency-sensitive
+// SSH exchanges. Keep all protocol/security defaults and only disable Nagle.
+pub(super) fn client_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        nodelay: true,
+        ..client::Config::default()
+    })
+}
+
 pub struct AuthenticatedSession {
     pub(super) handle: client::Handle<HostKeyVerifier>,
 }
@@ -171,7 +180,7 @@ async fn connect_and_authenticate(
     credential: &SshCredential,
 ) -> Result<AuthenticatedSession, SshConnectionError> {
     let mut handle = client::connect(
-        Arc::new(client::Config::default()),
+        client_config(),
         (destination.host.as_str(), destination.port),
         HostKeyVerifier::strict(destination.host_key.clone()),
     )
@@ -285,6 +294,17 @@ pub enum SshConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_client_config_changes_only_tcp_no_delay_from_protocol_defaults() {
+        let defaults = client::Config::default();
+        let mut configured = Arc::try_unwrap(client_config()).unwrap();
+        assert!(configured.nodelay);
+        configured.nodelay = defaults.nodelay;
+        // Config has no PartialEq; its derived Debug includes every public field,
+        // including negotiation, timeouts, limits, buffers and anonymous mode.
+        assert_eq!(format!("{configured:?}"), format!("{defaults:?}"));
+    }
 
     #[test]
     fn mvp_accepts_only_modern_non_rsa_algorithms() {

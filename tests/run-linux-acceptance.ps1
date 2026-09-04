@@ -1,5 +1,9 @@
 #requires -Version 7.0
-param([string]$Distribution = 'Ubuntu-22.04')
+param(
+    [string]$Distribution = 'Ubuntu-22.04',
+    [ValidateSet('All', 'Deployment', 'Retention', 'AutomaticRetention')]
+    [string]$Suite = 'All'
+)
 
 $ErrorActionPreference = 'Stop'
 $runId = [guid]::NewGuid().ToString('N')
@@ -21,6 +25,17 @@ function Invoke-FixtureDocker {
     $output = & wsl.exe -d $Distribution --exec docker -H unix:///var/run/docker.sock @Arguments
     if ($LASTEXITCODE -ne 0) { throw "Fixture Docker command failed ($($Arguments[0]))" }
     return $output
+}
+
+function Invoke-FixtureCase {
+    param([string]$Case)
+    # Cargo exits successfully even when a misspelled filter selects zero tests.
+    $listed = @(& cargo test --locked --test linux_ssh_deployment $Case -- --ignored --exact --list)
+    if ($LASTEXITCODE -ne 0 -or @($listed | Where-Object { $_ -eq "${Case}: test" }).Count -ne 1) {
+        throw "Expected exactly one available disposable Linux test: $Case"
+    }
+    & cargo test --locked --test linux_ssh_deployment $Case -- --ignored --exact --nocapture
+    if ($LASTEXITCODE -ne 0) { throw "Disposable Linux acceptance failed: $Case" }
 }
 
 function Complete-FixtureRun {
@@ -130,8 +145,19 @@ try {
     $env:SHIPFORGE_TEST_KEY = $key
     Push-Location $repository
     try {
-        & cargo test --test linux_ssh_deployment -- --ignored --nocapture
-        if ($LASTEXITCODE -ne 0) { throw 'Disposable Linux deployment acceptance failed' }
+        $cases = @()
+        if ($Suite -in @('All', 'Deployment')) {
+            $cases += 'real_linux_single_joint_rollback_health_failure_and_cancellation'
+        }
+        if ($Suite -in @('All', 'Retention')) {
+            $cases += 'real_linux_exact_retention_partial_and_archive_only_retry'
+        }
+        if ($Suite -in @('All', 'AutomaticRetention')) {
+            $cases += 'real_linux_automatic_retention_keeps_latest_five'
+        }
+        foreach ($case in $cases) {
+            Invoke-FixtureCase -Case $case
+        }
     } finally { Pop-Location }
 } catch {
     $operationError = $_

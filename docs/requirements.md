@@ -5,8 +5,8 @@
 - 产品名称：ShipForge
 - 产品类型：本地运行的前后端应用发布部署助手
 - 目标形态：交互式终端界面（TUI）
-- 当前阶段：MVP 实施 / M1 已验收，M2 的 HIS-01 本地历史、HIS-02 远端库存/审计及 REC-01 只读对账已完成；保留策略与历史/恢复管理界面待实施（证据见路线图）
-- 文档版本：v0.10
+- 当前阶段：MVP 实施 / M1 已验收，M2 的 HIS-01、HIS-02、REC-01、RET-01 已验收；完整历史/恢复管理界面待实施，M2/M3/M4 尚未完成（证据见路线图）
+- 文档版本：v0.11
 - 更新日期：2026-09-04
 
 ## 2. 产品背景
@@ -75,7 +75,7 @@ MVP 仅支持以下范围：
 - 服务管理：可选 systemd unit；
 - 发布策略：每个 Component 一个带版本号和 SHA-256 的 `tar.gz` Release，解压后通过该 Component 的 `current` 软链接原子切换；
 - 健康检查：Destination 端 HTTP/HTTPS 和 systemd 稳定性检查；
-- 版本管理：每个 Component 保留最近 N 个 Release，并保护当前版本和上一个健康版本；
+- 版本管理：每个 Component 默认保留最新 5 个 Release，并额外保护当前版本、上一个健康版本和未结束/待核实操作引用；
 - 操作方式：Ratatui TUI；启动可执行文件后，所有用户操作均在界面内完成。
 
 ## 6. 核心用户流程
@@ -106,7 +106,7 @@ MVP 仅支持以下范围：
 11. `linux-ssh` Driver 保存带版本号的压缩包，并解压到该 Component 的版本目录。
 12. 所有选中 Release 准备完成后，系统按计划逐一切换各 Component 的 `current` 软链接并重启其服务。
 13. 系统执行本次所选 Component 的健康检查。
-14. 全部成功时记录各 Component Release 结果并清理过期版本；失败时按实际激活顺序逆序恢复已操作 Component，并记录逐 Component 结果或需人工介入。
+14. 全部成功且结果落盘后，按预览提示尝试清理所选 Component 的过期版本；清理失败只警告，不撤销成功部署。激活或健康检查失败时，按实际激活顺序逆序恢复已操作 Component，并记录逐 Component 结果或需人工介入。
 
 ### 6.3 MVP `linux-ssh` 回滚流程
 
@@ -204,7 +204,7 @@ Destination 通过 TUI 连接管理页写入用户级注册表，系统自动生
 
 - 应用层只通过统一 Deployment Driver SPI 发起预检、规划、准备、激活、观察、库存查询、回滚、日志和清理操作，不得直接依赖 SSH/SFTP 或供应商客户端。
 - Driver 是内部代码边界，不是用户概念。TUI 使用“SSH 连接”和“部署目标”，`shipforge.yaml` 不出现 Driver 类型、能力名、供应商对象或传输参数。内部类型和诊断步骤可标识 Driver，但普通 TUI 文案不得要求用户理解它。
-- MVP Driver 只声明已经实现的准备、激活、回滚、观察、库存查询和取消等能力；远端日志、清理在相应工作包实现后才可声明。本地构建与标准 Release 归档属于 Driver 之前的通用流程。托管平台所需能力在对应 Driver 立项时扩展。
+- MVP Driver 只声明已经实现的准备、激活、回滚、观察、库存查询、保留清理和取消等能力；远端日志尚不声明。本地构建与标准 Release 归档属于 Driver 之前的通用流程。托管平台所需能力在对应 Driver 立项时扩展。
 - 当发布策略需要 Driver 不支持的能力时，生成计划阶段必须失败并给出原因。
 - 用户级 Destination 记录以内部类型标签选择实现，并由对应 Driver 执行字段级校验；Environment/Component 的项目专属字段在解析 Destination 后联合校验。内部标签不得复制到项目 YAML。
 - Driver 的每个读取或副作用操作都必须接收同一个不可序列化 `ComponentExecutionContext`。通用部分只包含 Project/Environment ID、Component 名称与 generation、Destination ID/revision 和端点指纹；凭据及经 Driver 校验的非秘密目标配置以不透明句柄传入。host、port、user、Host Key、远端 root 和 systemd 等字段只由 `linux-ssh` 解释，应用层不得读取或复制这些 Driver 专属字段。
@@ -332,11 +332,17 @@ Release 本身是不可变的 `<version>.tar.gz` 压缩包及其中的 manifest�
 
 远端 JSONL 只追加逐 Component 阶段证据，不表示整个 Deployment 成功。损坏、截断、重复冲突、未知格式或读取上限必须产生不完整提示；缺失审计不妨碍重建可验证的归档库存。Prepare 审计失败停止后续激活；激活或回滚生效后的辅助审计失败只附加警告，不覆盖已知结果，不阻止安全补偿。审计中不保存凭据、连接设置、路径、URL 或原始输出。
 
-Release 只在 Driver 声明支持清理时处理。`linux-ssh` 清理必须保护：
+Release 只在目标有效能力支持清理时处理。全部所选 Component 成功且结果落盘后，系统默认保留每个 Component 最新 5 个 Release，并额外保护：
 
 - 每个 Component 的当前 Release；
 - 每个 Component 的上一个健康 Release；
-- 被运行中 Deployment 或 Rollback Deployment 引用的 Release。
+- 被未结束 Deployment、Rollback Deployment 或待核实意图引用的 Release，包括所属 Deployment 已终态的 pending 意图。
+
+“最新”按 manifest 创建时间、版本号降序稳定排列；上一健康版本按本地健康观察的写入顺序确定，必须属于相同 Component generation、Destination 和端点，不能由 current 或准备成功推断。原历史修订和能力快照保持不变；自动清理不借用当前连接处理其他 revision 的旧版本。
+
+每个删除候选必须有本地原始包记录与远端 manifest、SHA-256、大小一致的证据，以及新持久化意图。删除前复核保护引用、配置与预期 current；本地历史缺失/损坏/超限、库存冲突或未知、临时残留不明确时不删除。数据库丢失后的库存缓存不是历史删除授权；辅助 JSONL 只能增加保护或否决冲突。
+
+`linux-ssh` 逐版本先删解压目录、再删压缩包，仅操作准确候选，不修改 current、服务、Marker、审计或临时文件。路径、元数据、链接和挂载检查失败即停止。部分失败分别记录两条路径的已知/未知状态；未知结果保留 pending 意图，后续只读对账不能完成或重放它。清理取消、超时或写入结果失败均停止后续清理，不补偿已成功部署；新的清理操作须重新规划和记录意图。
 
 ### 7.9 日志
 
@@ -425,7 +431,7 @@ MVP 不提供用于部署的无头 CLI、`--yes`、JSON 命令输出、AI Agent 
 
 Component root 必须是规范化绝对路径；同一 Destination 上不同 Component 的 root 不得相同或相互嵌套，并须避开 ShipForge 保留目录。
 
-激活与健康校验完成并记录结果后，ShipForge 关闭 SSH 连接，不保留任何常驻控制进程；已部署服务独立运行。
+激活与健康校验完成、记录结果并结束本次可选清理后，ShipForge 关闭 SSH 连接，不保留任何常驻控制进程；已部署服务独立运行。
 
 ## 9. 非功能需求
 

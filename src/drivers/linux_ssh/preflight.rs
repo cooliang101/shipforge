@@ -13,6 +13,23 @@ use super::{AuthenticatedSession, LinuxSshTarget, RemoteCommandOutput, SshConnec
 const TOOL_CHECK: &str = "for tool do command -v \"$tool\" >/dev/null || exit 1; done";
 const ROOT_CHECK: &str = "path=$1; while ! test -e \"$path\"; do test ! -L \"$path\" || exit 1; path=${path%/*}; test -n \"$path\" || path=/; done; test -d \"$path\" && test -w \"$path\" && test -x \"$path\" || exit 1; printf '%s\\n' \"$path\"";
 const DESCRIPTOR_CHECK: &str = "exec 3< /proc/self/status; test -f /proc/self/fd/3 && test -r /proc/self/fd/3 && head -c 1 /proc/self/fd/3 >/dev/null";
+// Fixed read-only kernel paths and stdin only: no test files or deletion probes.
+// Execute through GNU timeout as well as the cancellable client command deadline.
+const RETENTION_CHECK: &str = r#"set -eu
+export LC_ALL=C
+if (false | true); then exit 1; fi
+exec 3< /
+test -d /proc/self/fd/3
+test "$(stat -L -c '%d:%i:%s:%y:%z:%h:%f' -- /proc/self/fd/3)" = "$(stat -c '%d:%i:%s:%y:%z:%h:%f' -- /)"
+test -r /proc/self/mountinfo
+test -n "$(head -c 1 -- /proc/self/mountinfo)"
+test "$(find -P /proc/self/status -maxdepth 0 -xdev -printf '%D:%y:%s')" = "$(stat -c '%d:f:%s' -- /proc/self/status)"
+test "$(printf 12 | head -c 1)" = 1
+test "$(printf '%s' 'a b\c' | sed -e 's/\\/\\134/g' -e 's/ /\\040/g')" = 'a\040b\134c'
+printf '1:f:2\n1:d:3\n' | awk -F: '{ if (NF!=3 || $1!=1 || ($2!="f" && $2!="d") || $3!~/^[0-9]+$/) exit 1; total+=$3; } END { if (NR!=2 || total!=5) exit 1; }'
+printf 'shipforge-retention-tools-v1\n'
+"#;
+const RETENTION_CHECK_OUTPUT: &str = "shipforge-retention-tools-v1\n";
 const TOOLS: &[&str] = &[
     "test",
     "printf",
@@ -29,6 +46,9 @@ const TOOLS: &[&str] = &[
     "head",
     "timeout",
     "dd",
+    "bash",
+    "awk",
+    "sed",
 ];
 
 /// Checks tools, filesystem capacity, and configured service/health clients.
@@ -102,6 +122,7 @@ async fn check_with_remote<R: PreflightRemote>(
     if !descriptor.is_empty() {
         return Err(PreflightError::InvalidOutput("Linux descriptor filesystem"));
     }
+    check_retention_tools(remote, timeout, cancellation).await?;
     let capacity = probe_capacity(remote, target, timeout, cancellation).await?;
     if capacity.available_bytes == 0 || capacity.available_inodes == Some(0) {
         return Err(PreflightError::NoSpace);
@@ -116,6 +137,7 @@ async fn check_with_remote<R: PreflightRemote>(
         format!("Remote filesystem at {}: {} bytes available; {inodes} (planning snapshot; archive size is not yet known)", capacity.parent, capacity.available_bytes),
         "GNU tar extraction, ln symlinks and mv no-clobber/no-target-directory options checked; same-filesystem atomic switching is checked again before activation".into(),
         "Bounded remote timeout, append-only dd and readable Linux descriptor paths checked without creating files".into(),
+        "Retention GNU rm options, Bash pipefail, bounded find/awk/sed and directory descriptors/mountinfo checked without creating files".into(),
     ])
 }
 
@@ -180,6 +202,10 @@ async fn check_features<R: PreflightRemote>(
             "dd",
             &["oflag=", "conv=", "status=", "append", "notrunc", "none"][..],
         ),
+        (
+            "rm",
+            &["--recursive", "--one-file-system", "--preserve-root[=all]"][..],
+        ),
     ] {
         let output = run(remote, tool, tool, &["--help"], timeout, cancellation).await?;
         for option in options {
@@ -187,6 +213,36 @@ async fn check_features<R: PreflightRemote>(
                 return Err(PreflightError::UnsupportedOption { tool, option });
             }
         }
+    }
+    Ok(())
+}
+
+async fn check_retention_tools<R: PreflightRemote>(
+    remote: &R,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<(), PreflightError> {
+    let output = run(
+        remote,
+        "retention tool semantics",
+        "timeout",
+        &[
+            "--signal=TERM",
+            "--kill-after=1s",
+            "5s",
+            "bash",
+            "-o",
+            "pipefail",
+            "-c",
+            RETENTION_CHECK,
+            "shipforge-preflight-retention",
+        ],
+        timeout,
+        cancellation,
+    )
+    .await?;
+    if output != RETENTION_CHECK_OUTPUT {
+        return Err(PreflightError::InvalidOutput("retention tool semantics"));
     }
     Ok(())
 }

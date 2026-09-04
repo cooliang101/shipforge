@@ -14,6 +14,19 @@ use crate::{
 
 const PROJECT: &str = include_str!("../../../docs/examples/shipforge.yaml");
 
+fn cleanup_candidate(component: &DeploymentComponent) -> crate::drivers::CleanupCandidate {
+    crate::drivers::CleanupCandidate {
+        release: crate::application::orchestrator::planned_release_ref(&component.planned),
+        package: crate::drivers::inventory::InventoryRelease {
+            manifest: component.package.manifest().clone(),
+            sha256: component.package.sha256().into(),
+            size: component.package.size(),
+            extracted: true,
+        },
+        expected_current: None,
+    }
+}
+
 #[derive(Debug)]
 struct Settings(DriverKind);
 
@@ -360,6 +373,7 @@ async fn unchanged_snapshot_forwards_mutations_with_replaced_cancellation_tokens
             &RetentionPolicy {
                 protected_versions: BTreeSet::new(),
                 retain_count: 1,
+                candidate: cleanup_candidate(&component),
             },
         )
         .await
@@ -546,6 +560,7 @@ async fn changed_credential_with_unchanged_endpoint_blocks_rollback_and_cleanup(
                 &RetentionPolicy {
                     protected_versions: BTreeSet::new(),
                     retain_count: 1,
+                    candidate: cleanup_candidate(&component),
                 }
             )
             .await

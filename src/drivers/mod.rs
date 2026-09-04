@@ -364,12 +364,39 @@ pub struct ComponentInventory {
 pub struct RetentionPolicy {
     pub protected_versions: BTreeSet<ReleaseVersion>,
     pub retain_count: usize,
+    /// One exact, previously observed candidate; a Driver must not expand it.
+    pub candidate: CleanupCandidate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupCandidate {
+    pub release: ReleaseRef,
+    pub package: inventory::InventoryRelease,
+    /// Confirmed absence is `None`; unknown current must never authorize cleanup.
+    pub expected_current: Option<ReleaseVersion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupPathState {
+    Absent,
+    Present,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupPartial {
+    pub version: ReleaseVersion,
+    pub archive: CleanupPathState,
+    pub directory: CleanupPathState,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct CleanupReport {
     pub removed: Vec<ReleaseVersion>,
     pub retained: Vec<ReleaseVersion>,
+    /// Preserve independent path facts after interruption or a partial deletion.
+    pub partial: Vec<CleanupPartial>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::HostKeyFingerprint;
 
-use super::connection::supported_algorithm;
+use super::connection::{client_config, supported_algorithm};
 
 /// Performs only the SSH handshake needed to obtain a server Host Key.
 ///
@@ -42,11 +42,7 @@ pub async fn capture_host_key(
         return Err(SshProbeError::Cancelled);
     }
     let verifier = HostKeyVerifier::capture();
-    let connect = client::connect(
-        Arc::new(client::Config::default()),
-        (host, port),
-        verifier.clone(),
-    );
+    let connect = client::connect(client_config(), (host, port), verifier.clone());
     let result = tokio::select! {
         () = cancellation.cancelled() => return Err(SshProbeError::Cancelled),
         result = tokio::time::timeout(timeout, connect) => result,

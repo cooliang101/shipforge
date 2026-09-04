@@ -3,7 +3,7 @@ use std::io::Read as _;
 use std::num::NonZeroU8;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use russh::{
     Channel, ChannelId,
@@ -71,7 +71,58 @@ impl server::Server for ProtocolServer {
     type Handler = Self;
 
     fn new_client(&mut self, _peer_addr: Option<std::net::SocketAddr>) -> Self {
-        self.clone()
+        Self {
+            commands: Arc::clone(&self.commands),
+            // Channel identifiers are local to an SSH connection.
+            channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            transfer: Arc::clone(&self.transfer),
+        }
+    }
+}
+
+#[tokio::test]
+async fn protocol_handlers_isolate_channels_and_share_fixture_facts() {
+    let mut server = ProtocolServer::default();
+    let first = server.new_client(None);
+    let second = server.new_client(None);
+    assert!(!Arc::ptr_eq(&server.channels, &first.channels));
+    assert!(!Arc::ptr_eq(&server.channels, &second.channels));
+    assert!(!Arc::ptr_eq(&first.channels, &second.channels));
+    for handler in [&first, &second] {
+        assert!(Arc::ptr_eq(&server.commands, &handler.commands));
+        assert!(Arc::ptr_eq(&server.transfer, &handler.transfer));
+    }
+    let first_channels = first.channels.lock().await;
+    assert!(server.channels.try_lock().is_ok());
+    assert!(second.channels.try_lock().is_ok());
+    drop(first_channels);
+
+    first
+        .commands
+        .lock()
+        .unwrap()
+        .push("fixture command".into());
+    first
+        .transfer
+        .lock()
+        .await
+        .files
+        .insert("/fixture/shared".into(), b"shared".to_vec());
+    for handler in [&server, &second] {
+        assert_eq!(
+            *handler.commands.lock().unwrap(),
+            vec!["fixture command".to_owned()]
+        );
+        assert_eq!(
+            handler
+                .transfer
+                .lock()
+                .await
+                .files
+                .get("/fixture/shared")
+                .map(Vec::as_slice),
+            Some(&b"shared"[..])
+        );
     }
 }
 
@@ -1710,7 +1761,11 @@ async fn validate_production_driver(
     base_release: &ComponentRelease,
     cancellation: &CancellationToken,
     transfer: &Arc<AsyncMutex<TransferState>>,
+    commands: &Arc<Mutex<Vec<String>>>,
 ) {
+    let started = Instant::now();
+    let phase = |stage| report_protocol_phase(started, commands, stage);
+    phase("driver.start");
     let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let identity_path = directory.join("driver_id_ed25519");
     std::fs::write(
@@ -1785,6 +1840,7 @@ async fn validate_production_driver(
         )
         .await
         .unwrap();
+    phase("driver.plan.done");
     let artifact = directory.join("driver-server-binary");
     std::fs::write(&artifact, "production adapter").unwrap();
     let package = package_release(
@@ -1800,7 +1856,9 @@ async fn validate_production_driver(
     )
     .unwrap();
     let deployment = DeploymentId::new();
+    phase("driver.prepare-drift.before");
     validate_prepare_drift(&planned, &package, transfer).await;
+    phase("driver.prepare-drift.done");
     let prepared = planned
         .driver
         .prepare(
@@ -1812,6 +1870,7 @@ async fn validate_production_driver(
         )
         .await
         .unwrap();
+    phase("driver.prepare.done");
     let activated = planned
         .driver
         .activate(&deployment, &planned.context, &prepared.release)
@@ -1820,8 +1879,13 @@ async fn validate_production_driver(
     assert_eq!(activated.current.as_ref(), Some(&prepared.release));
     assert!(activated.healthy);
     assert!(activated.warnings.is_empty());
+    phase("driver.activate.done");
+    phase("driver.inventory.before");
     validate_driver_inventory(&planned, &package, transfer).await;
+    phase("driver.inventory.done");
+    phase("driver.remnants.before");
     validate_driver_remnants(&planned, transfer).await;
+    phase("driver.remnants.done");
 
     let previous = ReleaseRef {
         driver: prepared.release.driver.clone(),
@@ -1850,6 +1914,7 @@ async fn validate_production_driver(
         planned.driver.current(&planned.context).await.unwrap(),
         Some(prepared.release.clone())
     );
+    phase("driver.rollback-drift.done");
     let rolled_back = planned
         .driver
         .rollback(
@@ -1862,7 +1927,10 @@ async fn validate_production_driver(
         .unwrap();
     assert_eq!(rolled_back.current, Some(previous.clone()));
     assert!(rolled_back.healthy);
+    phase("driver.rollback.done");
+    phase("driver.undeploy.before");
     validate_undeploy_preserves_original_audit_ref(&planned, &previous).await;
+    phase("driver.undeploy.done");
     assert_eq!(
         planned.driver.current(&planned.context).await.unwrap(),
         None
@@ -1889,6 +1957,7 @@ async fn validate_production_driver(
         planned.driver.current(&planned.context).await.unwrap(),
         Some(previous)
     );
+    phase("driver.restore.done");
 }
 
 async fn validate_undeploy_preserves_original_audit_ref(
@@ -2109,6 +2178,14 @@ async fn validate_driver_inventory(
     transfer.lock().await.files.insert(archive_path, bytes);
 }
 
+fn report_protocol_phase(started: Instant, commands: &Mutex<Vec<String>>, stage: &str) {
+    let command_count = commands.lock().unwrap().len();
+    eprintln!(
+        "protocol phase={stage} elapsed_ms={} commands={command_count}",
+        started.elapsed().as_millis()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
@@ -2120,6 +2197,8 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
     let config = Arc::new(server::Config {
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
+        // Send the loopback fixture's immediate protocol responses without Nagle buffering.
+        nodelay: true,
         keys: vec![host_key],
         ..server::Config::default()
     });
@@ -2139,12 +2218,18 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
     let running = server.run_on_socket(config, &listener);
     let shutdown = running.handle();
     let client = async {
+        let started = Instant::now();
+        let phase = |stage| report_protocol_phase(started, &commands, stage);
+        phase("main.start");
         let directory = tempfile::tempdir().unwrap();
         let cancellation = CancellationToken::new();
         let session =
             connect_client(address, &host_fingerprint, directory.path(), &cancellation).await;
+        phase("main.connect.done");
         validate_exec(&session, &cancellation).await;
+        phase("main.exec.done");
         validate_transfer(&session, directory.path(), &cancellation, &transfer).await;
+        phase("main.transfer.done");
         let deployment = DeploymentId::new();
         let activation = validate_release_prepare(
             &session,
@@ -2154,6 +2239,7 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
             &deployment,
         )
         .await;
+        phase("main.prepare.done");
         transfer.lock().await.health_status = 503;
         let health_failure = session
             .verify_activation_health(
@@ -2190,7 +2276,9 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
                 .unwrap(),
             None
         );
+        phase("main.compensation.done");
         validate_probe(&session, &cancellation).await;
+        phase("main.probe.done");
         transfer.lock().await.health_status = 204;
         // The earlier low-level activation fixture represents an existing deployment.
         transfer.lock().await.files.insert(
@@ -2199,6 +2287,7 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
                 .encode()
                 .unwrap(),
         );
+        phase("main.production-driver.before");
         validate_production_driver(
             address,
             &host_fingerprint,
@@ -2206,9 +2295,12 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
             activation.release(),
             &cancellation,
             &transfer,
+            &commands,
         )
         .await;
+        phase("main.production-driver.done");
         validate_marker_reads(&session, &transfer, activation.release(), &cancellation).await;
+        phase("main.marker.done");
         validate_layout_and_manifest_safety(
             &session,
             &transfer,
@@ -2216,8 +2308,10 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
             &cancellation,
         )
         .await;
+        phase("main.layout.done");
         session.disconnect().await.unwrap();
 
+        phase("main.service.before");
         deployment_service::validate(
             address,
             &host_fingerprint,
@@ -2226,6 +2320,7 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
             &commands,
         )
         .await;
+        phase("main.service.done");
 
         let commands = commands.lock().unwrap().clone();
         assert_eq!(

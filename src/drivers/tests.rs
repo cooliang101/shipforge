@@ -295,6 +295,16 @@ async fn fake_driver_contract_propagates_context_through_every_operation() {
             &RetentionPolicy {
                 protected_versions: BTreeSet::new(),
                 retain_count: 2,
+                candidate: CleanupCandidate {
+                    release: prepared.release.clone(),
+                    package: inventory::InventoryRelease {
+                        manifest: package.manifest().clone(),
+                        sha256: package.sha256().into(),
+                        size: package.size(),
+                        extracted: true,
+                    },
+                    expected_current: None,
+                },
             },
         )
         .await

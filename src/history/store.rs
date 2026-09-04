@@ -18,6 +18,8 @@ mod details;
 pub use details::*;
 mod recovery;
 pub use recovery::*;
+mod retention;
+pub use retention::RetentionHistory;
 
 const LATEST_SCHEMA_VERSION: u32 = 6;
 const MIGRATION_1: &str = r"

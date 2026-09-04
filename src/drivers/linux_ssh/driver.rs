@@ -597,13 +597,23 @@ impl DeploymentDriver for LinuxSshDriver {
     async fn cleanup(
         &self,
         context: &ComponentExecutionContext,
-        _policy: &RetentionPolicy,
+        policy: &RetentionPolicy,
     ) -> Result<CleanupReport, DriverError> {
-        Err(error(
-            "cleanup",
-            &context.component,
-            "Release retention is not implemented",
-        ))
+        super::retention::validate_candidate(context, policy)
+            .map_err(|source| operation_error("cleanup", context, source))?;
+        let (destination, target, credential) = self.settings(context)?;
+        let session = connect_authenticated(
+            destination,
+            &credential,
+            CONNECTION_TIMEOUT,
+            &context.cancellation,
+        )
+        .await
+        .map_err(|source| operation_error("connect", context, source))?;
+        session
+            .cleanup_release(target, context, policy)
+            .await
+            .map_err(|source| operation_error("cleanup", context, source))
     }
 }
 
@@ -638,6 +648,7 @@ fn capabilities() -> DriverCapabilities {
         Capability::Inventory,
         Capability::Rollback,
         Capability::Cancellation,
+        Capability::Retention,
     ])
 }
 
@@ -882,7 +893,7 @@ mod tests {
             assert!(capabilities.contains(capability));
         }
         assert!(!capabilities.contains(Capability::RemoteLogs));
-        assert!(!capabilities.contains(Capability::Retention));
+        assert!(capabilities.contains(Capability::Retention));
     }
 
     #[test]

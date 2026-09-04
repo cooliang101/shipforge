@@ -234,6 +234,21 @@ impl<'a> DeploymentOrchestrator<'a> {
             );
         }
         self.persist_results(&deployment, None, &BTreeMap::new());
+        // Retention is a post-success maintenance step, not an activation effect.
+        // Never delete after incomplete durability or compensate a healthy release
+        // merely because removing an old, unreferenced version failed.
+        if self.history_warnings.borrow().is_empty() {
+            let warnings = super::retention::RetentionRun {
+                history: self.history,
+                clock: &self.clock,
+                redactor: &self.redactor,
+                events,
+                cancellation,
+            }
+            .run(&deployment.id, &components)
+            .await;
+            self.driver_warnings.borrow_mut().extend(warnings);
+        }
         self.remember_history_error(
             self.history
                 .transition_deployment(

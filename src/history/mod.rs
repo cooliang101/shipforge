@@ -10,7 +10,7 @@ pub use store::{
     InspectionScope, IntentId, IntentRecord, IntentStatus, LocalAttentionSummary,
     ObservationRecord, PackageAlignment, PersistedComponentResult, RecoveryBasis,
     RecoveryComponentReport, RecoveryQuery, RecoveryReport, ReleasePackageRecord,
-    ReleaseReceiptRecord, StepRecord, StepStatus,
+    ReleaseReceiptRecord, RetentionHistory, StepRecord, StepStatus,
 };
 
 /// Returns the platform-local history database path.

@@ -8,7 +8,7 @@ $tokens = $null
 $runner = Join-Path $PSScriptRoot 'run-linux-acceptance.ps1'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($runner, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw "Runner syntax errors: $parseErrors" }
-foreach ($name in @('Invoke-FixtureDocker', 'Complete-FixtureRun')) {
+foreach ($name in @('Invoke-FixtureDocker', 'Invoke-FixtureCase', 'Complete-FixtureRun')) {
     $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $false)
     if ($null -eq $definition) { throw "Missing cleanup function $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
@@ -18,6 +18,26 @@ function Assert-Cleanup {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
 }
+
+# No native Cargo process: validate exact test discovery and execution failures.
+$script:caseCalls = 0
+$script:caseListing = @()
+$script:caseExit = 0
+function cargo {
+    $script:caseCalls++
+    if ($args -contains '--list') { $global:LASTEXITCODE = 0; return $script:caseListing }
+    $global:LASTEXITCODE = $script:caseExit
+}
+$noMatchRejected = $false
+try { Invoke-FixtureCase -Case 'fixture_case' } catch { $noMatchRejected = $true }
+Assert-Cleanup ($noMatchRejected -and $script:caseCalls -eq 1) 'Zero matching tests must fail before execution'
+$script:caseListing = @('fixture_case: test', '1 test, 0 benchmarks')
+Invoke-FixtureCase -Case 'fixture_case'
+Assert-Cleanup ($script:caseCalls -eq 3) 'Exactly one discovered case must execute once'
+$script:caseExit = 7
+$failedCaseRejected = $false
+try { Invoke-FixtureCase -Case 'fixture_case' } catch { $failedCaseRejected = $true }
+Assert-Cleanup $failedCaseRejected 'Nonzero test execution must fail the runner'
 
 # Check the production native-command wrapper without invoking a native process.
 function wsl.exe { $global:LASTEXITCODE = 29; return 'simulated Docker failure' }
@@ -140,4 +160,4 @@ try {
         [Environment]::SetEnvironmentVariable('SHIPFORGE_CLEANUP_TEST_SENTINEL', [System.Management.Automation.Language.NullString]::Value, 'Process')
     } else { [Environment]::SetEnvironmentVariable('SHIPFORGE_CLEANUP_TEST_SENTINEL', $script:originalSentinel, 'Process') }
 }
-Write-Output 'Passed: native exit status and six isolated cleanup scenarios'
+Write-Output 'Passed: exact test discovery/execution, native exit status and six isolated cleanup scenarios'

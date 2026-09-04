@@ -7,6 +7,7 @@ ShipForge uses `russh` and `russh-sftp` for the built-in `linux-ssh` Driver. It 
 ## Verified in Code
 
 - Host Keys are never accepted implicitly. Capture mode records a fingerprint while rejecting the first connection; strict mode accepts only the fingerprint confirmed through the TUI.
+- Fingerprint capture and authenticated connections share a client configuration with TCP `nodelay` enabled; protocol, authentication and timeout defaults are otherwise unchanged. This avoids cumulative small-packet delays in sequential command exchanges. The Linux loopback regression retains its original 180-second deadline; RET-01's controlled client-only comparison completed the full case in 4.16 seconds after the baseline timed out.
 - Unix Agent sockets, Windows OpenSSH named pipes, and Pageant have explicit discovery paths. Agent identities expose only fingerprint, comment, and certificate status to selection UI.
 - Agent discovery observes a cancellation token and does not contact a deployment Destination.
 - SSH config discovery reads only concrete direct `Host` blocks and treats the result as editable TUI candidates. `Include`, `Match`, wildcards, and `ProxyJump` are intentionally outside the MVP.
