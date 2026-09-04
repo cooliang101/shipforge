@@ -1,0 +1,10 @@
+pub mod adapters;
+pub mod application;
+pub mod bootstrap;
+pub mod config;
+pub mod domain;
+pub mod drivers;
+pub mod history;
+pub mod projects;
+pub mod telemetry;
+pub mod tui;

@@ -1,0 +1,48 @@
+# Example only. The TUI generates and maintains this section.
+schemaVersion: 1
+_shipforge:
+  projectId: prj_01J8MALL4Y2K6M7P
+  environments:
+    production:
+      id: env_01J8PROD8V5F3Q1N
+      components:
+        frontend:
+          generation: 1
+          resolvedRoot: /srv/shipforge/mall/production/frontend
+        backend:
+          generation: 1
+          resolvedRoot: /srv/shipforge/mall/production/backend
+        worker:
+          generation: 1
+          resolvedRoot: /srv/shipforge/mall/production/worker
+
+project: mall
+
+components:
+  frontend:
+    build:
+      - [npm, ci]
+      - [npm, run, build]
+    artifact: dist
+  backend:
+    build:
+      - [go, build, -o, build/server, ./cmd/server]
+    artifact: build/server
+  worker:
+    build:
+      - [go, build, -o, build/worker, ./cmd/worker]
+    artifact: build/worker
+
+environments:
+  production:
+    components:
+      frontend:
+        to: dst_00000000000000000000000000000001
+      backend:
+        to: dst_00000000000000000000000000000002
+        systemd: mall-api.service
+        health: http://127.0.0.1:8080/health
+      worker:
+        to: dst_00000000000000000000000000000002
+        systemd: mall-worker.service
+        after: [backend]
