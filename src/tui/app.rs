@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -18,6 +18,8 @@ mod connections;
 mod logs;
 mod management;
 mod navigation;
+#[cfg(test)]
+mod performance_tests;
 mod project_edit;
 mod reinitialize;
 mod remote_target;
@@ -77,14 +79,12 @@ pub(super) enum Screen {
         config: ProjectConfig,
         cancellation: tokio_util::sync::CancellationToken,
         cancellation_requested: bool,
-        logs: VecDeque<DriverLog>,
     },
     DeploymentFinished {
         root: PathBuf,
         config: ProjectConfig,
         summary: String,
         scroll: u16,
-        logs: VecDeque<DriverLog>,
     },
     SetupComponents(ComponentSetupState),
     ManualComponent(setup_manual::ManualComponentScreen),
@@ -288,6 +288,22 @@ enum BackgroundEvent {
     Authentication(uuid::Uuid, Result<RemoteSetupCandidates, String>),
     DeploymentPlan(uuid::Uuid, Result<DeploymentPlan, String>),
     DeploymentFinished(uuid::Uuid, Result<DeploymentReport, String>),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::tui) struct BackgroundPoll {
+    changed: bool,
+    frame_boundary: bool,
+}
+
+impl BackgroundPoll {
+    pub(in crate::tui) fn changed(self) -> bool {
+        self.changed
+    }
+
+    pub(in crate::tui) fn requires_frame_boundary(self) -> bool {
+        self.frame_boundary
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -587,11 +603,14 @@ impl App {
         Ok(app)
     }
 
-    pub fn poll_background(&mut self) {
+    pub(in crate::tui) fn poll_background(&mut self) -> BackgroundPoll {
+        let mut poll = BackgroundPoll::default();
         for _ in 0..256 {
             let Ok(event) = self.background_receiver.try_recv() else {
                 break;
             };
+            poll.changed = true;
+            poll.frame_boundary = true;
             match event {
                 BackgroundEvent::Management(id, result) => self.finish_management(id, result),
                 BackgroundEvent::Connections(id, result) => self.finish_connections(id, result),
@@ -616,8 +635,11 @@ impl App {
                 }
             }
         }
-        self.poll_live_logs();
-        self.poll_log_workspace();
+        poll.changed |= self.poll_live_logs();
+        let log_workspace_changed = self.poll_log_workspace();
+        poll.changed |= log_workspace_changed;
+        poll.frame_boundary |= log_workspace_changed;
+        poll
     }
 
     fn finish_deployment_plan(
@@ -681,6 +703,27 @@ impl App {
             return false;
         }
         self.message = None;
+        // Dispatch latency-sensitive pages before the fallback clone. Their
+        // config/plan may be large, and log navigation must stay allocation-bounded.
+        if matches!(self.screen, Screen::DeploymentRunning { .. }) {
+            self.handle_deployment_running_key(key.code);
+            return false;
+        }
+        if matches!(self.screen, Screen::DeploymentFinished { .. }) {
+            self.handle_deployment_finished_key(key.code);
+            return false;
+        }
+        if matches!(self.screen, Screen::DeploymentReview { .. }) {
+            self.handle_deployment_review_key(key.code);
+            return false;
+        }
+        if matches!(self.screen, Screen::Overview { .. }) {
+            return self.handle_overview_key(key.code);
+        }
+        if matches!(self.screen, Screen::DeploySelection(_)) {
+            self.handle_deploy_selection_key(key.code);
+            return false;
+        }
         match self.screen.clone() {
             Screen::Management(screen) => self.handle_management(key.code, screen),
             Screen::Connections(screen) => self.handle_connections(key.code, screen),
@@ -720,52 +763,166 @@ impl App {
                 prepared,
                 ..
             } => self.handle_setup_review(key.code, &destinations, &prepared),
-            Screen::Overview { root, config } => match key.code {
-                KeyCode::Esc => self.show_projects(),
-                KeyCode::Char('q') => return true,
-                KeyCode::Char('d') => self.open_deployment(root, config),
-                KeyCode::Char('m') => self.open_management(root, config),
-                KeyCode::Char('e') => self.open_project_edit(root),
-                KeyCode::Left | KeyCode::Right => {
-                    self.move_overview_environment(&config, key.code == KeyCode::Right);
-                }
-                _ => self.scroll_overview(key.code),
-            },
-            Screen::DeploySelection(selection) => {
-                self.handle_deploy_selection(key.code, &selection);
+            Screen::Overview { .. } | Screen::DeploySelection(_) => {
+                unreachable!("project pages are dispatched before cloning")
             }
             Screen::DeploymentPlanning { cancellation, .. } => {
                 if key.code == KeyCode::Esc {
                     cancellation.cancel();
                 }
             }
-            Screen::DeploymentReview { plan, .. } => {
-                self.handle_deployment_review(key.code, plan);
-            }
-            Screen::DeploymentRunning { .. } => {
-                if key.code == KeyCode::Esc {
-                    self.request_deployment_cancellation();
-                } else if key.code == KeyCode::Char('l') {
-                    self.open_live_logs();
-                }
-            }
-            Screen::DeploymentFinished { root, config, .. } => {
-                if key.code == KeyCode::Char('l') {
-                    self.open_live_logs();
-                } else if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                    self.show_overview(root, config);
-                } else if let Screen::DeploymentFinished { scroll, .. } = &mut self.screen {
-                    *scroll = match key.code {
-                        KeyCode::Up => scroll.saturating_sub(1),
-                        KeyCode::Down => scroll.saturating_add(1),
-                        KeyCode::PageUp => scroll.saturating_sub(10),
-                        KeyCode::PageDown => scroll.saturating_add(10),
-                        _ => *scroll,
-                    };
-                }
+            Screen::DeploymentReview { .. }
+            | Screen::DeploymentRunning { .. }
+            | Screen::DeploymentFinished { .. } => {
+                unreachable!("large deployment pages are dispatched before cloning")
             }
         }
         false
+    }
+
+    fn handle_deployment_running_key(&mut self, key: KeyCode) {
+        if key == KeyCode::Esc {
+            self.request_deployment_cancellation();
+        } else if key == KeyCode::Char('l') {
+            self.open_live_logs();
+        }
+    }
+
+    fn handle_overview_key(&mut self, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Esc => self.show_projects(),
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('d') => match std::mem::replace(&mut self.screen, Screen::Projects) {
+                Screen::Overview { root, config } => self.open_deployment(root, config),
+                screen => self.screen = screen,
+            },
+            KeyCode::Char('m') => {
+                if let Screen::Overview { root, config } = &self.screen {
+                    self.open_management(root.clone(), config.clone());
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Screen::Overview { root, .. } = &self.screen {
+                    self.open_project_edit(root.clone());
+                }
+            }
+            KeyCode::Left | KeyCode::Right => {
+                self.move_overview_environment(key == KeyCode::Right);
+            }
+            _ => self.scroll_overview(key),
+        }
+        false
+    }
+
+    fn handle_deploy_selection_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Left | KeyCode::Right => {
+                let Some((cursor, count)) = (match &self.screen {
+                    Screen::DeploySelection(selection) => Some((
+                        selection.environment_cursor,
+                        selection.config.environments.len(),
+                    )),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                let cursor = if key == KeyCode::Right {
+                    cursor.saturating_add(1).min(count.saturating_sub(1))
+                } else {
+                    cursor.saturating_sub(1)
+                };
+                self.select_environment(cursor);
+            }
+            KeyCode::Up => self.move_deploy_component(false),
+            KeyCode::Down => self.move_deploy_component(true),
+            KeyCode::Char(' ') => {
+                let component = match &self.screen {
+                    Screen::DeploySelection(selection) => selection
+                        .config
+                        .environments
+                        .values()
+                        .nth(selection.environment_cursor)
+                        .and_then(|environment| {
+                            environment
+                                .components
+                                .keys()
+                                .nth(selection.component_cursor)
+                        })
+                        .cloned(),
+                    _ => None,
+                };
+                if let (Some(component), Screen::DeploySelection(selection)) =
+                    (component, &mut self.screen)
+                    && !selection.selected.remove(&component)
+                {
+                    selection.selected.insert(component);
+                }
+            }
+            KeyCode::Enter => {
+                let selection = match &self.screen {
+                    Screen::DeploySelection(selection) => Some(selection.clone()),
+                    _ => None,
+                };
+                if let Some(selection) = selection {
+                    self.start_deployment_plan(&selection);
+                }
+            }
+            KeyCode::Esc => match std::mem::replace(&mut self.screen, Screen::Projects) {
+                Screen::DeploySelection(selection) => {
+                    self.screen = Screen::Overview {
+                        root: selection.root,
+                        config: selection.config,
+                    };
+                }
+                screen => self.screen = screen,
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_deployment_finished_key(&mut self, key: KeyCode) {
+        if key == KeyCode::Char('l') {
+            self.open_live_logs();
+            return;
+        }
+        if matches!(key, KeyCode::Esc | KeyCode::Enter) {
+            match std::mem::replace(&mut self.screen, Screen::Projects) {
+                Screen::DeploymentFinished { root, config, .. } => {
+                    self.show_overview(root, config);
+                }
+                screen => self.screen = screen,
+            }
+            return;
+        }
+        if let Screen::DeploymentFinished { scroll, .. } = &mut self.screen {
+            *scroll = match key {
+                KeyCode::Up => scroll.saturating_sub(1),
+                KeyCode::Down => scroll.saturating_add(1),
+                KeyCode::PageUp => scroll.saturating_sub(10),
+                KeyCode::PageDown => scroll.saturating_add(10),
+                _ => *scroll,
+            };
+        }
+    }
+
+    fn handle_deployment_review_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Up => self.adjust_review_scroll(false, 1),
+            KeyCode::Down => self.adjust_review_scroll(true, 1),
+            KeyCode::PageUp => self.adjust_review_scroll(false, 10),
+            KeyCode::PageDown => self.adjust_review_scroll(true, 10),
+            KeyCode::Char('c') => {
+                if let Screen::DeploymentReview { plan, .. } = &self.screen {
+                    self.start_deployment(plan.clone());
+                }
+            }
+            KeyCode::Esc => {
+                if let Screen::DeploymentReview { plan, .. } = &self.screen {
+                    self.screen = Screen::DeploySelection(selection_state(&plan.selection));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> Option<bool> {
@@ -831,6 +988,12 @@ impl App {
 
     fn tracked_work_active(&self) -> bool {
         self.interactive_work_active() || self.attention_busy()
+    }
+
+    pub(in crate::tui) fn needs_periodic_redraw(&self) -> bool {
+        self.exit_state == ExitState::Running
+            && (matches!(self.screen, Screen::DeploymentRunning { .. })
+                || (self.management_task.is_some() && self.management_has_live_progress()))
     }
 
     pub(in crate::tui) fn exit_state(&self) -> ExitState {
@@ -989,26 +1152,6 @@ impl App {
         });
     }
 
-    fn handle_deploy_selection(&mut self, key: KeyCode, selection: &DeploySelectionState) {
-        match key {
-            KeyCode::Left => self.move_environment(selection, false),
-            KeyCode::Right => self.move_environment(selection, true),
-            KeyCode::Up => self.move_deploy_component(false),
-            KeyCode::Down => self.move_deploy_component(true),
-            _ => self.handle_deploy_action(key, selection),
-        }
-    }
-
-    fn move_environment(&mut self, selection: &DeploySelectionState, forward: bool) {
-        let count = selection.config.environments.len();
-        let cursor = if forward {
-            (selection.environment_cursor + 1).min(count.saturating_sub(1))
-        } else {
-            selection.environment_cursor.saturating_sub(1)
-        };
-        self.select_environment(cursor);
-    }
-
     fn move_deploy_component(&mut self, forward: bool) {
         let count = match &self.screen {
             Screen::DeploySelection(selection) => deployment_components(selection).len(),
@@ -1024,7 +1167,7 @@ impl App {
     }
 
     fn select_environment(&mut self, cursor: usize) {
-        if let Screen::DeploySelection(selection) = &mut self.screen {
+        let selected_environment = if let Screen::DeploySelection(selection) = &mut self.screen {
             if selection.environment_cursor == cursor {
                 return;
             }
@@ -1037,34 +1180,17 @@ impl App {
                 .nth(cursor)
                 .map(|environment| environment.components.keys().cloned().collect())
                 .unwrap_or_default();
-        }
-        if let Screen::DeploySelection(selection) = &self.screen {
-            let config = selection.config.clone();
-            if let Some(environment) = environment_names(selection).get(cursor) {
-                self.remember_environment(&config, environment);
-            }
-        }
-    }
-
-    fn handle_deploy_action(&mut self, key: KeyCode, selection: &DeploySelectionState) {
-        match key {
-            KeyCode::Char(' ') => {
-                let components = deployment_components(selection);
-                if let Some(component) = components.get(selection.component_cursor)
-                    && let Screen::DeploySelection(current) = &mut self.screen
-                    && !current.selected.remove(component)
-                {
-                    current.selected.insert(component.clone());
-                }
-            }
-            KeyCode::Enter => self.start_deployment_plan(selection),
-            KeyCode::Esc => {
-                self.screen = Screen::Overview {
-                    root: selection.root.clone(),
-                    config: selection.config.clone(),
-                };
-            }
-            _ => {}
+            selection
+                .config
+                .environments
+                .values()
+                .nth(cursor)
+                .map(|environment| (selection.config.project_id.clone(), environment.id.clone()))
+        } else {
+            None
+        };
+        if let Some((project, environment)) = selected_environment {
+            self.remember_environment_ids(project, environment);
         }
     }
 
@@ -1122,18 +1248,6 @@ impl App {
         };
     }
 
-    fn handle_deployment_review(&mut self, key: KeyCode, plan: DeploymentPlan) {
-        match key {
-            KeyCode::Up => self.adjust_review_scroll(false, 1),
-            KeyCode::Down => self.adjust_review_scroll(true, 1),
-            KeyCode::PageUp => self.adjust_review_scroll(false, 10),
-            KeyCode::PageDown => self.adjust_review_scroll(true, 10),
-            KeyCode::Char('c') => self.start_deployment(plan),
-            KeyCode::Esc => self.screen = Screen::DeploySelection(selection_state(&plan.selection)),
-            _ => {}
-        }
-    }
-
     fn adjust_review_scroll(&mut self, forward: bool, amount: u16) {
         if let Screen::DeploymentReview { scroll, .. } = &mut self.screen {
             *scroll = if forward {
@@ -1188,7 +1302,6 @@ impl App {
             config,
             cancellation,
             cancellation_requested: false,
-            logs: VecDeque::new(),
         };
         self.invalidate_attention();
     }
@@ -1224,11 +1337,12 @@ impl App {
             progress.finish();
         }
         self.poll_live_logs();
-        let Screen::DeploymentRunning {
-            root, config, logs, ..
-        } = self.screen.clone()
-        else {
-            return;
+        let (root, config) = match std::mem::replace(&mut self.screen, Screen::Projects) {
+            Screen::DeploymentRunning { root, config, .. } => (root, config),
+            screen => {
+                self.screen = screen;
+                return;
+            }
         };
         let summary = match result {
             Ok(report) => deployment_summary(&report),
@@ -1240,7 +1354,6 @@ impl App {
             config,
             summary,
             scroll: 0,
-            logs,
         };
         self.refresh_attention(Some(project));
     }
@@ -2034,14 +2147,6 @@ impl EventSink for ProgressEvents {
     fn emit_record(&self, event: crate::telemetry::log_record::LogEvent) {
         self.progress.record(event);
     }
-}
-
-fn push_bounded_log(logs: &mut VecDeque<DriverLog>, log: DriverLog) {
-    const MAX_LOGS: usize = 500;
-    if logs.len() == MAX_LOGS {
-        logs.pop_front();
-    }
-    logs.push_back(log);
 }
 
 fn deployment_summary(report: &DeploymentReport) -> String {

@@ -56,13 +56,21 @@ TUI-04 management tests restore exact page/scope/selection snapshots, retain foc
 
 TUI-05 lifecycle tests drive real finite workers through `q` confirmation, resume, cancellation, matching/stale completion and shutdown. Deployment planning/execution, management, connections, project editing, reinitialization, remote target selection, SSH setup, local attention and log/export tasks retain cancellation and join ownership. Fake terminal cleanup verifies partial setup, all-step best-effort restoration and combined errors; fixed diagnostics cannot expose panic payloads. `TestBackend` covers confirmation/waiting overlays down to empty and 20×3 terminals. The separate Linux PTY smoke sends `INT`, `TERM` and `HUP` directly to the release process while draining output, then checks exit status, termios and terminal-control pairs. This does not cover `SIGKILL`, host-enforced close deadlines, Windows ConPTY control-event delivery or TUI-06 whole-process benchmarks. See [TUI-05 evidence and limits](../docs/validation/tui-05.md).
 
+TUI-06 keeps both whole-process stress entry points ignored in the default suite. Run the parent alone, without competing tests:
+
+```sh
+cargo test --locked --lib tui::app::performance_tests::isolated_tui_stress_stays_responsive_and_memory_bounded -- --ignored --exact --nocapture --test-threads=1
+```
+
+The parent starts one exact child with a nonce and a hard timeout. The child drives the production frame scheduler with `App` and Ratatui `TestBackend`, 80,000 concurrent log events, deterministic view eviction and 400 bounded synthetic inputs. It checks UI-drain-independent producer eviction, view eviction, producer-attempt-to-completed-frame latency and whole-process RSS after the timed workload. Windows/Linux report a process high-water value; macOS reports current RSS after the workload. This does not read a real `crossterm` event, flush a PTY or physical terminal, measure every producer stall, exercise every event channel, or replace the persistent log-writer saturation tests. See [TUI-06 evidence and limits](../docs/validation/tui-06.md).
+
 ## Structured execution logs and local export
 
 TUI-03 tests cover explicit schema-v7 log format indexing without relabeling legacy files, complete JSONL rotation, durable-phase event scope, real failed-command snapshots, frozen elapsed clocks, bounded queues/windows and independent step-state retention. Historical-reader tests use raw temporary files to verify all-generation search, exact scope/filter cursors, same-size content drift, cross-file private-key/fragment boundaries, malformed/unsupported records, explicit limits and no history creation or migration.
 
 Log UI tests drive keyboard handlers, tracked worker cancellation/join, multiline record/preview scrolling, failed-rollback identity and exact preview confirmation through `TestBackend`. Clipboard tests inject a writer: they verify one OSC 52 request, refusal and partial-output behavior, not the user's actual clipboard. Local-export tests use owned temporary directories to check no-clobber publication, changed paths, exact bytes and known publication despite late cancellation. Windows fixtures use a workspace-owned temporary directory when the sandbox cannot inspect user-profile ancestors; Unix fixtures use the native temporary filesystem so permission assertions do not depend on WSL drive mappings.
 
-Remote diagnostic tests use in-memory SSH protocol streams and simulated command results, alongside the default loopback integration suite. They do not replace external OpenSSH/systemd acceptance. High-throughput whole-process memory/input latency remains TUI-06 work; terminal/multiplexer clipboard permission and manual usability remain platform validation, not claims made by automated buffer tests.
+Remote diagnostic tests use in-memory SSH protocol streams and simulated command results, alongside the default loopback integration suite. They do not replace external OpenSSH/systemd acceptance. TUI-06 now covers the bounded synthetic App/`TestBackend` performance gate described above; terminal/multiplexer clipboard permission, physical-terminal latency and manual usability remain platform validation.
 
 ## Read-only connection troubleshooting
 

@@ -1,6 +1,6 @@
 # TUI-05：退出生命周期验收
 
-日期：2026-09-05。状态：TUI-05 通过工作包验收；实现、两轮独立审查、文档复核、双平台最终门禁及 Linux 真实 PTY smoke 均已完成。TUI-06、M4 和完整 MVP 尚未完成。
+日期：2026-09-05。状态：TUI-05 通过工作包验收；本记录冻结其实现、两轮独立审查、双平台最终门禁及 Linux 真实 PTY smoke 证据。后续 [TUI-06](tui-06.md) 已完成，M4 和完整 MVP 尚未完成。
 
 ## 实施范围
 
@@ -50,4 +50,4 @@ cargo build --offline --locked --release
 
 所有 App 级操作 worker 会在退出前 join，部署/回滚等待安全恢复边界。内部部署日志 writer 关闭通道后最多等待五秒；超时会明确标记日志不完整，但不改变已知远端执行或补偿结论，因此不能声称每个进程内部辅助线程都必然 join。
 
-App 安全退出有意不设超时；若系统调用永久不返回，界面会继续等待而不假装任务已结束。`SIGKILL`、OOM、`panic=abort` 及宿主强制关闭期限不可恢复。真实 Windows ConPTY 的 Break/Close/Shutdown、macOS、最低 Rust 1.88、人工全页面体验及全进程背压/内存/输入延迟分别留给 M4 和 TUI-06。
+App 安全退出有意不设超时；若系统调用永久不返回，界面会继续等待而不假装任务已结束。`SIGKILL`、OOM、`panic=abort` 及宿主强制关闭期限不可恢复。全进程有界过载、内存和合成输入时延随后由 [TUI-06](tui-06.md) 覆盖；真实 Windows ConPTY 的 Break/Close/Shutdown、macOS、最低 Rust 1.88 及人工全页面体验仍留给 M4。

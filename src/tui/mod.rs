@@ -10,7 +10,7 @@ use std::{
     fmt::Write as _,
     io::{self, BufWriter, Stdout},
     sync::mpsc::{self, Receiver, TryRecvError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -32,6 +32,65 @@ use self::app::{App, ExitState, Screen};
 use self::presentation::{endpoint_label, environment_label, is_production, safe_text, step_label};
 
 type AppTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct FrameSchedule {
+    dirty: bool,
+    immediate: bool,
+    last_draw: Option<Instant>,
+}
+
+impl Default for FrameSchedule {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            immediate: true,
+            last_draw: None,
+        }
+    }
+}
+
+impl FrameSchedule {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn mark_interaction(&mut self) {
+        self.dirty = true;
+        self.immediate = true;
+    }
+
+    fn draw_due(&self, now: Instant, periodic: bool) -> bool {
+        self.immediate
+            || (self.dirty || periodic)
+                && self
+                    .last_draw
+                    .is_none_or(|last| now.saturating_duration_since(last) >= ACTIVE_FRAME_INTERVAL)
+    }
+
+    fn record_draw(&mut self, now: Instant) {
+        self.dirty = false;
+        self.immediate = false;
+        self.last_draw = Some(now);
+    }
+
+    fn wait_timeout(&self, now: Instant, periodic: bool) -> Duration {
+        if self.immediate {
+            return Duration::ZERO;
+        }
+        if !self.dirty && !periodic {
+            return IDLE_POLL_INTERVAL;
+        }
+        self.last_draw.map_or(Duration::ZERO, |last| {
+            ACTIVE_FRAME_INTERVAL
+                .saturating_sub(now.saturating_duration_since(last))
+                .min(IDLE_POLL_INTERVAL)
+        })
+    }
+}
 
 struct TerminalGuard {
     terminal: AppTerminal,
@@ -381,6 +440,78 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn frame_schedule_draws_initial_and_dirty_frames_at_the_active_cap() {
+        let started = Instant::now();
+        let mut schedule = FrameSchedule::default();
+        assert!(schedule.draw_due(started, false));
+        schedule.record_draw(started);
+
+        schedule.mark_dirty();
+        let before_cap = started + ACTIVE_FRAME_INTERVAL.saturating_sub(Duration::from_millis(1));
+        assert!(!schedule.draw_due(before_cap, false));
+        assert_eq!(
+            schedule.wait_timeout(before_cap, false),
+            Duration::from_millis(1)
+        );
+        assert!(schedule.draw_due(started + ACTIVE_FRAME_INTERVAL, false));
+    }
+
+    #[test]
+    fn frame_schedule_does_not_redraw_clean_idle_state() {
+        let started = Instant::now();
+        let mut schedule = FrameSchedule::default();
+        schedule.record_draw(started);
+
+        assert!(!schedule.draw_due(started + Duration::from_secs(2), false));
+        assert_eq!(
+            schedule.wait_timeout(started + Duration::from_secs(2), false),
+            IDLE_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn frame_schedule_presents_each_interaction_before_reading_another() {
+        let started = Instant::now();
+        let mut schedule = FrameSchedule::default();
+        schedule.record_draw(started);
+        schedule.mark_interaction();
+
+        let immediately_after = started + Duration::from_millis(1);
+        assert!(schedule.draw_due(immediately_after, false));
+        assert_eq!(
+            schedule.wait_timeout(immediately_after, false),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn frame_schedule_refreshes_active_work_without_state_events() {
+        let started = Instant::now();
+        let mut schedule = FrameSchedule::default();
+        schedule.record_draw(started);
+
+        assert!(!schedule.draw_due(started + Duration::from_millis(49), true));
+        assert!(schedule.draw_due(started + ACTIVE_FRAME_INTERVAL, true));
+    }
+
+    #[test]
+    fn frame_schedule_coalesces_continuous_log_changes_to_twenty_frames_per_second() {
+        let started = Instant::now();
+        let mut schedule = FrameSchedule::default();
+        schedule.record_draw(started);
+        let mut draws = 0;
+        for elapsed_ms in 1..=2_000 {
+            schedule.mark_dirty();
+            let now = started + Duration::from_millis(elapsed_ms);
+            if schedule.draw_due(now, true) {
+                draws += 1;
+                schedule.record_draw(now);
+            }
+        }
+        assert_eq!(draws, 40);
+    }
+
+    #[test]
     fn session_and_restoration_failures_are_both_reported() {
         let error = combine_session_result(
             Err(io::Error::other("session failed")),
@@ -447,9 +578,17 @@ fn drive_event_loop(
     guard: &mut TerminalGuard,
     signals: &ProcessSignals,
 ) -> io::Result<()> {
+    let mut frames = FrameSchedule::default();
     loop {
-        app.poll_background();
-        signals.consume(|| app.request_process_exit());
+        let background = app.poll_background();
+        if background.requires_frame_boundary() {
+            frames.mark_interaction();
+        } else if background.changed() {
+            frames.mark_dirty();
+        }
+        if signals.consume(|| app.request_process_exit()) {
+            frames.mark_interaction();
+        }
         if event_loop_exit_ready(app) {
             break;
         }
@@ -457,15 +596,27 @@ fn drive_event_loop(
             let transport = clipboard_transport();
             let outcome = clipboard::request_copy(guard.terminal.backend_mut(), &text, transport);
             app.finish_clipboard_request(outcome);
+            frames.mark_dirty();
         }
-        guard.terminal.draw(|frame| render(frame, app))?;
 
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && app.handle_key(key)
-        {
-            app.request_process_exit();
+        let now = Instant::now();
+        if frames.draw_due(now, app.needs_periodic_redraw()) {
+            guard.terminal.draw(|frame| render(frame, app))?;
+            frames.record_draw(Instant::now());
+        }
+
+        let timeout = frames.wait_timeout(Instant::now(), app.needs_periodic_redraw());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.handle_key(key) {
+                        app.request_process_exit();
+                    }
+                    frames.mark_interaction();
+                }
+                Event::Resize(_, _) => frames.mark_interaction(),
+                _ => {}
+            }
         }
     }
 
@@ -718,23 +869,19 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             render_deployment_review(frame, area, plan, *scroll);
         }
         Screen::DeploymentRunning {
-            logs,
             cancellation_requested,
             ..
         } => render_deployment_running(
             frame,
             area,
-            logs,
+            &app.live_logs,
             *cancellation_requested,
             app.live_progress.as_ref(),
         ),
         Screen::DeploymentFinished {
-            summary,
-            logs,
-            scroll,
-            ..
+            summary, scroll, ..
         } => {
-            render_deployment_finished(frame, area, summary, logs, *scroll);
+            render_deployment_finished(frame, area, summary, &app.live_logs, *scroll);
         }
         Screen::SetupComponents(setup) => {
             render_component_setup(frame, area, setup);
@@ -1009,7 +1156,7 @@ fn build_preview(build: &crate::config::ComponentConfig) -> String {
 fn render_deployment_running(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
-    logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
+    logs: &log_view::LogView,
     cancellation_requested: bool,
     progress: Option<&live_progress::LiveProgress>,
 ) {
@@ -1069,16 +1216,16 @@ fn render_deployment_finished(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     summary: &str,
-    logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
+    logs: &log_view::LogView,
     scroll: u16,
 ) {
     let mut content = format!("{summary}\nRecent events:\n");
-    for event in logs {
+    for row in logs.matching() {
         let _ = writeln!(
             content,
             "[{}] {}",
-            step_label(&event.namespace),
-            event.message
+            step_label(&row.event.namespace),
+            row.event.message
         );
     }
     frame.render_widget(
@@ -1092,19 +1239,20 @@ fn render_deployment_log(
     area: ratatui::layout::Rect,
     title: &'static str,
     status: &str,
-    logs: &std::collections::VecDeque<crate::drivers::DriverLog>,
+    logs: &log_view::LogView,
 ) {
     let areas = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
     frame.render_widget(panel(title, status.to_owned()), areas[0]);
     let visible = usize::from(areas[1].height.saturating_sub(2));
-    let lines: Vec<_> = logs
+    let matching = logs.matching();
+    let lines: Vec<_> = matching
         .iter()
-        .skip(logs.len().saturating_sub(visible))
-        .map(|event| {
+        .skip(matching.len().saturating_sub(visible))
+        .map(|row| {
             Line::from(format!(
                 "[{}] {}",
-                step_label(&event.namespace),
-                event.message
+                step_label(&row.event.namespace),
+                row.event.message
             ))
         })
         .collect();
@@ -1475,14 +1623,14 @@ fn panel(title: &'static str, content: String) -> Paragraph<'static> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::sync::Arc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect, widgets::Paragraph};
 
-    use crate::drivers::DriverLog;
+    use crate::telemetry::log_record::{LogEvent, LogEventKind};
 
-    use super::ExitState;
+    use super::{ExitState, log_view};
 
     #[test]
     fn build_preview_distinguishes_shell_and_argument_boundaries() {
@@ -1506,12 +1654,19 @@ mod tests {
 
     #[test]
     fn progress_keeps_cancellation_status_and_latest_events_visible() {
-        let logs: VecDeque<_> = (0..100)
-            .map(|index| DriverLog {
-                namespace: "build".into(),
-                message: format!("event-{index:03}"),
-            })
-            .collect();
+        let mut logs = log_view::LogView::default();
+        for index in 0..100 {
+            assert!(logs.push(log_view::LogRow {
+                sequence: index + 1,
+                elapsed_ms: None,
+                event: Arc::new(LogEvent {
+                    namespace: "build".into(),
+                    message: format!("event-{index:03}"),
+                    scope: None,
+                    kind: LogEventKind::Output,
+                }),
+            }));
+        }
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal
             .draw(|frame| super::render_deployment_running(frame, frame.area(), &logs, true, None))
@@ -1538,7 +1693,7 @@ mod tests {
                         frame,
                         frame.area(),
                         "Deployment failed",
-                        &VecDeque::new(),
+                        &log_view::LogView::default(),
                         0,
                     );
                 })

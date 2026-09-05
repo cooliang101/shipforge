@@ -14,7 +14,7 @@
 
 `TUI-DEP-01` 已实现并通过自动化工作包验收：Environment/Component 选择、只读预检、含 Git 和目标信息的计划预览、显式确认、后台构建和发布、实时脱敏日志、安全取消、逐 Component 结果及人工恢复指引均已接通。构建与远端操作共用 Deployment ID；每次 Driver 写操作前复核配置，上传前检查实际解压容量及远端状态。日志故障触发安全取消，但不覆盖已知部署结果；终端错误退出也等待恢复边界。验证范围和已知限制见 [TUI-DEP-01 验收记录](validation/tui-dep-01.md)。
 
-**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；M2 已验收，M3 正在推进，完整 MVP 尚未完成。
+**M1 安全部署闭环已验收**：两台一次性 Debian/OpenSSH Destination 的发布、回滚、HTTP 失败补偿及取消已实测通过；WSL 真实 systemd 的无端口 Worker 稳定窗口、更新/首次部署失败补偿和两种显式回滚也已通过。完整范围、质量门禁及逐条 M1 证据映射见 [systemd 与 M1 验收记录](validation/systemd-acceptance.md) 和 [双 Destination 记录](validation/linux-ssh-acceptance.md)。默认协议测试不替代实机证据；M2、M3 已验收，下一阶段为 M4，完整 MVP 尚未完成。
 
 WSL Linux 客户端已通过原生单测（含 Unix 继承管道回归）、协议测试、编译及正常启动/退出冒烟；范围见 [Linux 客户端验证](validation/linux-client.md)。这不等于真实 systemd 验收或全部平台支持。
 
@@ -81,7 +81,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 `RET-01` 已实现并验收：成功部署后默认保留最新 5 个版本及受保护引用，以原始包证据和逐版本持久意图授权精确清理；部分失败保留路径事实，未知结果保持 pending，不补偿成功部署。独立审查、Windows/Linux 全量门禁、原生删除脚本、真实权限失败/重试及六次经正式应用流程的测试发布触发默认清理均通过；完整范围见 [RET-01 记录](validation/ret-01.md)。
 
-`TUI-MGT-01` 已实现并验收项目配置编辑、连接管理、本地历史/日志、显式库存检查、检查报告和所选 Component 回滚入口，包含已删除 Environment 的只读历史入口。交叉审查、Windows 597 / Linux 609 项单测、各 8 项协议与 1 项中断父用例、双平台 Clippy/格式/release 构建，以及阶段诊断补强后的四轮真实 Management 用例均通过。独立百次连接用例提供额外基线，早期连接超时根因仍未知，保留为 QA-01 发行风险，不宣称已定位修复。范围与证据见 [管理功能验收记录](validation/tui-mgt-01.md)，使用方式见 [TUI 指南](tui-guide.md)。M2 已完成，M3、M4 和完整 MVP 尚未完成。
+`TUI-MGT-01` 已实现并验收项目配置编辑、连接管理、本地历史/日志、显式库存检查、检查报告和所选 Component 回滚入口，包含已删除 Environment 的只读历史入口。交叉审查、Windows 597 / Linux 609 项单测、各 8 项协议与 1 项中断父用例、双平台 Clippy/格式/release 构建，以及阶段诊断补强后的四轮真实 Management 用例均通过。独立百次连接用例提供额外基线，早期连接超时根因仍未知，保留为 QA-01 发行风险，不宣称已定位修复。范围与证据见 [管理功能验收记录](validation/tui-mgt-01.md)，使用方式见 [TUI 指南](tui-guide.md)。该工作包完成了 M2；后续 M3 现已完成，M4 和完整 MVP 尚未完成。
 
 - `HIS-01`：扩展 SQLite Deployment、Step、逐 Component Release Receipt、Environment Observation、Component generation、能力快照及日志索引模型。
 - `HIS-02`：实现 `linux-ssh` Release 库存重建和追加式远端 JSONL 审计记录；Release manifest 由 `ART-01` 创建，由 `REL-01` 和恢复流程读取。
@@ -97,20 +97,22 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 `TUI-02` 已实现并通过自动化工作包验收：共享候选搜索和键盘帮助、无候选时手动设置、可取消的首次 SSH 后台流程、逐 Component 只读目录/服务选择，以及损坏 `_shipforge` 的完整 YAML 预览和新身份确认重新初始化。空/加载/失败/未知状态明确区分，不以旧缓存伪装成功。交叉审查、Windows 749 / Linux 765 项单测、各 14 项协议与 1 项中断父用例、双平台格式/Clippy/release 及依赖审计通过；已有撤回依赖警告和验证限制见 [TUI-02 记录](validation/tui-02.md)。
 
-`TUI-03` 已实现并通过自动化工作包验收：步骤状态/耗时、结构化日志、有界实时窗口、跨保留文件搜索/筛选、实际失败命令复制及确认导出已接入。schema v7 仅新增明确的日志格式索引，旧文本不重标、只读浏览不迁移。交叉审查、Windows 887 / Linux 908 项库测试、各 14 项协议与 1 项中断父用例、双平台格式/Clippy/release 及依赖审计通过；完整范围、剪贴板/旧日志限制和既有撤回依赖警告见 [TUI-03 记录](validation/tui-03.md)。后续 `TUI-04`、`TUI-05` 也已完成；下一工作包为 `TUI-06`，最终 MVP 验收仍待完成。
+`TUI-03` 已实现并通过自动化工作包验收：步骤状态/耗时、结构化日志、有界实时窗口、跨保留文件搜索/筛选、实际失败命令复制及确认导出已接入。schema v7 仅新增明确的日志格式索引，旧文本不重标、只读浏览不迁移。交叉审查、Windows 887 / Linux 908 项库测试、各 14 项协议与 1 项中断父用例、双平台格式/Clippy/release 及依赖审计通过；完整范围、剪贴板/旧日志限制和既有撤回依赖警告见 [TUI-03 记录](validation/tui-03.md)。后续 `TUI-04` 至 `TUI-06` 也已完成；最终 MVP 验收仍待完成。
 
 - `TUI-01`：统一项目、Environment、Component、Destination、目标可用操作和生产环境确认的呈现与导航；不向用户暴露 Driver 名称或能力标识符。
 - `TUI-02`：完善选择优先的候选列表、空状态、加载状态、可恢复错误、键盘帮助和无障碍配色；补齐损坏 `_shipforge` 经明确确认后重新初始化的 TUI 入口，复用已有底层 API，不从远端恢复配置。
 - `TUI-03`：完善步骤进度、耗时、有界日志窗口、历史加载、搜索、筛选、复制和导出体验。
 - `TUI-04`：完善发布历史、回滚、环境检查和恢复页面的一致性。
 - `TUI-05`：加固运行中退出对话框、安全取消和中断处理。
-- `TUI-06`：用高吞吐合成日志验证事件背压、内存上限和输入延迟；仅在基准支持时评估 `mimalloc`。
+- `TUI-06`：用高吞吐合成日志验证与 UI 排空解耦的有界淘汰、内存上限和输入延迟；仅在基准支持时评估 `mimalloc`。
 
 `TUI-04` 已实现并通过自动化工作包验收：管理导航快照、取消后的计划消费、持久错误、完整历史/库存证据和窄终端展示已接入。交叉审查、Windows 931 / Linux 952 项库测试、各 14 项协议与 1 项中断恢复父用例、双平台格式/Clippy/release 及依赖审计通过；完整范围及限制见 [TUI-04 记录](validation/tui-04.md)。
 
-`TUI-05` 已实现并通过工作包验收：活动工作上的退出确认、全部 App 级任务的取消与线程 join、匹配请求结果分类、Unix/Windows 控制事件、部分终端初始化清理，以及正常/错误/panic 的脱敏恢复路径已接入。两轮独立审查无 P0/P1/P2；Windows 955 / Linux 976 项库测试、各 14 项协议与 1 项中断恢复父用例、双平台格式/严格 Clippy/release 均通过。Linux 发布构建还以真实 PTY 直接验证 `q` 及 `INT`/`TERM`/`HUP` 的退出码、termios、alternate screen 和光标恢复。范围、测试工具陷阱及不可拦截终止限制见 [TUI-05 记录](validation/tui-05.md)。下一工作包为 `TUI-06`。
+`TUI-05` 已实现并通过工作包验收：活动工作上的退出确认、全部 App 级任务的取消与线程 join、匹配请求结果分类、Unix/Windows 控制事件、部分终端初始化清理，以及正常/错误/panic 的脱敏恢复路径已接入。两轮独立审查无 P0/P1/P2；Windows 955 / Linux 976 项库测试、各 14 项协议与 1 项中断恢复父用例、双平台格式/严格 Clippy/release 均通过。Linux 发布构建还以真实 PTY 直接验证 `q` 及 `INT`/`TERM`/`HUP` 的退出码、termios、alternate screen 和光标恢复。范围、测试工具陷阱及不可拦截终止限制见 [TUI-05 记录](validation/tui-05.md)。
 
-完成门槛：全部 MVP 操作只能通过应用服务进入领域层；切换页面不取消 Deployment；安全退出等待恢复边界；正常退出、错误和 panic 均恢复 raw mode、光标及 alternate screen。
+`TUI-06` 已实现并通过工作包验收：空闲界面不再无效重绘，后台日志与活动进度以 50 ms 帧间隔合并，真实输入、resize 和页面完成仍立即安排帧；高频页面操作不再克隆完整配置、计划或日志，运行页与完成页共享规范实时日志。显式隔离门禁在 Windows 与 WSL Linux 上各以 80,000 条并发日志和 400 次合成输入验证与 UI 排空解耦的生产端有界淘汰、500 行展示窗口淘汰、256 MiB 整进程上限及 100 ms p99 提交尝试到帧阈值；双平台结果均有充足余量，因此未引入 `mimalloc`。两轮独立审查无 P0/P1/P2，完整范围和测量边界见 [TUI-06 记录](validation/tui-06.md)。M3 已完成，下一工作包为 M4 的 `QA-01`。
+
+完成门槛：全部 MVP 操作只能通过应用服务进入领域层；切换页面不取消 Deployment；安全退出等待恢复边界；正常退出、错误和 panic 均恢复 raw mode、光标及 alternate screen。该门槛及 TUI-01 至 TUI-06 的工作包验收均已通过，M3 完成。
 
 ## M4：发布加固
 

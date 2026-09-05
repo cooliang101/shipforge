@@ -57,24 +57,43 @@ impl App {
 
     pub(super) fn remember_environment(&mut self, config: &ProjectConfig, name: &str) {
         if let Some(environment) = config.environments.get(name) {
-            self.navigation.selected = Some((config.project_id.clone(), environment.id.clone()));
+            self.remember_environment_ids(config.project_id.clone(), environment.id.clone());
         }
     }
 
-    pub(super) fn move_overview_environment(&mut self, config: &ProjectConfig, forward: bool) {
-        let current = self.preferred_environment(config);
-        let names: Vec<_> = config.environments.keys().collect();
-        let index = names
-            .iter()
-            .position(|name| Some(*name) == current.as_ref())
-            .unwrap_or(0);
-        let next = if forward {
-            index.saturating_add(1).min(names.len().saturating_sub(1))
-        } else {
-            index.saturating_sub(1)
+    pub(super) fn remember_environment_ids(
+        &mut self,
+        project: ProjectId,
+        environment: EnvironmentId,
+    ) {
+        self.navigation.selected = Some((project, environment));
+    }
+
+    pub(super) fn move_overview_environment(&mut self, forward: bool) {
+        let selected = {
+            let Screen::Overview { config, .. } = &self.screen else {
+                return;
+            };
+            let current = self.preferred_environment(config);
+            let names: Vec<_> = config.environments.keys().collect();
+            let index = names
+                .iter()
+                .position(|name| Some(*name) == current.as_ref())
+                .unwrap_or(0);
+            let next = if forward {
+                index.saturating_add(1).min(names.len().saturating_sub(1))
+            } else {
+                index.saturating_sub(1)
+            };
+            names.get(next).and_then(|name| {
+                config
+                    .environments
+                    .get(*name)
+                    .map(|environment| (config.project_id.clone(), environment.id.clone()))
+            })
         };
-        if let Some(name) = names.get(next) {
-            self.remember_environment(config, name);
+        if let Some((project, environment)) = selected {
+            self.remember_environment_ids(project, environment);
             self.reset_overview_scroll();
         }
     }

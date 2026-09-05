@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-use super::{App, DirectoryBrowser, Screen, push_bounded_log};
+use super::{App, DirectoryBrowser};
 use worker::{LogTask, Request, Response};
 
 #[derive(Debug)]
@@ -327,11 +327,12 @@ impl App {
         self.log_workspace = Some(workspace);
     }
 
-    pub(super) fn poll_live_logs(&mut self) {
+    pub(super) fn poll_live_logs(&mut self) -> bool {
         let Some(progress) = &self.live_progress else {
-            return;
+            return false;
         };
         let update = progress.drain();
+        let changed = !update.rows.is_empty();
         let scope = self.live_log_scope();
         if let Some(workspace) = &mut self.log_workspace
             && workspace.live
@@ -346,15 +347,6 @@ impl App {
             workspace.progress = Some(update.snapshot.clone());
         }
         for row in update.rows {
-            if let Screen::DeploymentRunning { logs, .. } = &mut self.screen {
-                push_bounded_log(
-                    logs,
-                    crate::drivers::DriverLog {
-                        namespace: row.event.namespace.clone(),
-                        message: row.event.message.clone(),
-                    },
-                );
-            }
             if let Some(workspace) = &mut self.log_workspace
                 && workspace.live
             {
@@ -362,17 +354,18 @@ impl App {
             }
             self.live_logs.push(row);
         }
+        changed
     }
 
-    pub(super) fn poll_log_workspace(&mut self) {
+    pub(super) fn poll_log_workspace(&mut self) -> bool {
         let Some(workspace) = &mut self.log_workspace else {
-            return;
+            return false;
         };
         if !workspace.task.as_ref().is_some_and(LogTask::is_finished) {
-            return;
+            return false;
         }
         let Some(task) = workspace.task.take() else {
-            return;
+            return false;
         };
         match task.join() {
             Ok(response) => workspace.accept(response),
@@ -382,6 +375,7 @@ impl App {
                     format!("{message} No successful refresh is claimed. r starts a fresh read.");
             }
         }
+        true
     }
 
     pub(super) fn log_workspace_busy(&self) -> bool {

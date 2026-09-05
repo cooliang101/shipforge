@@ -237,6 +237,8 @@ mod tests {
         domain::{ComponentName, DeploymentId, DeploymentState, EnvironmentId},
         drivers::EventSink,
         history::{DeploymentKind, DeploymentRecord, HistoryStore},
+        telemetry::log_record::{LogEvent, LogEventKind},
+        tui::live_progress::LiveProgress,
     };
 
     use super::*;
@@ -530,7 +532,6 @@ mod tests {
             config: config(directory.path()),
             cancellation: tokio_util::sync::CancellationToken::new(),
             cancellation_requested: false,
-            logs: VecDeque::new(),
         };
         app.invalidate_attention();
         app.refresh_attention(None);
@@ -560,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_completion_refreshes_project_attention_and_keeps_result_screen() {
+    fn deployment_completion_refreshes_attention_and_preserves_live_logs() {
         let directory = tempfile::tempdir().unwrap();
         let gateway = Arc::new(FakeAttentionGateway::new([Ok(summary(0)), Ok(summary(1))]));
         let mut app = new_app(directory.path(), gateway.clone());
@@ -573,8 +574,22 @@ mod tests {
             config: project.clone(),
             cancellation: cancellation.clone(),
             cancellation_requested: false,
-            logs: VecDeque::new(),
         };
+        let progress = LiveProgress::default();
+        progress.record(LogEvent {
+            namespace: "deploy.stdout".into(),
+            message: "running log sentinel".into(),
+            scope: None,
+            kind: LogEventKind::Output,
+        });
+        app.live_progress = Some(progress.clone());
+        assert!(app.poll_live_logs(), "running page must drain live logs");
+        progress.record(LogEvent {
+            namespace: "deploy.stdout".into(),
+            message: "completion log sentinel".into(),
+            scope: None,
+            kind: LogEventKind::Output,
+        });
         app.deployment_execution_task = Some(super::super::DeploymentTask {
             id: request_id,
             cancellation,
@@ -583,6 +598,29 @@ mod tests {
         app.finish_deployment(request_id, Err("execution failed".into()));
         wait_attention(&mut app);
         assert!(matches!(app.screen, Screen::DeploymentFinished { .. }));
+        let retained = app
+            .live_logs
+            .matching()
+            .into_iter()
+            .map(|row| row.event.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(retained.contains(&"running log sentinel"));
+        assert!(retained.contains(&"completion log sentinel"));
+        app.open_live_logs();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+            .expect("log overlay terminal");
+        terminal
+            .draw(|frame| crate::tui::render(frame, &app))
+            .expect("render completed deployment log overlay");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("running log sentinel"));
+        assert!(rendered.contains("completion log sentinel"));
         assert_eq!(
             *gateway.queries.lock().unwrap(),
             vec![None, Some(project.project_id)]

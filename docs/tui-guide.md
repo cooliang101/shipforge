@@ -151,4 +151,4 @@ Project/Environment 改名保留 ID 和固化 root。Component 换名需显式�
 
 步骤元数据使用可读名称，例如 `Uploading`、`Packaging`，不显示 Driver 命名空间或能力标识符；用户日志正文不会被步骤名称转换改写。部署控制错误提供安全的处理建议，保留已知结果及持久化警告，不直接展示底层解析器、数据库或 Driver 的原始错误字符串。
 
-统一导航的自动化验收见 [TUI-01 记录](validation/tui-01.md)，候选、首次设置与重新初始化见 [TUI-02 记录](validation/tui-02.md)，步骤与日志见 [TUI-03 记录](validation/tui-03.md)，管理页面一致性见 [TUI-04 记录](validation/tui-04.md)，退出生命周期见 [TUI-05 记录](validation/tui-05.md)；五个工作包的双平台门禁均已通过。全进程压力测试仍属 TUI-06，平台和发布验收属于 M4，当前不能视作正式发布的 MVP。
+统一导航的自动化验收见 [TUI-01 记录](validation/tui-01.md)，候选、首次设置与重新初始化见 [TUI-02 记录](validation/tui-02.md)，步骤与日志见 [TUI-03 记录](validation/tui-03.md)，管理页面一致性见 [TUI-04 记录](validation/tui-04.md)，退出生命周期见 [TUI-05 记录](validation/tui-05.md)，后台帧调度与全进程压力门禁见 [TUI-06 记录](validation/tui-06.md)；六个工作包的双平台门禁均已通过，M3 已完成。平台、安全和发布验收属于 M4，当前不能视作正式发布的 MVP。

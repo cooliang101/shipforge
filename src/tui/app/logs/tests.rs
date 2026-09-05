@@ -1,3 +1,4 @@
+use super::super::Screen;
 use super::*;
 
 #[path = "tests/viewport.rs"]

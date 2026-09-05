@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::{collections::BTreeSet, sync::Arc};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
@@ -12,7 +12,8 @@ use crate::{
         ProjectConfigState,
     },
     domain::{DestinationKey, EnvironmentId, ProjectId},
-    drivers::{CredentialHandle, DriverLog},
+    drivers::CredentialHandle,
+    telemetry::log_record::{LogEvent, LogEventKind},
 };
 
 use super::super::{App, LocalDeploymentGateway, Screen, TuiDeploymentGateway};
@@ -232,17 +233,21 @@ fn production_context_and_confirmation_remain_visible_when_plan_is_scrolled() {
 fn live_and_finished_headers_keep_scope_and_hide_internal_step_namespace() {
     let (directory, mut app, config) = fixture();
     app.remember_environment(&config, "production");
-    let logs: VecDeque<_> = [DriverLog {
-        namespace: "linux-ssh.upload".into(),
-        message: "payload transferred".into(),
-    }]
-    .into();
+    assert!(app.live_logs.push(crate::tui::log_view::LogRow {
+        sequence: 1,
+        elapsed_ms: None,
+        event: Arc::new(LogEvent {
+            namespace: "linux-ssh.upload".into(),
+            message: "payload transferred".into(),
+            scope: None,
+            kind: LogEventKind::Output,
+        }),
+    }));
     app.screen = Screen::DeploymentRunning {
         root: directory.path().into(),
         config: config.clone(),
         cancellation: CancellationToken::new(),
         cancellation_requested: false,
-        logs: logs.clone(),
     };
     let text = draw(&app, 100, 14).join("\n");
     assert!(text.starts_with("[PRODUCTION]"));
@@ -253,7 +258,6 @@ fn live_and_finished_headers_keep_scope_and_hide_internal_step_namespace() {
         config,
         summary: "Completed".into(),
         scroll: 0,
-        logs,
     };
     let text = draw(&app, 100, 14).join("\n");
     assert!(text.contains("production"));
@@ -321,7 +325,6 @@ async fn active_session_footer_shows_actual_cancel_action_and_cancellation_state
         config,
         cancellation: CancellationToken::new(),
         cancellation_requested: false,
-        logs: VecDeque::new(),
     };
     let session = std::sync::Arc::clone(&app.deployment_session);
     session
