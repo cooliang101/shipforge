@@ -2,17 +2,15 @@ use std::fmt::Write as _;
 
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::{
-    history::{CurrentAlignment, PackageAlignment},
-    tui::presentation::{context_label, environment_label, is_production, step_label},
-};
+use crate::tui::presentation::{context_label, environment_label, is_production, step_label};
 
-use super::{ManagementPage, ManagementScreen, ReleaseRef};
+use super::evidence::{deployment_details, release_label, report_details, timestamp};
+use super::{ManagementPage, ManagementScreen};
 pub(super) use crate::tui::presentation::safe_text;
 
 impl ManagementScreen {
@@ -22,7 +20,7 @@ impl ManagementScreen {
         }
         match &self.page {
             ManagementPage::Home if self.scope.historical_environment.is_some() => {
-                "Esc current management  h history  p saved inspections  (read-only)"
+                "Esc back  h history  p saved inspections  (read-only)"
             }
             ManagementPage::Home => {
                 "Esc overview  ←/→ env  h history  i inspect  p reports  a old envs"
@@ -31,21 +29,21 @@ impl ManagementScreen {
                 cancelling: true, ..
             } => "Cancellation requested; waiting for a safe result. Do not close the terminal.",
             ManagementPage::Loading { .. } => {
-                "Esc / Ctrl+C request cancellation; l opens active rollback logs"
+                "Esc / Ctrl+C request cancellation; wait for a safe result"
             }
             ManagementPage::Environments { .. }
             | ManagementPage::History { .. }
             | ManagementPage::Reports { .. } => {
-                "Esc back  ↑/↓ select  Enter details  n/b next/previous page  f refresh"
+                "Esc back  ↑/↓ select  Enter details  n/b page  f refresh  [/] pan"
             }
             ManagementPage::Detail(_) if self.scope.historical_environment.is_some() => {
-                "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  (read-only historical scope)"
+                "Esc back  ↑/↓ PgUp/PgDn scroll  [/] pan  l logs  (read-only)"
             }
             ManagementPage::Detail(details) if details.snapshots.is_empty() => {
-                "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  (no frozen remote context)"
+                "Esc back  ↑/↓ PgUp/PgDn scroll  [/] pan  l logs  (no remote context)"
             }
             ManagementPage::Detail(_) => {
-                "Esc back  ↑/↓ PgUp/PgDn scroll  l logs  r rollback  i inspect remote"
+                "Esc back  ↑/↓ PgUp/PgDn scroll  [/] pan  l logs  r rollback  i inspect"
             }
             ManagementPage::InspectSelection { selected, .. } if selected.is_empty() => {
                 "Esc back  ↑/↓ Component  Space select at least one Component"
@@ -60,18 +58,26 @@ impl ManagementScreen {
                 "Esc back  ↑/↓ Component  Space toggle  Enter find selected targets"
             }
             ManagementPage::RollbackTargets { selected, .. } if selected.is_empty() => {
-                "Esc back  ↑/↓ Component  ←/→ version  Space select an available target"
+                "Esc back  ↑/↓ Component  ←/→ version  Space select  d details  [/] pan"
             }
             ManagementPage::RollbackTargets { .. } => {
-                "Esc back  ↑/↓ Component  ←/→ version  Space select  Enter check targets"
+                "Esc back  ↑/↓ Component  ←/→ version  Space select  Enter check  d details"
             }
             ManagementPage::RollbackReview(_) => {
-                "Esc reject  ↑/↓ PgUp/PgDn scroll  c confirm rollback"
+                "Esc reject  ↑/↓ PgUp/PgDn scroll  [/] pan  c confirm rollback"
             }
             ManagementPage::RollbackFinished(_) | ManagementPage::RollbackFailed { .. } => {
-                "Esc back  ↑/↓ PgUp/PgDn scroll  l this rollback's logs"
+                "Esc back  ↑/↓ PgUp/PgDn scroll  [/] pan  l this rollback's logs"
             }
-            ManagementPage::Report { .. } => "Esc back  ↑/↓ PgUp/PgDn scroll  Home top",
+            ManagementPage::Report { .. } | ManagementPage::RollbackTargetDetail { .. } => {
+                "Esc back  ↑/↓ PgUp/PgDn scroll  Home/End top/bottom  [/] pan  0 left"
+            }
+            ManagementPage::Failed { retry: Some(_), .. } => {
+                "Esc back to snapshot  f retry check  ↑/↓ scroll  [/] pan"
+            }
+            ManagementPage::Failed { retry: None, .. } => {
+                "Esc back to snapshot  ↑/↓ scroll  [/] pan  review before retrying"
+            }
         }
     }
 
@@ -82,6 +88,7 @@ impl ManagementScreen {
                 ManagementPage::InspectSelection { .. }
                     | ManagementPage::RollbackSelection { .. }
                     | ManagementPage::RollbackTargets { .. }
+                    | ManagementPage::RollbackTargetDetail { .. }
                     | ManagementPage::RollbackReview(_)
             )
     }
@@ -93,13 +100,13 @@ impl ManagementScreen {
             ManagementPage::History { .. } | ManagementPage::Detail(_) => "Deployment history",
             ManagementPage::Reports { .. } | ManagementPage::Report { .. } => "Inspections",
             ManagementPage::InspectSelection { .. } => "Choose inspection targets",
-            ManagementPage::RollbackSelection { .. } | ManagementPage::RollbackTargets { .. } => {
-                "Choose rollback targets"
-            }
+            ManagementPage::RollbackSelection { .. }
+            | ManagementPage::RollbackTargets { .. }
+            | ManagementPage::RollbackTargetDetail { .. } => "Choose rollback targets",
             ManagementPage::RollbackReview(_) => "Confirm rollback",
             ManagementPage::RollbackFinished(_) => "Rollback result",
             ManagementPage::RollbackFailed { .. } => "Rollback did not complete normally",
-            ManagementPage::Loading { .. } => "Working",
+            ManagementPage::Loading { label, .. } | ManagementPage::Failed { label, .. } => label,
         };
         let environment = self.scope.historical_environment.as_ref().map_or_else(
             || Some(self.scope.environment.as_str()),
@@ -130,6 +137,9 @@ impl ManagementScreen {
                 .map(|snapshot| snapshot.release.component.as_str()),
             ManagementPage::RollbackTargets {
                 candidates, cursor, ..
+            }
+            | ManagementPage::RollbackTargetDetail {
+                candidates, cursor, ..
             } => candidates
                 .components
                 .get(*cursor)
@@ -139,7 +149,26 @@ impl ManagementScreen {
     }
 
     pub(in crate::tui) fn render(&self, frame: &mut Frame<'_>, area: Rect, app: &super::App) {
-        let (title, body, cursor) = self.content(app);
+        let historical_blocked = self.historical_remote_page();
+        let cached = !historical_blocked
+            && matches!(
+                self.page,
+                ManagementPage::Detail(_)
+                    | ManagementPage::Report { .. }
+                    | ManagementPage::RollbackReview(_)
+                    | ManagementPage::RollbackFinished(_)
+                    | ManagementPage::RollbackFailed { .. }
+                    | ManagementPage::RollbackTargetDetail { .. }
+                    | ManagementPage::Failed { .. }
+            );
+        let dynamic;
+        let (document, cursor) = if cached {
+            (self.view.document(|| self.content(app)), None)
+        } else {
+            let (title, body, cursor) = self.content(app);
+            dynamic = super::viewport::Document::new(title, body);
+            (&dynamic, cursor)
+        };
         let environment = self.scope.historical_environment.as_ref().map_or_else(
             || environment_label(&self.scope.environment),
             |id| self.historical_environment_label(id),
@@ -150,31 +179,76 @@ impl ManagementScreen {
         );
         let heading = format!(
             " {} · {} / {} ",
-            title,
+            document.title,
             safe_text(&self.scope.config.project),
             safe_text(&environment),
         );
-        let scroll = cursor.map_or(self.scroll, |cursor| {
-            let visible = usize::from(area.height.saturating_sub(4)).max(1);
-            u16::try_from(cursor.saturating_sub(visible.saturating_sub(1))).unwrap_or(u16::MAX)
-        });
         let block = Block::default()
             .title(heading)
+            .title_bottom(if cached {
+                format!(
+                    " line {}/{} · [/] pan · ,/. fine · col {} ",
+                    self.view.top(document).saturating_add(1),
+                    document.lines(),
+                    self.view.horizontal().saturating_add(1)
+                )
+            } else if cursor.is_some() {
+                format!(
+                    " [/] pan · ,/. fine · col {} · 0 left ",
+                    self.view.horizontal().saturating_add(1)
+                )
+            } else {
+                String::new()
+            })
             .borders(Borders::ALL)
             .border_style(if production {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default()
             });
-        let paragraph = Paragraph::new(body).block(block).scroll((scroll, 0));
-        // List cursor offsets count explicit lines. Wrapping these rows would
-        // hide the selected entry on narrow terminals; details remain wrapped.
-        let paragraph = if cursor.is_some() {
-            paragraph
+        let mut inner = block.inner(area);
+        frame.render_widget(block, area);
+        if let Some(notice) = &self.notice {
+            let [banner, body] =
+                Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+            frame.render_widget(
+                Paragraph::new(safe_text(notice))
+                    .style(Style::default().fg(Color::Yellow))
+                    .wrap(Wrap { trim: false }),
+                banner,
+            );
+            inner = body;
+        }
+        let top = if historical_blocked {
+            0
         } else {
-            paragraph.wrap(Wrap { trim: false })
+            cursor.map_or_else(
+                || self.view.top(document),
+                |cursor| {
+                    let visible = usize::from(inner.height.saturating_sub(2)).max(1);
+                    cursor.saturating_sub(visible.saturating_sub(1))
+                },
+            )
         };
-        frame.render_widget(paragraph, area);
+        let horizontal = if historical_blocked {
+            0
+        } else {
+            self.view.horizontal()
+        };
+        if !cached && cursor.is_none() && horizontal == 0 {
+            // Short overview/loading text remains wrapped. Evidence and lists
+            // use logical-line windows, so every row and long tail is reachable.
+            frame.render_widget(
+                Paragraph::new(document.window(top, 0, inner.height, u16::MAX))
+                    .wrap(Wrap { trim: false }),
+                inner,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(document.window(top, horizontal, inner.height, inner.width)),
+                inner,
+            );
+        }
     }
 
     fn content(&self, app: &super::App) -> (&'static str, String, Option<usize>) {
@@ -189,48 +263,7 @@ impl ManagementScreen {
             && app.management_has_live_progress()
             && let Some(progress) = &app.live_progress
         {
-            let snapshot = progress.snapshot();
-            let mut text = format!(
-                "Rollback running · elapsed {} ms\n{}\nl opens logs, full step progress, search and export.\n\n",
-                snapshot.elapsed_ms,
-                if *cancelling {
-                    "Safe cancellation requested; waiting for compensation."
-                } else {
-                    "Esc / Ctrl+C requests safe cancellation."
-                }
-            );
-            let mut steps: Vec<_> = snapshot.steps.iter().collect();
-            steps.sort_by_key(|step| std::cmp::Reverse(step.updated_sequence));
-            for step in steps.iter().take(3) {
-                let _ = writeln!(
-                    text,
-                    "{} / {}: {:?}; persistence {:?}",
-                    step.scope.component,
-                    step_label(&step.scope.step),
-                    step.state,
-                    step.persistence
-                );
-            }
-            if snapshot.dropped_rows > 0
-                || snapshot.dropped_steps > 0
-                || snapshot.rejected_events > 0
-            {
-                let _ = writeln!(
-                    text,
-                    "Window gaps: {} rows / {} steps / {} rejected",
-                    snapshot.dropped_rows, snapshot.dropped_steps, snapshot.rejected_events
-                );
-            }
-            text.push_str("\nLatest output (bounded):\n");
-            let rows = app.live_logs.matching();
-            for row in rows.iter().skip(rows.len().saturating_sub(8)) {
-                let _ = writeln!(
-                    text,
-                    "{}",
-                    safe_text(row.event.message.lines().next().unwrap_or(""))
-                );
-            }
-            return ("Rollback progress", text, None);
+            return Self::live_rollback_content(app, progress, *cancelling);
         }
         match &self.page {
             ManagementPage::Home | ManagementPage::Loading { .. } => self.overview_content(),
@@ -243,6 +276,7 @@ impl ManagementScreen {
                 self.selection_content(app)
             }
             ManagementPage::RollbackTargets { .. } => self.rollback_targets_content(),
+            ManagementPage::RollbackTargetDetail { .. } => self.rollback_target_detail(),
             ManagementPage::RollbackReview(_) | ManagementPage::RollbackFinished(_) => {
                 self.rollback_execution_content()
             }
@@ -266,7 +300,70 @@ impl ManagementScreen {
                     None,
                 )
             }
+            ManagementPage::Failed {
+                label,
+                message,
+                retry,
+            } => (
+                "Request failed · no fresh result",
+                format!(
+                    "{label}\n\n{}\n\nNo fresh result is available. Esc returns to the prior snapshot, which is not a new check.\n{}",
+                    safe_text(message),
+                    if retry.is_some() {
+                        "Press f to run this read/check again. No rollback execution is retried here."
+                    } else {
+                        "No automatic retry is offered. Review saved reports and current state before starting another inspection."
+                    }
+                ),
+                None,
+            ),
         }
+    }
+
+    fn live_rollback_content(
+        app: &super::App,
+        progress: &crate::tui::live_progress::LiveProgress,
+        cancelling: bool,
+    ) -> (&'static str, String, Option<usize>) {
+        let snapshot = progress.snapshot();
+        let mut text = format!(
+            "Rollback running · elapsed {} ms\n{}\nl opens logs, full step progress, search and export.\n\n",
+            snapshot.elapsed_ms,
+            if cancelling {
+                "Safe cancellation requested; waiting for compensation."
+            } else {
+                "Esc / Ctrl+C requests safe cancellation."
+            }
+        );
+        let mut steps: Vec<_> = snapshot.steps.iter().collect();
+        steps.sort_by_key(|step| std::cmp::Reverse(step.updated_sequence));
+        for step in steps.iter().take(3) {
+            let _ = writeln!(
+                text,
+                "{} / {}: {:?}; persistence {:?}",
+                step.scope.component,
+                step_label(&step.scope.step),
+                step.state,
+                step.persistence
+            );
+        }
+        if snapshot.dropped_rows > 0 || snapshot.dropped_steps > 0 || snapshot.rejected_events > 0 {
+            let _ = writeln!(
+                text,
+                "Window gaps: {} rows / {} steps / {} rejected",
+                snapshot.dropped_rows, snapshot.dropped_steps, snapshot.rejected_events
+            );
+        }
+        text.push_str("\nLatest output (bounded):\n");
+        let rows = app.live_logs.matching();
+        for row in rows.iter().skip(rows.len().saturating_sub(8)) {
+            let _ = writeln!(
+                text,
+                "{}",
+                safe_text(row.event.message.lines().next().unwrap_or(""))
+            );
+        }
+        ("Rollback progress", text, None)
     }
 
     fn overview_content(&self) -> (&'static str, String, Option<usize>) {
@@ -274,7 +371,7 @@ impl ManagementScreen {
             ManagementPage::Home if self.scope.historical_environment.is_some() => (
                 "Historical Environment · read-only",
                 format!(
-                    "Project directory: {}\nEnvironment: {}\n\n[h] Local deployment history and logs\n[p] Saved inspection reports\n\nRead-only local evidence; no remote connections or rollback.\nEnvironment identity, not its name, determines this scope.\nOld configuration is not reconstructed. Esc returns to current management.",
+                    "Project directory: {}\nEnvironment: {}\n\n[h] Local deployment history and logs\n[p] Saved inspection reports\n\nRead-only local evidence; no remote connections or rollback.\nEnvironment identity, not its name, determines this scope.\nOld configuration is not reconstructed. Esc returns to the previous page.",
                     safe_text(&self.scope.root.display().to_string()),
                     self.scope
                         .historical_environment
@@ -286,7 +383,7 @@ impl ManagementScreen {
             ManagementPage::Home => (
                 "Manage",
                 format!(
-                    "Project directory: {}\n\n[h] Local deployment history and logs\n[i] Inspect selected Components / remote Releases\n[p] Saved inspection reports\n[a] Historical Environment IDs (including removed Environments)\n\nOpening history never connects to a server.\nInspection is read-only on the server; it saves a separate local report.\nInventory does not prove service health or historical success.",
+                    "Project directory: {}\n\n[h] Local deployment history and logs\n[i] Inspect selected Components / remote Releases\n[p] Saved inspection reports\n[a] Historical Environment IDs (including removed Environments)\n\nOpening history never connects to a server.\nInspection is read-only on the server; it saves a separate local report.\nInventory is not an environment preflight or a health check.\nIt does not prove service health or historical success.",
                     safe_text(&self.scope.root.display().to_string())
                 ),
                 None,
@@ -371,21 +468,25 @@ impl ManagementScreen {
                 for (index, record) in page.items.iter().enumerate() {
                     let _ = writeln!(
                         text,
-                        "{} {}  {:?} / {:?}  pending:{}  started:{}",
+                        "{} {:?} / {:?} · {} · pending:{}\n  {}",
                         mark(index == *cursor),
-                        record.deployment,
                         record.kind,
                         record.state,
+                        timestamp(record.created_at_ms),
                         record.pending_intent_count,
-                        timestamp(record.created_at_ms)
+                        record.deployment
                     );
                 }
-                ("Deployment history · local", text, Some(cursor + 2))
+                (
+                    "Deployment history · local · created time",
+                    text,
+                    Some(cursor * 2 + 2),
+                )
             }
             ManagementPage::Detail(details) => {
                 let mut text = deployment_details(details);
                 if details.snapshots.is_empty() {
-                    let _ = writeln!(text, "\n{}", super::MISSING_FROZEN_CONTEXT);
+                    text.insert_str(0, &format!("{}\n\n", super::MISSING_FROZEN_CONTEXT));
                 }
                 ("Deployment details · original record", text, None)
             }
@@ -409,24 +510,30 @@ impl ManagementScreen {
                 for (index, report) in page.items.iter().enumerate() {
                     let _ = writeln!(
                         text,
-                        "{} {}  {} Components  source:{}  checked:{}",
+                        "{} {} · {} Components · {}\n  {}",
                         mark(index == *cursor),
-                        report.id,
+                        timestamp(report.completed_at_ms),
                         report.components.len(),
-                        report
-                            .related_deployment
-                            .as_ref()
-                            .map_or_else(|| "inventory only".into(), ToString::to_string),
-                        timestamp(report.completed_at_ms)
+                        if report.related_deployment.is_some() {
+                            "Deployment comparison"
+                        } else {
+                            "inventory only"
+                        },
+                        report.id
                     );
                 }
-                ("Saved inspections · local", text, Some(cursor + 2))
+                (
+                    "Saved inspections · local · checked time",
+                    text,
+                    Some(cursor * 2 + 2),
+                )
             }
             ManagementPage::Report { report, warning } => {
-                let mut text = report_details(report);
-                if let Some(warning) = warning {
-                    let _ = writeln!(text, "\nPERSISTENCE WARNING: {}", safe_text(warning));
-                }
+                let mut text = warning.as_ref().map_or_else(
+                    || "Saved inspection report · historical observations, not live health.\n\n".into(),
+                    |warning| format!("SAVE UNCONFIRMED: observations retained on this page.\nPERSISTENCE WARNING: {}\n\n", safe_text(warning)),
+                );
+                text.push_str(&report_details(report));
                 (
                     "Inspection · observed facts, not repaired history",
                     text,
@@ -594,40 +701,58 @@ impl ManagementScreen {
                 );
                 ("Rollback review", text, None)
             }
-            ManagementPage::RollbackFinished(report) => {
-                let mut text = format!(
-                    "Rollback Deployment: {}\nResult: {:?}\n\n",
-                    report.deployment.id, report.deployment.state
-                );
-                for (name, result) in &report.deployment.components {
-                    let _ = writeln!(
-                        text,
-                        "{name}: {:?}; reported version: {}",
-                        result.outcome,
-                        result
-                            .observed_release
-                            .as_ref()
-                            .map_or("none reported (not proof of absence)", |version| version
-                                .as_str())
-                    );
-                }
-                if report.failure.is_some() {
-                    text.push_str("\nRollback failed. Open this Deployment in history for recorded steps and observations.\n");
-                }
-                for (name, error) in &report.compensation_failures {
-                    let _ = writeln!(
-                        text,
-                        "MANUAL RECOVERY REQUIRED: {name}: {}",
-                        crate::tui::deployment_error::driver_error(error)
-                    );
-                }
-                for warning in &report.warnings {
-                    let _ = writeln!(text, "WARNING: {}", safe_text(warning));
-                }
-                ("Rollback result", text, None)
-            }
+            ManagementPage::RollbackFinished(report) => (
+                "Rollback result",
+                super::outcome::rollback_result(report),
+                None,
+            ),
             _ => unreachable!("page category is selected by the exhaustive renderer"),
         }
+    }
+
+    fn rollback_target_detail(&self) -> (&'static str, String, Option<usize>) {
+        let ManagementPage::RollbackTargetDetail {
+            candidates,
+            cursor,
+            option,
+        } = &self.page
+        else {
+            unreachable!("only candidate detail is routed here");
+        };
+        let Some(component) = candidates.components.get(*cursor) else {
+            return (
+                "Rollback candidate · local evidence",
+                "No candidate recorded. Return and refresh the Component selection.".into(),
+                None,
+            );
+        };
+        let target = component.options.get(*option);
+        let reason = component
+            .unavailable
+            .as_ref()
+            .or_else(|| target.and_then(|target| target.unavailable.as_ref()));
+        let text = format!(
+            "Component: {}\nSource Deployment: {}\nServer: {}\nRoot: {}\nOption: {} of {}\nTarget: {}\nAvailability: {}\n\nLocal evidence only; current remote state has not been checked.\nThis page does not select or execute a target. Esc preserves the selection.\nUse [/] to pan long paths and messages; 0 returns to the left edge.",
+            component.component,
+            candidates.source,
+            safe_text(&component.destination),
+            safe_text(&component.root),
+            option.saturating_add(1),
+            component.options.len(),
+            target.map_or_else(
+                || "unknown / no proven option".into(),
+                |target| release_label(target.target.as_ref())
+            ),
+            reason.map_or_else(
+                || if target.is_some() {
+                    "eligible for explicit selection and a fresh remote check".into()
+                } else {
+                    "unavailable: no proven option".into()
+                },
+                |reason| format!("UNAVAILABLE: {}", safe_text(reason))
+            ),
+        );
+        ("Rollback candidate · local evidence", text, None)
     }
 }
 
@@ -642,281 +767,6 @@ fn page_header(missing: bool, empty: bool, offset: u32, more: bool) -> String {
         "Local records · page {} · {}\n\n",
         offset / super::PAGE_SIZE + 1,
         if more { "more available" } else { "last page" }
-    )
-}
-
-fn deployment_details(details: &crate::application::history_query::DeploymentDetails) -> String {
-    let record = &details.record;
-    let mut text = format!(
-        "Deployment: {}\n{:?} / {:?}\nProject: {}  Environment: {}\nStarted: {}\nUpdated: {}\nPending intents: {} (not replayed by inspection)\n",
-        record.deployment,
-        record.kind,
-        record.state,
-        record.project,
-        record.environment,
-        timestamp(record.created_at_ms),
-        timestamp(record.updated_at_ms),
-        record.pending_intent_count
-    );
-    if let Some(source) = &record.related_deployment {
-        let _ = writeln!(text, "Related Deployment: {source}");
-    }
-    if let Some(metadata) = &details.metadata {
-        let _ = writeln!(
-            text,
-            "Branch: {}  Commit: {}  Worktree: {:?}\nOperator: {}",
-            optional_text(metadata.git_branch.as_deref()),
-            optional_text(metadata.git_revision.as_deref()),
-            metadata.git_worktree,
-            optional_text(metadata.operator.as_deref())
-        );
-    } else {
-        text.push_str("Source and operator metadata: unknown\n");
-    }
-    text.push_str("\nFrozen Components (no current-config substitution)\n");
-    for snapshot in &details.snapshots {
-        let release = &snapshot.release;
-        let _ = writeln!(
-            text,
-            "{} · generation {} · destination {} revision {}\n  endpoint fingerprint: {}\n  before: {} -> target: {}",
-            release.component,
-            release.generation.get(),
-            release.destination,
-            release.destination_revision.get(),
-            String::from(release.endpoint_fingerprint.clone()),
-            release_label(snapshot.expected_current.as_ref()),
-            release_label(snapshot.target.as_ref())
-        );
-    }
-    if details.snapshots.is_empty() {
-        text.push_str("Unknown: no frozen Component plan.\n");
-    }
-    text.push_str("\nPackages\n");
-    for package in &details.packages {
-        let _ = writeln!(
-            text,
-            "{} / {} · {} bytes\n  SHA-256: {}",
-            package.release.component, package.release.version, package.size, package.sha256
-        );
-    }
-    text.push_str("\nComponent results\n");
-    for item in &details.results {
-        let _ = writeln!(
-            text,
-            "{}: {:?} · version {} · {}",
-            item.component,
-            item.result.outcome,
-            item.result
-                .observed_release
-                .as_ref()
-                .map_or("none reported", |version| version.as_str()),
-            optional_text(item.error.as_deref())
-        );
-    }
-    append_execution_details(&mut text, details);
-    text
-}
-
-fn append_execution_details(
-    text: &mut String,
-    details: &crate::application::history_query::DeploymentDetails,
-) {
-    text.push_str("\nSteps\n");
-    for step in &details.steps {
-        let elapsed = step
-            .started_at_ms
-            .zip(step.completed_at_ms)
-            .map(|(start, end)| end.saturating_sub(start));
-        let _ = writeln!(
-            text,
-            "{} / {}: {:?} · elapsed {}\n  {}",
-            step.component,
-            step_label(&step.name),
-            step.status,
-            elapsed.map_or_else(
-                || "unknown / ongoing".into(),
-                |millis| format!("{millis}ms")
-            ),
-            optional_text(step.error.as_deref())
-        );
-    }
-    text.push_str("\nObserved facts (empty result fields alone do not establish absence)\n");
-    for observation in &details.observations {
-        let current = match &observation.observed {
-            Ok(None) => "not_deployed (confirmed absent)".into(),
-            Ok(Some(release)) => release.version.to_string(),
-            Err(error) => format!("UNKNOWN: {}", safe_text(error)),
-        };
-        let health = match observation.healthy {
-            Some(true) => "healthy",
-            Some(false) => "unhealthy",
-            None => "health unknown",
-        };
-        let _ = writeln!(
-            text,
-            "{} / {}: {current}; {health} ({})",
-            observation.component,
-            step_label(&observation.stage),
-            timestamp(observation.observed_at_ms)
-        );
-    }
-    text.push_str("\nPending intents — inspect, do not replay\n");
-    for pending in &details.pending {
-        let _ = writeln!(
-            text,
-            "{} / {} · target: {}",
-            pending.component,
-            step_label(&pending.stage),
-            safe_text(&pending.target)
-        );
-    }
-}
-
-fn report_details(report: &crate::history::RecoveryReport) -> String {
-    let mut text = format!(
-        "Inspection: {}\nCheck started: {}\nCheck completed: {}\nNo commands replayed, services repaired or original outcomes changed.\nVersion equality does not prove health or operation success.\n\n",
-        report.id,
-        timestamp(report.started_at_ms),
-        timestamp(report.completed_at_ms)
-    );
-    if let Some(source) = &report.related_deployment {
-        let _ = writeln!(text, "Source Deployment: {source}\n");
-    }
-    for component in &report.components {
-        let scope = &component.scope;
-        let _ = writeln!(
-            text,
-            "{} · generation {} · destination {} revision {}\n  endpoint fingerprint: {}\n  current alignment: {} · package: {}",
-            scope.component,
-            scope.generation.get(),
-            scope.destination,
-            scope.destination_revision.get(),
-            String::from(scope.endpoint_fingerprint.clone()),
-            alignment(component.alignment),
-            package_alignment(component.package_alignment)
-        );
-        match &component.inventory {
-            Err(error) => {
-                let _ = writeln!(text, "  UNKNOWN: {}", safe_text(error));
-            }
-            Ok(inventory) => {
-                let current = match &inventory.releases.current {
-                    Ok(Some(version)) => version.to_string(),
-                    Ok(None) => "not_deployed (confirmed absent)".into(),
-                    Err(error) => format!("UNKNOWN: {}", safe_text(error)),
-                };
-                let _ = writeln!(text, "  Current: {current}");
-                for release in &inventory.releases.releases {
-                    let _ = writeln!(
-                        text,
-                        "  {} · {} bytes · {}\n    SHA-256:{}\n    source:{} · created:{}",
-                        release.manifest.version,
-                        release.size,
-                        if release.extracted {
-                            "archive + extracted directory"
-                        } else {
-                            "archive only; extracted directory missing"
-                        },
-                        release.sha256,
-                        optional_text(release.manifest.source_revision.as_deref()),
-                        release
-                            .manifest
-                            .created_at_unix
-                            .checked_mul(1000)
-                            .map_or_else(|| "timestamp outside supported range".into(), timestamp)
-                    );
-                }
-                for issue in &inventory.releases.issues {
-                    let _ = writeln!(
-                        text,
-                        "  INCOMPLETE {}: {}",
-                        issue
-                            .version
-                            .as_ref()
-                            .map_or("unknown version", |version| version.as_str()),
-                        safe_text(&issue.message)
-                    );
-                }
-                let _ = writeln!(
-                    text,
-                    "  Audit: {} entries; {}\n  Temporary remnants: {}; {}",
-                    inventory.audit.records.len(),
-                    if inventory.audit.incomplete {
-                        "incomplete / missing; not proof of success"
-                    } else {
-                        "complete scan"
-                    },
-                    inventory.remnants.entries.len(),
-                    if inventory.remnants.incomplete {
-                        "scan incomplete"
-                    } else {
-                        "complete scan; nothing removed"
-                    }
-                );
-                for notice in inventory
-                    .releases
-                    .notices
-                    .iter()
-                    .chain(&inventory.audit.notices)
-                    .chain(&inventory.remnants.notices)
-                {
-                    let _ = writeln!(text, "  NOTICE: {}", safe_text(notice));
-                }
-            }
-        }
-        for notice in &component.notices {
-            let _ = writeln!(text, "  NOTICE: {}", safe_text(notice));
-        }
-        text.push('\n');
-    }
-    text
-}
-
-const fn alignment(value: CurrentAlignment) -> &'static str {
-    match value {
-        CurrentAlignment::Unplanned => "inventory only",
-        CurrentAlignment::Target => "target version",
-        CurrentAlignment::Previous => "previous version",
-        CurrentAlignment::Other => "other version",
-        CurrentAlignment::Unknown => "unknown",
-    }
-}
-
-const fn package_alignment(value: PackageAlignment) -> &'static str {
-    match value {
-        PackageAlignment::Unplanned => "inventory only",
-        PackageAlignment::Matches => "matches frozen evidence",
-        PackageAlignment::ArchiveOnly => "archive only",
-        PackageAlignment::Missing => "missing",
-        PackageAlignment::Mismatch => "mismatched",
-        PackageAlignment::Unknown => "unknown",
-    }
-}
-
-fn timestamp(millis: u64) -> String {
-    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000).map_or_else(
-        |_| "timestamp outside supported range".into(),
-        |value| {
-            format!(
-                "{} {:02}:{:02}:{:02}.{:03} UTC",
-                value.date(),
-                value.hour(),
-                value.minute(),
-                value.second(),
-                value.millisecond()
-            )
-        },
-    )
-}
-
-fn optional_text(value: Option<&str>) -> String {
-    value.map_or_else(|| "unknown / not recorded".into(), safe_text)
-}
-
-fn release_label(release: Option<&ReleaseRef>) -> String {
-    release.map_or_else(
-        || "not_deployed".into(),
-        |release| release.version.to_string(),
     )
 }
 
@@ -936,7 +786,7 @@ mod tests {
             ComponentGeneration, ComponentName, DeploymentId, DeploymentState, DestinationKey,
             DestinationRevision, DriverCapabilities, EnvironmentId, ProjectId, ReleaseVersion,
         },
-        drivers::{DriverKind, EndpointFingerprint},
+        drivers::{DriverKind, EndpointFingerprint, ReleaseRef},
         history::{
             DeploymentComponentSnapshot, DeploymentKind, DeploymentRecord, ObservationRecord,
         },
@@ -1139,9 +989,15 @@ mod tests {
 
     #[test]
     fn narrow_history_list_keeps_the_selected_last_row_on_screen() {
-        let (_directory, app) = super::super::tests::fixture();
+        let (_directory, mut app) = super::super::tests::fixture();
         let mut screen = super::super::tests::screen(&app);
-        let items: Vec<_> = (0..20).map(|_| record()).collect();
+        let items: Vec<_> = (0..20)
+            .map(|index| {
+                let mut item = record();
+                item.created_at_ms = index * 86_400_000;
+                item
+            })
+            .collect();
         let selected = items[19].deployment.to_string();
         screen.page = ManagementPage::History {
             page: Arc::new(HistoryPage {
@@ -1152,18 +1008,12 @@ mod tests {
             offset: 0,
             cursor: 19,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
-        terminal
-            .draw(|frame| screen.render(frame, frame.area(), &app))
-            .unwrap();
-        let buffer: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(buffer.contains(&format!("> {selected}")));
+        app.screen = super::super::Screen::Management(screen);
+        let buffer = render_app(&app, 80, 10);
+        assert!(buffer.contains(&selected));
+        assert!(buffer.contains("> Rollback / Failed"));
+        assert!(buffer.contains("1970-01-20"));
+        assert!(buffer.contains("pending:0"));
     }
 
     #[test]
@@ -1178,5 +1028,162 @@ mod tests {
         let text = safe_text(&"x".repeat(4097));
         assert!(text.ends_with("[display truncated]"));
         assert!(text.len() < 4200);
+    }
+
+    fn render_app(app: &super::super::App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render(frame, app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn saved_report_warning_precedes_long_observations_in_real_small_viewport() {
+        let (_directory, mut app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        let report = Arc::new(crate::history::RecoveryReport {
+            id: uuid::Uuid::now_v7(),
+            related_deployment: None,
+            source_revision: None,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            components: (0..32)
+                .map(|index| {
+                    let mut scope =
+                        crate::history::InspectionScope::from(&details().snapshots[0].release);
+                    scope.component = ComponentName::parse(format!("service-{index}")).unwrap();
+                    crate::history::RecoveryComponentReport {
+                        scope,
+                        inventory: Err("No observation obtained".into()),
+                        alignment: crate::history::CurrentAlignment::Unknown,
+                        package_alignment: crate::history::PackageAlignment::Unknown,
+                        notices: (0..32)
+                            .map(|notice| format!("Recorded notice {notice}"))
+                            .collect(),
+                    }
+                })
+                .collect(),
+        });
+        screen.page = ManagementPage::Report {
+            report: Arc::clone(&report),
+            warning: Some("Local report persistence failed; observed facts retained.".into()),
+        };
+        app.screen = super::super::Screen::Management(screen);
+        let buffer = render_app(&app, 80, 10);
+        assert!(buffer.contains("SAVE UNCONFIRMED: observations retained on this page."));
+        assert!(buffer.contains("PERSISTENCE WARNING"));
+        assert!(!buffer.contains("Saved inspection report"));
+        let mut screen = super::super::tests::screen(&app);
+        screen.page = ManagementPage::Report {
+            report,
+            warning: None,
+        };
+        screen.view = super::super::viewport::Viewport::default();
+        app.screen = super::super::Screen::Management(screen);
+        assert!(render_app(&app, 80, 10).contains("Saved inspection report"));
+    }
+
+    #[test]
+    fn selected_rollback_candidate_has_complete_pannable_details_without_execution() {
+        use crate::application::{RollbackComponentCandidates, RollbackOption};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_directory, mut app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        let name = ComponentName::parse("c".repeat(63)).unwrap();
+        let mut release = details().snapshots[0].release.clone();
+        release.component = name.clone();
+        release.version = ReleaseVersion::parse("v-same-prefix-target-B").unwrap();
+        screen.page = ManagementPage::RollbackTargets {
+            candidates: Arc::new(crate::application::RollbackCandidates {
+                source: DeploymentId::new(),
+                components: vec![RollbackComponentCandidates {
+                    component: name,
+                    destination: format!("{}endpoint-tail", "server".repeat(25)),
+                    root: format!("/srv/{}/root-tail", "x".repeat(100)),
+                    options: vec![RollbackOption {
+                        target: Some(release),
+                        unavailable: Some(format!("{}REASON-TAIL", "x".repeat(160))),
+                    }],
+                    unavailable: None,
+                }],
+            }),
+            selected: std::collections::BTreeSet::default(),
+            options: std::collections::BTreeMap::default(),
+            cursor: 0,
+        };
+        app.screen = super::super::Screen::Management(screen);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let _ = render_app(&app, 80, 10);
+        assert!(matches!(
+            super::super::tests::screen(&app).page,
+            ManagementPage::RollbackTargetDetail { .. }
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.management_task.is_none());
+        for _ in 0..5 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert!(render_app(&app, 80, 10).contains("Target: v-same-prefix-target-B"));
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        }
+        assert!(render_app(&app, 80, 10).contains("REASON-TAIL"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            super::super::tests::screen(&app).page,
+            ManagementPage::RollbackTargets { cursor: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn management_details_render_without_panicking_in_tiny_and_empty_terminals() {
+        let (_directory, mut app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        screen.page = ManagementPage::Detail(Arc::new(details()));
+        screen.notice = Some("Cancelled; retained snapshot is not a fresh check.".into());
+        app.screen = super::super::Screen::Management(screen);
+        for (width, height) in [(0, 0), (1, 1), (5, 2), (10, 4), (80, 10)] {
+            let _ = render_app(&app, width, height);
+        }
+    }
+
+    #[test]
+    fn rollback_failure_warning_and_manual_recovery_counts_are_visible_at_eighty_by_ten() {
+        use crate::{
+            application::{DeploymentFailure, OrchestrationStage, RollbackReport},
+            domain::Deployment,
+            drivers::DriverError,
+        };
+        let (_directory, mut app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        let mut deployment = Deployment::new();
+        deployment.state = DeploymentState::Failed;
+        let error = DriverError {
+            stage: "linux-ssh.health".into(),
+            target: "private-error-target".into(),
+            message: "private-error-message".into(),
+            suggested_action: "private-error-advice".into(),
+        };
+        let name = ComponentName::parse("api").unwrap();
+        screen.page = ManagementPage::RollbackFinished(Arc::new(RollbackReport {
+            deployment,
+            failure: Some(DeploymentFailure::Driver { component: name.clone(), stage: OrchestrationStage::Rollback, error: error.clone(), observed_release: None }),
+            compensation_failures: [(name, error)].into_iter().collect(),
+            warnings: vec!["persist Rollback terminal state: local history persistence failed; inspect durable history before retrying".into()],
+        }));
+        app.screen = super::super::Screen::Management(screen);
+        let buffer = render_app(&app, 80, 10);
+        assert!(buffer.contains("Result: Failed"));
+        assert!(buffer.contains("warnings:1"));
+        assert!(buffer.contains("manual recovery:1"));
+        assert!(buffer.contains("Main failure: api"));
+        assert!(!buffer.contains("private-error"));
     }
 }

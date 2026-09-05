@@ -1,7 +1,12 @@
 //! Management navigation is separate from deployment setup and live progress.
 //! A single tracked worker owns each request until completion, including cancellation.
 
+mod evidence;
 mod gateway;
+mod navigation;
+#[cfg(test)]
+mod navigation_tests;
+mod outcome;
 mod render;
 #[cfg(test)]
 mod retired_tests;
@@ -10,6 +15,7 @@ mod rollback_tests;
 mod search;
 #[cfg(test)]
 mod tests;
+mod viewport;
 
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
@@ -37,7 +43,9 @@ const MISSING_FROZEN_CONTEXT: &str = "Remote actions are unavailable: this recor
 pub(in crate::tui) struct ManagementScreen {
     scope: Arc<ManagementScope>,
     page: ManagementPage,
-    scroll: u16,
+    view: viewport::Viewport,
+    back: Vec<navigation::ManagementReturn>,
+    notice: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +138,16 @@ pub(super) enum ManagementPage {
         options: BTreeMap<ComponentName, usize>,
         cursor: usize,
     },
+    RollbackTargetDetail {
+        candidates: Arc<RollbackCandidates>,
+        cursor: usize,
+        option: usize,
+    },
+    Failed {
+        label: &'static str,
+        message: String,
+        retry: Option<ManagementRequest>,
+    },
     RollbackReview(Arc<RollbackPlan>),
     RollbackFinished(Arc<RollbackReport>),
     RollbackFailed {
@@ -171,11 +189,11 @@ impl ManagementRequest {
 
     const fn label(&self) -> &'static str {
         match self {
-            Self::Environments(_)
-            | Self::History(_)
-            | Self::Detail(_)
-            | Self::Reports(_)
-            | Self::Report(_) => "Reading local records",
+            Self::Environments(_) => "Reading historical Environment IDs (local only)",
+            Self::History(_) => "Reading deployment history (local only)",
+            Self::Detail(_) => "Reading deployment details (local only)",
+            Self::Reports(_) => "Reading saved inspection reports (local only)",
+            Self::Report(_) => "Reading an inspection report (local only)",
             Self::Inspect { .. } => "Inspecting remote state (read-only)",
             Self::Candidates { .. } => "Checking local rollback evidence",
             Self::Plan { .. } => "Checking rollback targets (read-only)",
@@ -190,6 +208,7 @@ pub(super) struct ManagementTask {
     origin: ManagementScreen,
     cancellation: CancellationToken,
     execution_progress: Option<crate::tui::live_progress::LiveProgress>,
+    request: ManagementRequest,
 }
 
 impl ManagementScreen {
@@ -244,7 +263,9 @@ impl App {
                 historical_environment: None,
             }),
             page: ManagementPage::Home,
-            scroll: 0,
+            view: viewport::Viewport::default(),
+            back: Vec::new(),
+            notice: None,
         });
     }
 
@@ -259,6 +280,9 @@ impl App {
         {
             self.message = Some(HISTORICAL_READ_ONLY.into());
             self.screen = Screen::Management(screen);
+            return;
+        }
+        if self.handle_management_shortcut(key, &mut screen) {
             return;
         }
         if matches!(screen.page, ManagementPage::Environments { .. }) {
@@ -333,6 +357,39 @@ impl App {
         self.navigate_management(key, screen);
     }
 
+    fn handle_management_shortcut(&mut self, key: KeyCode, screen: &mut ManagementScreen) -> bool {
+        if key == KeyCode::Char('f')
+            && let ManagementPage::Failed {
+                retry: Some(request),
+                ..
+            } = &screen.page
+        {
+            let request = request.clone();
+            screen.go_back();
+            self.start_management(screen.clone(), request);
+            return true;
+        }
+        if key == KeyCode::Char('d')
+            && let ManagementPage::RollbackTargets {
+                candidates,
+                options,
+                cursor,
+                ..
+            } = &screen.page
+            && let Some(component) = candidates.components.get(*cursor)
+        {
+            let detail = ManagementPage::RollbackTargetDetail {
+                candidates: Arc::clone(candidates),
+                cursor: *cursor,
+                option: *options.get(&component.component).unwrap_or(&0),
+            };
+            screen.push_page(detail);
+            self.screen = Screen::Management(screen.clone());
+            return true;
+        }
+        false
+    }
+
     fn handle_management_environments(&mut self, key: KeyCode, mut screen: ManagementScreen) {
         let ManagementPage::Environments {
             page,
@@ -346,9 +403,12 @@ impl App {
         if key == KeyCode::Enter
             && let Some(environment) = page.items.get(*cursor)
         {
-            Arc::make_mut(&mut screen.scope).historical_environment = Some(environment.clone());
+            let environment = environment.clone();
+            screen.remember_page();
+            Arc::make_mut(&mut screen.scope).historical_environment = Some(environment);
             screen.page = ManagementPage::Home;
-            screen.scroll = 0;
+            screen.view = viewport::Viewport::default();
+            screen.notice = None;
             self.screen = Screen::Management(screen);
             return;
         }
@@ -367,9 +427,6 @@ impl App {
                 }),
             );
         } else {
-            if key == KeyCode::Esc {
-                Arc::make_mut(&mut screen.scope).historical_environment = None;
-            }
             self.navigate_management(key, screen);
         }
     }
@@ -396,17 +453,16 @@ impl App {
         }
         let request = match key {
             KeyCode::Char('r') => {
-                screen.page = ManagementPage::RollbackSelection {
+                screen.push_page(ManagementPage::RollbackSelection {
                     details: Arc::clone(details),
                     selected: BTreeSet::new(),
                     cursor: 0,
-                };
-                screen.scroll = 0;
+                });
                 self.screen = Screen::Management(screen);
                 return;
             }
             KeyCode::Char('i') => {
-                screen.page = ManagementPage::InspectSelection {
+                screen.push_page(ManagementPage::InspectSelection {
                     source: Some(details.record.deployment.clone()),
                     historical_releases: details
                         .snapshots
@@ -424,8 +480,7 @@ impl App {
                         .map(|snapshot| snapshot.release.component.clone())
                         .collect(),
                     cursor: 0,
-                };
-                screen.scroll = 0;
+                });
                 self.screen = Screen::Management(screen);
                 return;
             }
@@ -440,10 +495,9 @@ impl App {
 
     fn navigate_management(&mut self, key: KeyCode, mut screen: ManagementScreen) {
         if key == KeyCode::Esc {
-            screen.page = ManagementPage::Home;
-            screen.scroll = 0;
+            screen.go_back();
         } else {
-            scroll_key(key, &mut screen.scroll);
+            screen.view.handle_key(key);
         }
         self.screen = Screen::Management(screen);
     }
@@ -465,13 +519,13 @@ impl App {
                 offset: 0,
             })),
             KeyCode::Char('i') if screen.scope.historical_environment.is_none() => {
-                screen.page = ManagementPage::InspectSelection {
+                screen.push_page(ManagementPage::InspectSelection {
                     source: None,
                     historical_releases: Vec::new(),
                     names: screen.scope.components(),
                     selected: screen.scope.components().into_iter().collect(),
                     cursor: 0,
-                };
+                });
                 None
             }
             KeyCode::Left | KeyCode::Right if screen.scope.historical_environment.is_none() => {
@@ -489,11 +543,17 @@ impl App {
                     .environment
                     .clone_from(&names[next]);
                 self.remember_environment(&screen.scope.config, &screen.scope.environment);
+                screen.view = viewport::Viewport::default();
+                screen.notice = None;
+                None
+            }
+            KeyCode::Esc if !screen.back.is_empty() => {
+                screen.go_back();
                 None
             }
             KeyCode::Esc if screen.scope.historical_environment.is_some() => {
                 Arc::make_mut(&mut screen.scope).historical_environment = None;
-                screen.scroll = 0;
+                screen.view = viewport::Viewport::default();
                 None
             }
             KeyCode::Esc => {
@@ -523,7 +583,7 @@ impl App {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
-            self.message = Some("Background runtime is unavailable.".into());
+            self.management_start_failed(origin, request, "Background runtime is unavailable.");
             return;
         };
         let id = uuid::Uuid::now_v7();
@@ -536,6 +596,7 @@ impl App {
         let execution_progress = matches!(request, ManagementRequest::Execute(_))
             .then(crate::tui::live_progress::LiveProgress::default);
         let worker_progress = execution_progress.clone();
+        let worker_request = request.clone();
         let spawn = std::thread::Builder::new()
             .name("shipforge-management".into())
             .spawn(move || {
@@ -544,10 +605,10 @@ impl App {
                         if let Some(progress) = worker_progress.clone() {
                             let events = super::ProgressEvents { progress };
                             gateway
-                                .run_with_events(&scope, request, &events, &worker_cancel)
+                                .run_with_events(&scope, worker_request, &events, &worker_cancel)
                                 .await
                         } else {
-                            gateway.run(&scope, request, &worker_cancel).await
+                            gateway.run(&scope, worker_request, &worker_cancel).await
                         }
                     })
                 });
@@ -573,18 +634,24 @@ impl App {
                         started: Instant::now(),
                         cancelling: false,
                     },
-                    scroll: 0,
+                    view: viewport::Viewport::default(),
+                    back: Vec::new(),
+                    notice: None,
                 });
                 self.management_task = Some(ManagementTask {
                     id,
                     origin,
                     cancellation,
                     execution_progress,
+                    request,
                 });
             }
             Err(_) => {
-                self.message =
-                    Some("Could not start management worker; nothing was started.".into());
+                self.management_start_failed(
+                    origin,
+                    request,
+                    "Could not start management worker; nothing was started.",
+                );
             }
         }
     }
@@ -622,10 +689,21 @@ impl App {
         }
         self.poll_live_logs();
         let mut screen = task.origin;
+        let cancelled = task.cancellation.is_cancelled();
+        if cancelled && task.request.discards_cancelled_result() {
+            screen.notice = Some(
+                "Request cancelled. The previous page is retained; no new query result or rollback preview was accepted. Refresh or check again explicitly."
+                    .into(),
+            );
+            self.screen = Screen::Management(screen);
+            return;
+        }
+        if matches!(task.request, ManagementRequest::Execute(_)) {
+            screen.consume_rollback_navigation();
+        }
         match result {
             Ok(page) => {
-                screen.page = page;
-                screen.scroll = 0;
+                screen.accept_result(&task.request, page);
             }
             Err(error) => {
                 let message = render::safe_text(&error);
@@ -638,11 +716,33 @@ impl App {
                         message,
                         progress,
                     };
-                    screen.scroll = 0;
+                    screen.view = viewport::Viewport::default();
+                } else {
+                    screen.show_failure(task.request, message);
                 }
             }
         }
+        if cancelled {
+            screen.notice = Some(
+                "Cancellation was requested. Available observations and execution outcomes are retained below; cancellation does not prove that nothing happened."
+                    .into(),
+            );
+        }
         self.screen = Screen::Management(screen);
+    }
+
+    fn management_start_failed(
+        &mut self,
+        mut origin: ManagementScreen,
+        request: ManagementRequest,
+        message: &str,
+    ) {
+        self.message = Some(message.into());
+        if matches!(request, ManagementRequest::Execute(_)) {
+            origin.consume_rollback_navigation();
+        }
+        origin.show_failure(request, message.into());
+        self.screen = Screen::Management(origin);
     }
 }
 
@@ -784,17 +884,10 @@ fn move_cursor(key: KeyCode, cursor: &mut usize, count: usize) {
     *cursor = match key {
         KeyCode::Up => cursor.saturating_sub(1),
         KeyCode::Down => cursor.saturating_add(1).min(count.saturating_sub(1)),
-        _ => *cursor,
-    };
-}
-
-fn scroll_key(key: KeyCode, scroll: &mut u16) {
-    *scroll = match key {
-        KeyCode::Up => scroll.saturating_sub(1),
-        KeyCode::Down => scroll.saturating_add(1),
-        KeyCode::PageUp => scroll.saturating_sub(10),
-        KeyCode::PageDown => scroll.saturating_add(10),
+        KeyCode::PageUp => cursor.saturating_sub(10),
+        KeyCode::PageDown => cursor.saturating_add(10).min(count.saturating_sub(1)),
         KeyCode::Home => 0,
-        _ => *scroll,
+        KeyCode::End => count.saturating_sub(1),
+        _ => *cursor,
     };
 }

@@ -213,6 +213,7 @@ async fn browse_removed_environment(
     assert!(text.contains("retired-environment-log"));
     assert!(text.contains(&old_deployment.to_string()));
     press(app, KeyCode::Esc); // detail
+    press(app, KeyCode::Esc); // historical History, preserving its selection
     press(app, KeyCode::Esc); // historical Home
     press(app, KeyCode::Char('p'));
     finish(app).await;
@@ -222,7 +223,9 @@ async fn browse_removed_environment(
         panic!("old report expected")
     };
     assert_eq!(report.as_ref(), saved);
+    press(app, KeyCode::Esc); // saved reports, preserving its selection
     press(app, KeyCode::Esc); // historical Home
+    press(app, KeyCode::Esc); // historical Environment selector in current scope
     press(app, KeyCode::Esc); // current Home
     assert!(screen(app).scope.historical_environment.is_none());
 }

@@ -234,7 +234,7 @@ async fn worker_panic_returns_to_origin_without_exposing_the_panic_payload() {
     app.management_gateway = Arc::new(fake);
     app.handle_key(key(KeyCode::Char('h')));
     finished(&mut app).await;
-    assert!(matches!(screen(&app).page, ManagementPage::Home));
+    assert!(matches!(screen(&app).page, ManagementPage::Failed { .. }));
     let message = app.message.unwrap();
     assert!(message.contains("stopped unexpectedly"));
     assert!(!message.contains("private-secret"));
@@ -249,6 +249,7 @@ fn stale_results_do_not_replace_current_screen_or_clear_the_active_request() {
         origin: screen(&app),
         cancellation: CancellationToken::new(),
         execution_progress: None,
+        request: ManagementRequest::History(DeploymentQuery::default()),
     });
     app.finish_management(uuid::Uuid::now_v7(), Err("stale failure".into()));
     assert_eq!(app.management_task.as_ref().unwrap().id, id);

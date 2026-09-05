@@ -146,6 +146,7 @@ async fn execute_error_keeps_this_requests_logs_and_does_not_hijack_source_histo
     // The source record's normal l entry must keep its own exact historical scope.
     let mut source_screen = failed_screen.clone();
     source_screen.page = ManagementPage::Detail(Arc::clone(&fixture.details));
+    source_screen.view = viewport::Viewport::default();
     fixture.app.screen = Screen::Management(source_screen);
     assert!(!fixture.app.management_has_live_progress());
     press(&mut fixture.app, KeyCode::Char('l'));

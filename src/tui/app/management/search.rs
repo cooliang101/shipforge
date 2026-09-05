@@ -101,7 +101,7 @@ impl App {
             | ManagementPage::RollbackTargets { cursor, .. } => *cursor = index,
             _ => return,
         }
-        screen.scroll = 0;
+        screen.view = super::viewport::Viewport::default();
         self.screen = Screen::Management(screen);
     }
 }

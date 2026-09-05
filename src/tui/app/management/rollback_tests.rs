@@ -2,6 +2,8 @@
 
 #[path = "rollback_failure_tests.rs"]
 mod failure_tests;
+#[path = "navigation_rollback_tests.rs"]
+mod navigation_tests;
 
 use std::{any::Any, sync::Mutex, time::Duration};
 
@@ -586,7 +588,7 @@ async fn keyboard_subset_rollback_requires_plain_confirmation_and_preserves_exac
     press(&mut fixture.app, KeyCode::Esc);
     assert!(matches!(
         super::tests::screen(&fixture.app).page,
-        ManagementPage::Home
+        ManagementPage::RollbackTargets { .. }
     ));
     assert!(fixture.driver.0.lock().unwrap().mutations.is_empty());
     fixture.open_review().await;
