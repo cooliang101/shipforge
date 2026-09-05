@@ -8,21 +8,52 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    runs-on: ${{ matrix.os }}
+  stable-platform:
+    name: stable / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            executable: shipforge
+          - runner: windows-2022
+            target: x86_64-pc-windows-gnu
+            executable: shipforge.exe
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            executable: shipforge
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: stable-${{ matrix.target }}
+      - name: Record native toolchain
+        shell: pwsh
+        run: |
+          Write-Output "runner=${{ matrix.runner }} arch=${{ runner.arch }} target=${{ matrix.target }} commit=${{ github.sha }}"
+          rustc -Vv
+          cargo -V
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --target ${{ matrix.target }} --all-targets --all-features
+      - run: cargo build --locked --target ${{ matrix.target }} --release
+      - name: Run native release TUI smoke
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path -LiteralPath "target/${{ matrix.target }}/release/${{ matrix.executable }}").Path
+          $env:SHIPFORGE_RELEASE_SMOKE_BINARY = $binary
+          cargo test --locked --target ${{ matrix.target }} --test platform_smoke release_binary_q_exits_and_restores_terminal -- --ignored --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target ${{ matrix.target }} --test platform_smoke release_binary_recovers_after_idle_ctrl_c_bytes_then_q -- --ignored --exact --nocapture --test-threads=1
+      - name: Run isolated TUI performance gate
+        run: cargo test --locked --target ${{ matrix.target }} --lib tui::app::performance_tests::isolated_tui_stress_stays_responsive_and_memory_bounded -- --ignored --exact --nocapture --test-threads=1
       - name: Check disposable fixture cleanup
         if: runner.os == 'Windows'
         shell: pwsh
@@ -34,6 +65,62 @@ jobs:
       - name: Check systemd fixture safety
         if: runner.os == 'Linux'
         run: python3 -B tests/fixtures/systemd/test_fixture.py
+      - name: Run native Linux OpenSSH release gate
+        if: runner.os == 'Linux'
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          bash tests/run-linux-qa01-runner-tests.sh
+          bash tests/run-linux-qa01-release-gate.sh
+      - name: Run native macOS OpenSSH release gate
+        if: runner.os == 'macOS'
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          bash tests/run-macos-qa01-runner-tests.sh
+          bash tests/run-macos-qa01-release-gate.sh
+
+  msrv-platform:
+    name: Rust 1.88.0 / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            executable: shipforge
+          - runner: windows-2022
+            target: x86_64-pc-windows-gnu
+            executable: shipforge.exe
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            executable: shipforge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: 1.88.0-${{ matrix.target }}
+      - name: Record minimum toolchain
+        shell: pwsh
+        run: |
+          Write-Output "runner=${{ matrix.runner }} arch=${{ runner.arch }} target=${{ matrix.target }} commit=${{ github.sha }}"
+          rustc -Vv
+          cargo -V
+      - run: cargo test --locked --target ${{ matrix.target }} --all-targets --all-features
+      - run: cargo build --locked --target ${{ matrix.target }} --release
+      - name: Run minimum-toolchain release TUI smoke
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path -LiteralPath "target/${{ matrix.target }}/release/${{ matrix.executable }}").Path
+          $env:SHIPFORGE_RELEASE_SMOKE_BINARY = $binary
+          cargo test --locked --target ${{ matrix.target }} --test platform_smoke release_binary_q_exits_and_restores_terminal -- --ignored --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target ${{ matrix.target }} --test platform_smoke release_binary_recovers_after_idle_ctrl_c_bytes_then_q -- --ignored --exact --nocapture --test-threads=1
 
   audit:
     runs-on: ubuntu-latest

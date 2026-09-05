@@ -8,6 +8,7 @@ PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 AuthenticationMethods publickey
+PermitUserEnvironment SHIPFORGE_QA01_AUTH
 UsePAM no
 StrictModes yes
 AllowTcpForwarding no

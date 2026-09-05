@@ -1,20 +1,6 @@
 # Failure-only, read-only diagnostics for the runner's exact disposable containers.
 # Loading this file defines functions only; it never starts a process.
 
-function New-FixtureDiagnosticProcess {
-    param([string]$Distribution, [string[]]$Arguments)
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo.FileName = 'wsl.exe'
-    $process.StartInfo.UseShellExecute = $false
-    $process.StartInfo.CreateNoWindow = $true
-    $process.StartInfo.RedirectStandardOutput = $true
-    $process.StartInfo.RedirectStandardError = $true
-    foreach ($argument in @('-d', $Distribution, '--exec', 'docker', '-H', 'unix:///var/run/docker.sock') + $Arguments) {
-        $process.StartInfo.ArgumentList.Add($argument)
-    }
-    return $process
-}
-
 function Invoke-FixtureDiagnosticCommand {
     param(
         [string]$Distribution,
@@ -22,64 +8,8 @@ function Invoke-FixtureDiagnosticCommand {
         [ValidateRange(1, 5000)][int]$TimeoutMilliseconds = 5000,
         [ValidateRange(1, 65536)][int]$MaxOutputBytes = 65536
     )
-    $process = New-FixtureDiagnosticProcess -Distribution $Distribution -Arguments $Arguments
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    $started = $false
-    $timedOut = $false
-    $truncated = $false
-    $exitCode = $null
-    $remainingBytes = $MaxOutputBytes
-    $captures = @([System.IO.MemoryStream]::new(), [System.IO.MemoryStream]::new())
-    $streams = @()
-    try {
-        if (-not $process.Start()) { throw 'Diagnostic helper did not start' }
-        $started = $true
-        $streams = @($process.StandardOutput.BaseStream, $process.StandardError.BaseStream)
-        $buffers = @([byte[]]::new(4096), [byte[]]::new(4096))
-        $reads = @($streams[0].ReadAsync($buffers[0], 0, 4096), $streams[1].ReadAsync($buffers[1], 0, 4096))
-        $ended = @($false, $false)
-        while (-not ($ended[0] -and $ended[1] -and $process.HasExited)) {
-            if ($timer.ElapsedMilliseconds -ge $TimeoutMilliseconds) { $timedOut = $true; break }
-            for ($index = 0; $index -lt 2; $index++) {
-                if ($ended[$index] -or -not $reads[$index].IsCompleted) { continue }
-                $count = $reads[$index].GetAwaiter().GetResult()
-                if ($count -eq 0) { $ended[$index] = $true; continue }
-                $take = [Math]::Min($remainingBytes, $count)
-                $captures[$index].Write($buffers[$index], 0, $take)
-                $remainingBytes -= $take
-                if ($take -ne $count) { $truncated = $true }
-                # Continue draining even after the retained-byte bound is reached.
-                $reads[$index] = $streams[$index].ReadAsync($buffers[$index], 0, 4096)
-            }
-            if (-not ($ended[0] -and $ended[1] -and $process.HasExited)) {
-                [System.Threading.Thread]::Sleep(5)
-            }
-        }
-        if (-not $timedOut) { $exitCode = $process.ExitCode }
-        return [pscustomobject]@{
-            ExitCode = $exitCode
-            TimedOut = $timedOut
-            Truncated = $truncated
-            Stdout = [System.Text.Encoding]::UTF8.GetString($captures[0].ToArray())
-            Stderr = [System.Text.Encoding]::UTF8.GetString($captures[1].ToArray())
-        }
-    } finally {
-        if ($started) {
-            try {
-                if (-not $process.HasExited) {
-                    # Only the helper created above, never a container or arbitrary process.
-                    $process.Kill($true)
-                    [void]$process.WaitForExit(250)
-                }
-            } catch { }
-        }
-        foreach ($capture in $captures) { $capture.Dispose() }
-        try { $process.Dispose() }
-        finally {
-            # Process.Dispose need not close manually consumed redirected streams.
-            foreach ($stream in $streams) { try { $stream.Dispose() } catch { } }
-        }
-    }
+    $nativeArguments = @('-d', $Distribution, '--exec', 'docker', '-H', 'unix:///var/run/docker.sock') + $Arguments
+    return Invoke-BoundedNativeCommand -FilePath 'wsl.exe' -Arguments $nativeArguments -TimeoutMilliseconds $TimeoutMilliseconds -MaxOutputBytes $MaxOutputBytes
 }
 
 function ConvertTo-FixtureDiagnosticText {

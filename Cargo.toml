@@ -32,7 +32,11 @@ uuid = { version = "1.26.0", features = ["serde", "v7"] }
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1.11"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
+portable-pty = "0.9.0"
 rand = "0.10.0"
 
 [profile.release]

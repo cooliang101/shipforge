@@ -1,22 +1,37 @@
 use std::{
     fmt,
+    io::Read,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use russh::{
-    ChannelMsg, Disconnect, client,
-    keys::{PrivateKeyWithHashAlg, ssh_key::Algorithm},
+    ChannelMsg, Disconnect, Sig, client,
+    keys::{PrivateKey, PrivateKeyWithHashAlg, ssh_key::Algorithm},
 };
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::{config::SshCredential, drivers::EventSink, telemetry::CommandSpec};
 
 use super::{HostKeyVerifier, LinuxSshDestination, probe::connect_platform_agent};
+
+const TCP_CONNECTION_PHASE: &str = "TCP connection";
+const SSH_HANDSHAKE_PHASE: &str = "SSH handshake and Host Key verification";
+const IDENTITY_FILE_LOADING_PHASE: &str = "IdentityFile credential loading";
+const SSH_AGENT_LOADING_PHASE: &str = "SSH Agent credential loading";
+const USER_AUTHENTICATION_PHASE: &str = "SSH user authentication";
+const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
+const REMOTE_COMMAND_SETTLE_GRACE: Duration = Duration::from_millis(50);
+const REMOTE_COMMAND_TERM_GRACE: Duration = Duration::from_millis(400);
+const REMOTE_COMMAND_KILL_GRACE: Duration = Duration::from_millis(400);
+const REMOTE_COMMAND_CLEANUP_BOUND: Duration = Duration::from_secs(1);
+static IDENTITY_FILE_LOAD_LIMITER: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
 // Both fingerprint capture and authenticated sessions issue latency-sensitive
 // SSH exchanges. Keep all protocol/security defaults and only disable Nagle.
@@ -82,13 +97,8 @@ impl AuthenticatedSession {
             .render_posix()
             .map_err(|error| SshConnectionError::Command(error.to_string()))?;
         let accepted = AtomicBool::new(false);
-        let operation = execute_command(&self.handle, &rendered, &accepted);
-        let result = tokio::select! {
-            () = cancellation.cancelled() => Err(SshConnectionError::Cancelled),
-            result = tokio::time::timeout(timeout, operation) => {
-                result.unwrap_or(Err(SshConnectionError::Timeout { timeout, phase: "remote command" }))
-            }
-        };
+        let result =
+            execute_command(&self.handle, &rendered, &accepted, timeout, cancellation).await;
         if let Some(events) = &self.command_events {
             record_command_result(
                 events.as_ref(),
@@ -125,63 +135,291 @@ pub struct RemoteCommandOutput {
     pub stderr_truncated: bool,
 }
 
+#[derive(Default)]
+struct RemoteCommandState {
+    exit_status: Option<u32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+impl RemoteCommandState {
+    fn into_known_output(self) -> Option<RemoteCommandOutput> {
+        self.exit_status.map(|exit_status| RemoteCommandOutput {
+            exit_status,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+        })
+    }
+
+    fn into_output(self) -> Result<RemoteCommandOutput, SshConnectionError> {
+        self.into_known_output()
+            .ok_or(SshConnectionError::MissingExitStatus)
+    }
+}
+
 async fn execute_command(
     handle: &client::Handle<HostKeyVerifier>,
     command: &str,
     accepted: &AtomicBool,
+    timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<RemoteCommandOutput, SshConnectionError> {
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|error| SshConnectionError::Protocol(error.to_string()))?;
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
+    let mut channel = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(SshConnectionError::Cancelled),
+        () = wait_for_deadline(deadline) => return Err(remote_command_timeout(timeout)),
+        result = handle.channel_open_session() => {
+            result.map_err(|error| SshConnectionError::Protocol(error.to_string()))?
+        }
+    };
 
-    channel
-        .exec(true, command)
-        .await
-        .map_err(|error| SshConnectionError::Protocol(error.to_string()))?;
+    let dispatch_interruption = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Some(SshConnectionError::Cancelled),
+        () = wait_for_deadline(deadline) => Some(remote_command_timeout(timeout)),
+        result = channel.exec(true, command) => {
+            result
+                .map_err(|error| SshConnectionError::Protocol(error.to_string()))?;
+            None
+        }
+    };
+    if let Some(error) = dispatch_interruption {
+        // Once `exec` has been polled, cancellation may race after its request
+        // was queued. Treat the command as possibly dispatched and terminate
+        // conservatively instead of only dropping the channel.
+        return finish_interrupted_command(
+            &mut channel,
+            accepted,
+            RemoteCommandState::default(),
+            error,
+        )
+        .await;
+    }
 
-    let mut exit_status = None;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut stdout_truncated = false;
-    let mut stderr_truncated = false;
-    while let Some(message) = channel.wait().await {
-        match message {
-            ChannelMsg::Success => accepted.store(true, Ordering::Release),
-            ChannelMsg::Data { data } => {
-                append_bounded(&mut stdout, &data, &mut stdout_truncated);
+    receive_command_output(&mut channel, accepted, timeout, deadline, cancellation).await
+}
+
+async fn receive_command_output(
+    channel: &mut russh::Channel<client::Msg>,
+    accepted: &AtomicBool,
+    timeout: Duration,
+    deadline: Option<tokio::time::Instant>,
+    cancellation: &CancellationToken,
+) -> Result<RemoteCommandOutput, SshConnectionError> {
+    let mut state = RemoteCommandState::default();
+    loop {
+        let message = tokio::select! {
+            biased;
+            message = channel.wait() => message,
+            () = cancellation.cancelled() => {
+                return finish_interrupted_command(
+                    channel,
+                    accepted,
+                    state,
+                    SshConnectionError::Cancelled,
+                ).await;
             }
-            ChannelMsg::ExtendedData { data, .. } => {
-                append_bounded(&mut stderr, &data, &mut stderr_truncated);
+            () = wait_for_deadline(deadline) => {
+                return finish_interrupted_command(
+                    channel,
+                    accepted,
+                    state,
+                    remote_command_timeout(timeout),
+                ).await;
             }
-            ChannelMsg::ExitStatus {
-                exit_status: status,
-            } => {
-                accepted.store(true, Ordering::Release);
-                exit_status = Some(status);
-            }
-            ChannelMsg::ExitSignal {
-                signal_name,
-                error_message,
-                ..
-            } => {
-                accepted.store(true, Ordering::Release);
-                return Err(SshConnectionError::ExitSignal {
-                    signal: format!("{signal_name:?}"),
-                    message: error_message,
-                });
-            }
-            _ => {}
+        };
+        let Some(message) = message else {
+            break;
+        };
+        if let Some(error) = record_command_message(&mut state, accepted, message) {
+            close_command_channel(
+                channel,
+                tokio::time::Instant::now() + REMOTE_COMMAND_CLEANUP_BOUND,
+            )
+            .await;
+            return Err(error);
+        }
+        // A continuously ready data stream must not starve cancellation or
+        // the deadline merely because the message branch is biased. The bias
+        // still gives an already-ready terminal message first consideration.
+        if let Some(error) = observed_command_interruption(cancellation, deadline, timeout) {
+            return finish_interrupted_command(channel, accepted, state, error).await;
         }
     }
-    let exit_status = exit_status.ok_or(SshConnectionError::MissingExitStatus)?;
-    Ok(RemoteCommandOutput {
-        exit_status,
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
-    })
+    state.into_output()
+}
+
+fn record_command_message(
+    state: &mut RemoteCommandState,
+    accepted: &AtomicBool,
+    message: ChannelMsg,
+) -> Option<SshConnectionError> {
+    match message {
+        ChannelMsg::Success => accepted.store(true, Ordering::Release),
+        ChannelMsg::Data { data } => {
+            append_bounded(&mut state.stdout, &data, &mut state.stdout_truncated);
+        }
+        ChannelMsg::ExtendedData { data, .. } => {
+            append_bounded(&mut state.stderr, &data, &mut state.stderr_truncated);
+        }
+        ChannelMsg::ExitStatus {
+            exit_status: status,
+        } => {
+            accepted.store(true, Ordering::Release);
+            state.exit_status = Some(status);
+        }
+        ChannelMsg::ExitSignal {
+            signal_name,
+            error_message,
+            ..
+        } => {
+            accepted.store(true, Ordering::Release);
+            return Some(SshConnectionError::ExitSignal {
+                signal: format!("{signal_name:?}"),
+                message: error_message,
+            });
+        }
+        _ => {}
+    }
+    None
+}
+
+fn observed_command_interruption(
+    cancellation: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    timeout: Duration,
+) -> Option<SshConnectionError> {
+    if cancellation.is_cancelled() {
+        Some(SshConnectionError::Cancelled)
+    } else if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        Some(remote_command_timeout(timeout))
+    } else {
+        None
+    }
+}
+
+async fn finish_interrupted_command(
+    channel: &mut russh::Channel<client::Msg>,
+    accepted: &AtomicBool,
+    mut state: RemoteCommandState,
+    error: SshConnectionError,
+) -> Result<RemoteCommandOutput, SshConnectionError> {
+    let cleanup_started = tokio::time::Instant::now();
+    let cleanup_deadline = cleanup_started + REMOTE_COMMAND_CLEANUP_BOUND;
+    if state.exit_status.is_some() {
+        close_command_channel(channel, cleanup_deadline).await;
+        return state.into_output();
+    }
+
+    let settle_deadline = (cleanup_started + REMOTE_COMMAND_SETTLE_GRACE).min(cleanup_deadline);
+    if let Some(result) =
+        settle_remote_command(channel, accepted, &mut state, settle_deadline).await
+    {
+        close_command_channel(channel, cleanup_deadline).await;
+        return result;
+    }
+    // Outcomes observed after TERM may be caused by our interruption request;
+    // they confirm cleanup but must not replace the original classification.
+    terminate_remote_command(channel, accepted, cleanup_deadline).await;
+    Err(error)
+}
+
+async fn settle_remote_command(
+    channel: &mut russh::Channel<client::Msg>,
+    accepted: &AtomicBool,
+    state: &mut RemoteCommandState,
+    deadline: tokio::time::Instant,
+) -> Option<Result<RemoteCommandOutput, SshConnectionError>> {
+    loop {
+        let message = tokio::select! {
+            biased;
+            message = channel.wait() => message,
+            () = tokio::time::sleep_until(deadline) => return None,
+        };
+        let Some(message) = message else {
+            return Some(Err(SshConnectionError::MissingExitStatus));
+        };
+        if let Some(error) = record_command_message(state, accepted, message) {
+            return Some(Err(error));
+        }
+        if state.exit_status.is_some() {
+            return Some(std::mem::take(state).into_output());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+fn remote_command_timeout(timeout: Duration) -> SshConnectionError {
+    SshConnectionError::Timeout {
+        timeout,
+        phase: "remote command",
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn terminate_remote_command(
+    channel: &mut russh::Channel<client::Msg>,
+    accepted: &AtomicBool,
+    cleanup_deadline: tokio::time::Instant,
+) {
+    let term_deadline =
+        (tokio::time::Instant::now() + REMOTE_COMMAND_TERM_GRACE).min(cleanup_deadline);
+    let _ = tokio::time::timeout_at(term_deadline, channel.signal(Sig::TERM)).await;
+    if wait_for_remote_termination(channel, accepted, term_deadline).await {
+        close_command_channel(channel, cleanup_deadline).await;
+        return;
+    }
+    let kill_deadline =
+        (tokio::time::Instant::now() + REMOTE_COMMAND_KILL_GRACE).min(cleanup_deadline);
+    let _ = tokio::time::timeout_at(kill_deadline, channel.signal(Sig::KILL)).await;
+    let _ = wait_for_remote_termination(channel, accepted, kill_deadline).await;
+    close_command_channel(channel, cleanup_deadline).await;
+}
+
+async fn wait_for_remote_termination(
+    channel: &mut russh::Channel<client::Msg>,
+    accepted: &AtomicBool,
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        let Ok(message) = tokio::time::timeout_at(deadline, channel.wait()).await else {
+            return false;
+        };
+        match message {
+            None | Some(ChannelMsg::Close | ChannelMsg::Failure | ChannelMsg::OpenFailure(_)) => {
+                return true;
+            }
+            Some(ChannelMsg::Success) => accepted.store(true, Ordering::Release),
+            Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. }) => {
+                accepted.store(true, Ordering::Release);
+                return true;
+            }
+            Some(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+async fn close_command_channel(
+    channel: &russh::Channel<client::Msg>,
+    deadline: tokio::time::Instant,
+) {
+    let _ = tokio::time::timeout_at(deadline, channel.close()).await;
 }
 
 fn append_bounded(target: &mut Vec<u8>, source: &[u8], truncated: &mut bool) {
@@ -225,28 +463,30 @@ async fn connect_and_authenticate(
     // One deadline covers all stages. Diagnostics must not grant authentication
     // a fresh timeout or weaken the confirmed Host Key check.
     let deadline = tokio::time::Instant::now().checked_add(timeout);
-    let mut handle = connection_phase(
-        deadline,
-        timeout,
-        "network connection and SSH handshake",
-        async {
-            client::connect(
-                client_config(),
-                (destination.host.as_str(), destination.port),
-                HostKeyVerifier::strict(destination.host_key.clone()),
-            )
+    let config = client_config();
+    let socket = connection_phase(deadline, timeout, TCP_CONNECTION_PHASE, async {
+        tokio::net::TcpStream::connect((destination.host.as_str(), destination.port))
             .await
             .map_err(|error| SshConnectionError::Protocol(error.to_string()))
-        },
-    )
+    })
     .await?;
-    let authenticated = connection_phase(
-        deadline,
-        timeout,
-        "credential loading and authentication",
-        authenticate(&mut handle, destination, credential),
-    )
+    // Match `russh::client::connect`: TCP_NODELAY is best-effort and a
+    // platform refusal does not change the protocol or authentication result.
+    if config.nodelay {
+        let _ = socket.set_nodelay(true);
+    }
+    let mut handle = connection_phase(deadline, timeout, SSH_HANDSHAKE_PHASE, async {
+        client::connect_stream(
+            config,
+            socket,
+            HostKeyVerifier::strict(destination.host_key.clone()),
+        )
+        .await
+        .map_err(|error| SshConnectionError::Protocol(error.to_string()))
+    })
     .await?;
+    let authenticated =
+        authenticate(&mut handle, destination, credential, deadline, timeout).await?;
     if !authenticated {
         return Err(SshConnectionError::Rejected);
     }
@@ -300,57 +540,225 @@ async fn authenticate(
     handle: &mut client::Handle<HostKeyVerifier>,
     destination: &LinuxSshDestination,
     credential: &SshCredential,
+    deadline: Option<tokio::time::Instant>,
+    timeout: Duration,
 ) -> Result<bool, SshConnectionError> {
-    Ok(match credential {
+    match credential {
         SshCredential::IdentityFile { path } => {
-            let path = path.clone();
-            let key = tokio::task::spawn_blocking(move || russh::keys::load_secret_key(path, None))
-                .await
-                .map_err(|error| SshConnectionError::Key(error.to_string()))?
-                .map_err(|error| SshConnectionError::Key(error.to_string()))?;
-            ensure_supported_algorithm(&key.algorithm())?;
-            handle
-                .authenticate_publickey(
-                    destination.user.clone(),
-                    PrivateKeyWithHashAlg::new(Arc::new(key), None),
-                )
-                .await
-                .map_err(|error| SshConnectionError::Protocol(error.to_string()))?
-                .success()
+            let key = load_identity_file(path, deadline, timeout).await?;
+            connection_phase(deadline, timeout, USER_AUTHENTICATION_PHASE, async {
+                handle
+                    .authenticate_publickey(
+                        destination.user.clone(),
+                        PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                    )
+                    .await
+                    .map(|result| result.success())
+                    .map_err(|error| SshConnectionError::Protocol(error.to_string()))
+            })
+            .await
         }
         SshCredential::Agent { fingerprint } => {
-            let mut agent = connect_platform_agent()
-                .await
-                .map_err(|error| SshConnectionError::Agent(error.to_string()))?;
-            let identities = agent
-                .request_identities()
-                .await
-                .map_err(|error| SshConnectionError::Agent(error.to_string()))?;
-            let identity = identities
-                .into_iter()
-                .find(|identity| {
-                    identity
-                        .public_key()
-                        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
-                        .to_string()
-                        == *fingerprint
+            let (mut agent, public_key) =
+                connection_phase(deadline, timeout, SSH_AGENT_LOADING_PHASE, async {
+                    let mut agent = connect_platform_agent()
+                        .await
+                        .map_err(|error| SshConnectionError::Agent(error.to_string()))?;
+                    let identities = agent
+                        .request_identities()
+                        .await
+                        .map_err(|error| SshConnectionError::Agent(error.to_string()))?;
+                    let identity = identities
+                        .into_iter()
+                        .find(|identity| {
+                            identity
+                                .public_key()
+                                .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                                .to_string()
+                                == *fingerprint
+                        })
+                        .ok_or_else(|| {
+                            SshConnectionError::MissingAgentIdentity(fingerprint.clone())
+                        })?;
+                    if matches!(
+                        identity,
+                        russh::keys::agent::AgentIdentity::Certificate { .. }
+                    ) {
+                        return Err(SshConnectionError::UnsupportedCertificate);
+                    }
+                    let public_key = identity.public_key().into_owned();
+                    ensure_supported_algorithm(&public_key.algorithm())?;
+                    Ok((agent, public_key))
                 })
-                .ok_or_else(|| SshConnectionError::MissingAgentIdentity(fingerprint.clone()))?;
-            if matches!(
-                identity,
-                russh::keys::agent::AgentIdentity::Certificate { .. }
-            ) {
-                return Err(SshConnectionError::UnsupportedCertificate);
-            }
-            let public_key = identity.public_key().into_owned();
-            ensure_supported_algorithm(&public_key.algorithm())?;
-            handle
-                .authenticate_publickey_with(destination.user.clone(), public_key, None, &mut agent)
-                .await
-                .map_err(|error| SshConnectionError::Agent(error.to_string()))?
-                .success()
+                .await?;
+            connection_phase(deadline, timeout, USER_AUTHENTICATION_PHASE, async {
+                handle
+                    .authenticate_publickey_with(
+                        destination.user.clone(),
+                        public_key,
+                        None,
+                        &mut agent,
+                    )
+                    .await
+                    .map(|result| result.success())
+                    .map_err(|error| SshConnectionError::Agent(error.to_string()))
+            })
+            .await
         }
+    }
+}
+
+async fn load_identity_file(
+    path: &std::path::Path,
+    deadline: Option<tokio::time::Instant>,
+    timeout: Duration,
+) -> Result<PrivateKey, SshConnectionError> {
+    let path = path.to_path_buf();
+    load_identity_file_with_limiter(
+        Arc::clone(&IDENTITY_FILE_LOAD_LIMITER),
+        deadline,
+        timeout,
+        move || load_identity_file_blocking(&path),
+    )
+    .await
+}
+
+async fn load_identity_file_with_limiter(
+    limiter: Arc<Semaphore>,
+    deadline: Option<tokio::time::Instant>,
+    timeout: Duration,
+    operation: impl FnOnce() -> Result<PrivateKey, SshConnectionError> + Send + 'static,
+) -> Result<PrivateKey, SshConnectionError> {
+    connection_phase(deadline, timeout, IDENTITY_FILE_LOADING_PHASE, async move {
+        // Filesystem calls can block indefinitely on a disconnected network or
+        // virtual filesystem even when their async wrapper is dropped. Keep the
+        // whole read/parse operation on one detached, single-flight OS thread:
+        // the connection deadline remains effective, retries cannot accumulate
+        // blocked workers, and Tokio runtime shutdown never waits for the worker.
+        let permit = limiter
+            .acquire_owned()
+            .await
+            .map_err(|_| identity_key_error("the IdentityFile loader is unavailable"))?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let _worker = std::thread::Builder::new()
+            .name("shipforge-identity-loader".into())
+            .spawn(move || {
+                let result = operation();
+                drop(permit);
+                let _ = sender.send(result);
+            })
+            .map_err(|_| identity_key_error("the IdentityFile loader could not start"))?;
+        receiver
+            .await
+            .map_err(|_| identity_key_error("the IdentityFile loader stopped unexpectedly"))?
     })
+    .await
+}
+
+fn load_identity_file_blocking(path: &std::path::Path) -> Result<PrivateKey, SshConnectionError> {
+    #[cfg(windows)]
+    ensure_direct_windows_identity_path(path)?;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| identity_key_error("the selected file is unavailable"))?;
+    ensure_safe_identity_metadata(&metadata)?;
+    if metadata.len() > MAX_IDENTITY_FILE_BYTES {
+        return Err(identity_key_error(
+            "the selected file exceeds the 1 MiB limit",
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A path swapped after metadata validation must neither follow a
+        // symlink nor block this worker on a FIFO/device open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Inspect a swapped reparse point itself instead of following it.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| identity_key_error("the selected file could not be opened safely"))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| identity_key_error("the selected file metadata is unavailable"))?;
+    ensure_safe_identity_metadata(&opened_metadata)?;
+    if opened_metadata.len() > MAX_IDENTITY_FILE_BYTES {
+        return Err(identity_key_error(
+            "the selected file exceeds the 1 MiB limit",
+        ));
+    }
+
+    let capacity = usize::try_from(opened_metadata.len())
+        .map_err(|_| identity_key_error("the selected file exceeds this platform's limit"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_IDENTITY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| identity_key_error("the selected file could not be read"))?;
+    if bytes.len() as u64 > MAX_IDENTITY_FILE_BYTES {
+        return Err(identity_key_error(
+            "the selected file exceeds the 1 MiB limit",
+        ));
+    }
+    let secret = String::from_utf8(bytes)
+        .map_err(|_| identity_key_error("the selected file is not valid UTF-8"))?;
+    let key = russh::keys::decode_secret_key(&secret, None)
+        .map_err(|_| identity_key_error("the selected file is not an unencrypted SSH key"))?;
+    ensure_supported_algorithm(&key.algorithm())?;
+    Ok(key)
+}
+
+fn ensure_safe_identity_metadata(metadata: &std::fs::Metadata) -> Result<(), SshConnectionError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(identity_key_error(
+            "the selected path must be a regular, non-symbolic-link file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(identity_key_error(
+                "the selected path must not be a Windows reparse point",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_direct_windows_identity_path(path: &std::path::Path) -> Result<(), SshConnectionError> {
+    use std::path::{Component, Prefix};
+
+    if path.is_absolute()
+        && matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        )
+    {
+        Ok(())
+    } else {
+        Err(identity_key_error(
+            "the selected IdentityFile must use a direct Windows drive path",
+        ))
+    }
+}
+
+fn identity_key_error(message: &'static str) -> SshConnectionError {
+    SshConnectionError::Key(message.into())
 }
 
 fn ensure_supported_algorithm(algorithm: &Algorithm) -> Result<(), SshConnectionError> {
@@ -516,6 +924,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_file_loader_accepts_only_bounded_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("identity_ed25519");
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        std::fs::write(
+            &key_path,
+            key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap(),
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(1);
+        let loaded = load_identity_file(
+            &key_path,
+            tokio::time::Instant::now().checked_add(timeout),
+            timeout,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.algorithm(), Algorithm::Ed25519);
+        #[cfg(windows)]
+        {
+            let canonical_key_path = std::fs::canonicalize(&key_path).unwrap();
+            let loaded = load_identity_file(
+                &canonical_key_path,
+                tokio::time::Instant::now().checked_add(timeout),
+                timeout,
+            )
+            .await
+            .unwrap();
+            assert_eq!(loaded.algorithm(), Algorithm::Ed25519);
+        }
+
+        let oversized = directory.path().join("oversized-key");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_IDENTITY_FILE_BYTES + 1)
+            .unwrap();
+        let error = load_identity_file(
+            &oversized,
+            tokio::time::Instant::now().checked_add(timeout),
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SshConnectionError::Key(_)));
+        assert!(
+            !error
+                .to_string()
+                .contains(oversized.to_string_lossy().as_ref())
+        );
+
+        let error = load_identity_file(
+            directory.path(),
+            tokio::time::Instant::now().checked_add(timeout),
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SshConnectionError::Key(_)));
+    }
+
+    #[test]
+    fn stalled_identity_loader_is_single_flight_and_does_not_hold_runtime_shutdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let limiter = Arc::new(Semaphore::new(1));
+        let release = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let worker_release = Arc::clone(&release);
+        let worker_spawned = Arc::clone(&spawned);
+        let timeout = Duration::from_millis(200);
+        let result = runtime.block_on(async {
+            load_identity_file_with_limiter(
+                Arc::clone(&limiter),
+                tokio::time::Instant::now().checked_add(timeout),
+                timeout,
+                move || {
+                    worker_spawned.fetch_add(1, Ordering::SeqCst);
+                    started_sender.send(()).unwrap();
+                    while !worker_release.load(Ordering::Acquire) {
+                        std::thread::park_timeout(Duration::from_millis(5));
+                    }
+                    finished_sender.send(()).unwrap();
+                    Err(identity_key_error("simulated stalled local read"))
+                },
+            )
+            .await
+        });
+        assert!(matches!(
+            result,
+            Err(SshConnectionError::Timeout {
+                phase: IDENTITY_FILE_LOADING_PHASE,
+                ..
+            })
+        ));
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(limiter.available_permits(), 0);
+
+        let runtime_drop_started = std::time::Instant::now();
+        drop(runtime);
+        assert!(runtime_drop_started.elapsed() < Duration::from_secs(1));
+
+        let retry_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let retry_spawned = Arc::clone(&spawned);
+        let retry_timeout = Duration::from_millis(50);
+        let retry = retry_runtime.block_on(async {
+            load_identity_file_with_limiter(
+                Arc::clone(&limiter),
+                tokio::time::Instant::now().checked_add(retry_timeout),
+                retry_timeout,
+                move || {
+                    retry_spawned.fetch_add(1, Ordering::SeqCst);
+                    Err(identity_key_error("unexpected concurrent loader"))
+                },
+            )
+            .await
+        });
+        assert!(matches!(retry, Err(SshConnectionError::Timeout { .. })));
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+        drop(retry_runtime);
+
+        release.store(true, Ordering::Release);
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        for _ in 0..100 {
+            if limiter.available_permits() == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("stalled identity worker did not release its single-flight permit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_file_loader_rejects_nonlocal_windows_paths_before_io() {
+        let path = std::path::Path::new(r"\\fixture-server\keys\identity_ed25519");
+        let error = load_identity_file_blocking(path).unwrap_err();
+        assert!(matches!(error, SshConnectionError::Key(_)));
+        assert!(!error.to_string().contains("fixture-server"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_file_loader_rejects_symlinks_and_special_files_without_opening_them() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let directory = tempfile::tempdir().unwrap();
+        let regular = directory.path().join("regular-key");
+        std::fs::write(&regular, "not read through symlink").unwrap();
+        let link = directory.path().join("linked-key");
+        symlink(&regular, &link).unwrap();
+        let socket = directory.path().join("socket-key");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let timeout = Duration::from_millis(250);
+
+        for path in [&link, &socket] {
+            let started = tokio::time::Instant::now();
+            let error = load_identity_file(path, started.checked_add(timeout), timeout)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SshConnectionError::Key(_)));
+            assert!(started.elapsed() < timeout);
+            assert!(!error.to_string().contains(path.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[tokio::test]
     async fn cancelled_connection_does_not_touch_the_network_or_key_file() {
         let destination = LinuxSshDestination {
             driver: crate::drivers::DriverKind::linux_ssh(),
@@ -539,27 +1128,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authentication_uses_existing_deadline_instead_of_a_fresh_timeout() {
-        let timeout = Duration::from_secs(15);
-        let deadline = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            connection_phase::<()>(
-                Some(deadline),
-                timeout,
-                "credential loading and authentication",
-                std::future::pending(),
-            ),
+    async fn later_connection_phase_uses_existing_deadline_instead_of_a_fresh_timeout() {
+        let timeout = Duration::from_millis(500);
+        let started = tokio::time::Instant::now();
+        let deadline = started.checked_add(timeout);
+        // Simulate earlier connection phases consuming most of the one shared
+        // budget before user authentication begins.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let userauth_started = tokio::time::Instant::now();
+        let result = connection_phase::<()>(
+            deadline,
+            timeout,
+            USER_AUTHENTICATION_PHASE,
+            std::future::pending(),
         )
-        .await
-        .expect("an exhausted shared deadline must not grant another 15 seconds");
+        .await;
         assert!(matches!(
             result,
             Err(SshConnectionError::Timeout {
                 timeout: budget,
-                phase: "credential loading and authentication",
+                phase: USER_AUTHENTICATION_PHASE,
             }) if budget == timeout
         ));
+        assert!(
+            userauth_started.elapsed() < Duration::from_millis(350),
+            "userauth must receive only the remaining shared budget"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(650),
+            "a fresh userauth timeout would extend the total budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_phase_labels_report_only_static_stage_and_shared_budget() {
+        let timeout = Duration::from_secs(15);
+        for phase in [
+            TCP_CONNECTION_PHASE,
+            SSH_HANDSHAKE_PHASE,
+            IDENTITY_FILE_LOADING_PHASE,
+            SSH_AGENT_LOADING_PHASE,
+            USER_AUTHENTICATION_PHASE,
+        ] {
+            assert_eq!(
+                connection_phase(
+                    tokio::time::Instant::now().checked_add(timeout),
+                    timeout,
+                    phase,
+                    async { Ok(42) },
+                )
+                .await
+                .unwrap(),
+                42
+            );
+            let error = connection_phase::<()>(
+                Some(tokio::time::Instant::now()),
+                timeout,
+                phase,
+                std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                &error,
+                SshConnectionError::Timeout {
+                    timeout: budget,
+                    phase: observed,
+                } if *budget == timeout && *observed == phase
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!("SSH operation timed out after {timeout:?} during {phase}")
+            );
+        }
     }
 
     #[tokio::test]
@@ -596,7 +1237,7 @@ mod tests {
         assert!(matches!(
             error,
             SshConnectionError::Timeout {
-                phase: "network connection and SSH handshake",
+                phase: SSH_HANDSHAKE_PHASE,
                 ..
             }
         ));
@@ -609,14 +1250,9 @@ mod tests {
         let deadline = tokio::time::Instant::now().checked_add(timeout);
         assert!(deadline.is_none());
         assert_eq!(
-            connection_phase(
-                deadline,
-                timeout,
-                "network connection and SSH handshake",
-                async { Ok(42) }
-            )
-            .await
-            .unwrap(),
+            connection_phase(deadline, timeout, TCP_CONNECTION_PHASE, async { Ok(42) })
+                .await
+                .unwrap(),
             42
         );
     }

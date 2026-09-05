@@ -147,13 +147,25 @@ fn fail(
     // Never display protocol text, paths, agent identities or remote output.
     let category = match error {
         SshConnectionError::Timeout {
-            phase: "network connection and SSH handshake",
+            phase: "TCP connection",
             ..
-        } => "handshake-timeout",
+        } => "tcp-timeout",
         SshConnectionError::Timeout {
-            phase: "credential loading and authentication",
+            phase: "SSH handshake and Host Key verification",
             ..
-        } => "authentication-timeout",
+        } => "handshake-or-host-key-timeout",
+        SshConnectionError::Timeout {
+            phase: "IdentityFile credential loading",
+            ..
+        } => "identity-file-timeout",
+        SshConnectionError::Timeout {
+            phase: "SSH Agent credential loading",
+            ..
+        } => "agent-timeout",
+        SshConnectionError::Timeout {
+            phase: "SSH user authentication",
+            ..
+        } => "userauth-timeout",
         SshConnectionError::Timeout { .. } => "operation-timeout",
         SshConnectionError::Cancelled => "cancelled",
         SshConnectionError::Protocol(_) => "protocol-or-host-key",

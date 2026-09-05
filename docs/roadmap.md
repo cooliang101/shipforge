@@ -116,6 +116,8 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ## M4：发布加固
 
+`QA-01` 已形成待 CI 验证的发行候选：stable 与最低 Rust 1.88 的 Windows GNU、Linux GNU、macOS arm64 原生矩阵及准确 release 二进制 PTY/ConPTY smoke 已接入；Linux/macOS stable job 另运行各自的隔离 OpenSSH 门禁，Windows OpenSSH 门禁保留为需要已有系统 Agent 的显式运行。Windows MinGW 全量门禁、ConPTY smoke 和真实 OpenSSH ReleaseGate 已在提交前候选树通过；Linux/macOS runner 的无副作用安全回归也已在本地通过，但最终提交仍须复跑 Windows 证据，stable 三平台同一提交、Rust 1.88 三平台及 Linux/macOS 原生 live gate 均尚无 CI 证据。因此 `QA-01`、M4 与完整 MVP **仍未验收**，也不标注正式平台支持。当前证据与明确边界见 [QA-01 候选记录](validation/qa-01.md)。
+
 - `QA-01`：完成确认后的 Windows、macOS、Linux 编译及 smoke test 矩阵；复核 TUI-MGT-01 早期未定位 SSH 连接超时，在阶段化诊断证据基础上给出支持条件与发行结论，不把单次复跑通过当作根因修复。
 - `QA-02`：对路径穿越、Shell 注入、Host Key、凭据、日志和归档权限做安全审查。
 - `QA-03`：验证 Driver SPI 契约、Project/Environment ID、Destination ID/revision、Component generation、配置兼容、远端元数据前向兼容和安装升级。
