@@ -40,5 +40,5 @@ cargo build --locked --release
 ## 本记录之外的验收
 
 - 本客户端验证不包含真实 systemd；用户随后授权准备临时环境，该部分已由 Windows 客户端驱动的 [WSL systemd 验收](systemd-acceptance.md) 补齐。
-- macOS、其他 Linux 发行版、声明的最低 Rust 1.88，以及完整 SSH Agent/Host Key 轮换矩阵。
+- 本记录未验证 macOS、其他 Linux 发行版、声明的最低 Rust 1.88 或完整 SSH Agent/Host Key 轮换矩阵。现行 MVP 仅支持 Windows，本记录保留为历史证据，不构成待补的平台门禁。
 - 活动部署中的退出、错误和 panic 的实机终端恢复，以及全部 TUI 页面视觉交互。此处只做了空项目列表的正常退出冒烟；后续信号与退出生命周期证据见 [TUI-05 验收](tui-05.md)。

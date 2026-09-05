@@ -2,7 +2,7 @@
 
 ## Goals and Boundaries
 
-ShipForge is a local Rust executable that builds Components and deploys them through capability-based Drivers. A reusable Destination may be a Linux host reached by SSH or, after the MVP, a managed platform account; each Environment configures its Components directly with a Destination and deployment settings.
+ShipForge is a local Rust executable that builds Components and deploys them through capability-based Drivers. The MVP client supports Windows x64 GNU only and is verified locally with the existing Rust/MinGW toolchain; GitHub stores repository commits, not test runs. Linux/macOS client code and historical evidence do not establish supported platforms. A reusable Destination may be a Linux host reached by SSH or, after the MVP, a managed platform account; each Environment configures its Components directly with a Destination and deployment settings.
 
 The MVP ships only the built-in `linux-ssh` Driver. Each Component selects exactly one Destination in an Environment, while several Components may reuse the same Destination with independent roots. One Component cannot be replicated across Destinations; rolling rollout, distributed atomicity, multi-process deployment coordination, external Driver plugins, AI Agent control, and automated database rollback are outside the MVP. AI Agent support is frozen: the MVP reserves no adapter, schema, protocol, or roadmap work package for it. SSH Agent remains only an authentication option.
 

@@ -65,7 +65,7 @@ MVP 阶段暂不建设完整 CI/CD 平台，不包含：
 
 MVP 仅支持以下范围：
 
-- 本地运行环境：优先支持 Windows、macOS 和 Linux；
+- 本地运行环境：仅支持 Windows x64 客户端，使用 GNU/MinGW 构建；Linux/macOS 客户端不进入 MVP；
 - Destination：用户级注册表可保存多套可复用 `linux-ssh` 连接，并可被多个项目引用；
 - 部署映射：每个 Environment 直接配置需要部署的 Component；每个 Component 在该 Environment 中指向一个 Destination；
 - 登录方式：SSH Key，优先使用 SSH Agent 和用户 SSH 配置；
@@ -475,10 +475,10 @@ Component root 必须是规范化绝对路径；同一 Destination 上不同 Com
 ### 9.3 可移植性
 
 - ShipForge 使用 Rust 实现，并发布单文件可执行程序；
-- 本地优先覆盖 Windows、macOS 和 Linux；
+- 本地仅支持 Windows x64，使用现有 Rust + MinGW 工具链进行本机编译、审查和测试，不在 GitHub 执行测试；推送只同步仓库内容；
 - 目标服务器首版仅支持 Linux；
 - 目标服务器除 SSH、基础 Shell 和解压工具外不应依赖专用运行时。
-- 本地构建命令、路径和归档权限必须有明确的跨平台语义；项目负责提供能为目标 Linux 生成有效构建输出的命令。
+- Windows 本地构建命令、路径与 Linux 目标归档权限必须有明确语义；项目负责提供能在 Windows 构建并为目标 Linux 生成有效输出的命令。
 
 ### 9.4 可观测性
 
@@ -595,7 +595,7 @@ failed deployment → compensation → restored | manual intervention required
 - 完善可搜索选择、部署确认、实时步骤和有界日志；
 - 完善发布历史、回滚和恢复体验；
 - 安全取消和终端状态恢复；
-- 跨平台 smoke test、安全审查和 ShipForge 可执行文件发布。
+- Windows 本机 smoke test、安全审查和 ShipForge 可执行文件打包。
 
 预计工作量：1.5～3 周。
 
@@ -620,6 +620,6 @@ failed deployment → compensation → restored | manual intervention required
 - 服务器应用日志查看；
 - 发布模板与项目脚手架。
 
-## 15. 待确认事项
+## 15. 平台与延期范围
 
-正式发布前，根据 `QA-01` 在 Windows、macOS 和 Linux 上的实际编译与 smoke test 结果标注支持等级。Shared Content、TCP/日志关键字健康检查、跳板机和 `ProxyJump` 已明确延期，不再作为 MVP 待确认项。
+客户端平台已限定为 Windows x64 GNU；`QA-01` 只要求本机编译、测试、ConPTY smoke 和真实 SSH 验收，不再要求三平台或 GitHub CI。实测工具链为既有 Rust 1.96.1 + MinGW；`Cargo.toml` 的 Rust 1.88 声明尚无独立最低版本实测，不作为已验证兼容性承诺。Linux/macOS 客户端、Shared Content、TCP/日志关键字健康检查、跳板机和 `ProxyJump` 均不进入 MVP。

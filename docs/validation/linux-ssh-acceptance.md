@@ -29,7 +29,7 @@ HTTP 由目标内的真实 Python 服务提供，根据实际 `current/health.tx
 | 门禁 | 结果 |
 | --- | --- |
 | `./tests/run-linux-acceptance.ps1` | 1 项真实双端部署验收通过，清理成功 |
-| `./tests/run-linux-acceptance-cleanup-tests.ps1` | 原生命令退出码及 6 个隔离清理场景通过；接入 Windows CI |
+| `./tests/run-linux-acceptance-cleanup-tests.ps1` | 原生命令退出码及 6 个隔离清理场景在 Windows 本机通过 |
 | `cargo test --all-targets --all-features --quiet` | 287 项单测和 1 项协议集成测试通过；2 项外部环境测试默认忽略，双端用例已单独显式执行 |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --all-targets --all-features -- -D warnings` | 通过 |
@@ -37,12 +37,12 @@ HTTP 由目标内的真实 Python 服务提供，根据实际 `current/health.tx
 | `cargo audit` | 退出码 0，未报告已知漏洞；仍有 `wnaf 0.14.0` 撤回警告，须在发布前跟进 |
 | `git diff --check` / 文档相对链接检查 | 通过 |
 
-上述命令均在本机执行；CI 步骤已配置，但本记录不宣称远端 CI 或其他平台执行通过。夹具文件固定 LF 行尾，避免 Windows checkout 改成 CRLF 后导致 Linux 启动脚本失败。
+上述命令均在本机执行；现行策略已移除 GitHub CI，本记录不宣称远端 CI 或其他平台执行通过。夹具文件固定 LF 行尾，避免 Windows checkout 改成 CRLF 后导致 Linux 启动脚本失败。
 
 WSL 的前台输入管道只用于保证 Windows 测试运行期间实例不退出，不修改 WSL 或 Docker 配置。清理限于本轮带匹配标签的容器、唯一镜像标签和精确临时密钥目录；Docker 构建缓存可能保留。
 
 ## 本记录之外的验收
 
 - 容器不运行 systemd，本记录只证明 HTTP 健康检查。用户随后授权安装 WSL SSH 服务端并继续测试；真实服务重启、无端口 Worker 稳定窗口及失败恢复已由独立 [systemd 验收](systemd-acceptance.md) 补齐，不倒填为本容器用例的能力。
-- Unix 专用子进程回归与 WSL Linux 的编译/正常退出冒烟已由后续 [Linux 客户端验证](linux-client.md) 补齐；macOS、其他 Linux 环境、SSH Agent 和 Host Key 轮换等完整平台矩阵仍属 QA-01。
+- Unix 专用子进程回归与 WSL Linux 的编译/正常退出冒烟已由后续 [Linux 客户端验证](linux-client.md) 补齐；现行 QA-01 只验证 Windows 客户端的 SSH Agent 和 Host Key 轮换等行为，Linux/macOS 客户端不再列为 MVP 门禁。
 - TUI 视觉交互、M2 历史/恢复/保留及 M3/M4 工作不由此测试证明完成。

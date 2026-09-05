@@ -2,9 +2,9 @@
 
 ## 目标与节奏
 
-本路线图覆盖 `docs/requirements.md` 的 MVP：本地 Rust 单文件程序以 Ratatui TUI 作为唯一用户入口，通过统一 Deployment Driver SPI 发布，首个且唯一交付的 Driver 是 `linux-ssh`。MVP 包含稳定身份与 Component generation、可复用 Destination、统一的带版本号 `tar.gz` Component Release、多 Component 编排及补偿回滚；无头 CLI、CI 和 AI Agent 调用不进入 MVP，不预留适配器、配置、协议或工作包。以 1 名全职开发者估算，基线为 10 周，合理范围为 8～12 周。
+本路线图覆盖 `docs/requirements.md` 的 MVP：本地 Rust 单文件程序以 Ratatui TUI 作为唯一用户入口，通过统一 Deployment Driver SPI 发布，首个且唯一交付的 Driver 是 `linux-ssh`。MVP 包含稳定身份与 Component generation、可复用 Destination、统一的带版本号 `tar.gz` Component Release、多 Component 编排及补偿回滚；无头 CLI、CI 和 AI Agent 调用不进入 MVP，不预留适配器、配置、协议或工作包。客户端只支持 Windows x64 GNU，验收使用现有 Rust + MinGW 在本机完成；GitHub 只同步仓库提交，不运行测试。以 1 名全职开发者估算，基线为 10 周，合理范围为 8～12 周。
 
-当前状态：核心架构已收敛，M0 主体及 M1 的 `HIS-00`、`BLD-01`、`ART-01`、`SSH-02`、`REL-01`、`REL-02`、`ORC-01`、`HLT-00` 已实施。工程骨架、核心领域模型、配置加载/初始化及 generation 更新、Destination 与最近 Project 注册表、Driver SPI、应用层规划器与安全边界已有代码和测试。本地构建已覆盖 Git 预检、结构化子进程、双流排空、输出上限、超时和进程树取消；单一路径 `artifact` 会自动识别文件或目录，并由通用归档层确定性地生成一次带 manifest、大小和 SHA-256 的不可变 `tar.gz` Release。Driver `prepare` 契约只能接收核心创建且字段封装的 `ReleasePackage`。`linux-ssh` 使用 64 KiB SFTP 流式上传、单次进度、最多五次有限重试、远端 SHA-256、硬链接 no-clobber 归档、Deployment 专属暂存解压和 no-clobber 版本目录提交；随后严格观察规范 `current`，校验准备凭证与 Deployment、真实目录类型及同文件系统条件，以临时软链接加原子重命名逐 Component 激活。切换前漂移会停止且只清理本次临时链接；切换后取消或 systemd 重启失败会用独立超时恢复原版本，首次部署则移除新链接并停止服务；补偿前再次观察，拒绝覆盖外部漂移。驱动无关编排器会先持久化副作用意图并完成所有选中 Component 的 Prepare，再按所选子图拓扑顺序 Activate；失败或取消后观察失败点，将确认生效的 Component 按实际顺序逆序补偿，并把逐 Component 结果和人工恢复错误写入 SQLite。`HLT-00` 已实现 Destination 端 HTTP/HTTPS、systemd 稳定窗口和健康失败补偿。TUI 已支持最近列表、键盘目录浏览、有效 Project 直接打开、Component 发现与勾选、逐 Component 分配 Destination、滚动预览及确认写入；首次设置也已接入简单 SSH config 候选、SSH Agent/IdentityFile/文件选择、后台 Host Key 获取、显式指纹确认、严格 Host Key 下的身份认证和 Destination 自动分配。认证后会通过受限、限长、可取消的只读远端命令探测默认目录状态和 systemd unit，并在 TUI 中选择可选服务。SSH 设置通过应用服务隔离 transport 类型；root、systemd 和 Host Key 等概念明确属于 `linux-ssh`，不提升为通用 Driver 契约。真实 loopback SSH/SFTP 协议测试已覆盖握手、Host Key、公钥认证、exec、部分写入失败后的清理重试、进度、冲突、上传中取消、远端 SHA-256 成功与不匹配、完整 Release Prepare、原子激活、最终观察、远端 HTTP 健康检查、失败补偿及远端探测；剩余外部 OpenSSH 认证、传输/命令取消、Host Key 轮换及跨平台矩阵保留为 `QA-01` 发布门禁。SSH 高级配置、Shared Content 和 AI Agent 控制均已移出 MVP。工作包状态应在项目跟踪系统维护，本文只定义顺序、范围和门禁。
+当前状态：核心架构已收敛，M0 主体及 M1 的 `HIS-00`、`BLD-01`、`ART-01`、`SSH-02`、`REL-01`、`REL-02`、`ORC-01`、`HLT-00` 已实施。工程骨架、核心领域模型、配置加载/初始化及 generation 更新、Destination 与最近 Project 注册表、Driver SPI、应用层规划器与安全边界已有代码和测试。本地构建已覆盖 Git 预检、结构化子进程、双流排空、输出上限、超时和进程树取消；单一路径 `artifact` 会自动识别文件或目录，并由通用归档层确定性地生成一次带 manifest、大小和 SHA-256 的不可变 `tar.gz` Release。Driver `prepare` 契约只能接收核心创建且字段封装的 `ReleasePackage`。`linux-ssh` 使用 64 KiB SFTP 流式上传、单次进度、最多五次有限重试、远端 SHA-256、硬链接 no-clobber 归档、Deployment 专属暂存解压和 no-clobber 版本目录提交；随后严格观察规范 `current`，校验准备凭证与 Deployment、真实目录类型及同文件系统条件，以临时软链接加原子重命名逐 Component 激活。切换前漂移会停止且只清理本次临时链接；切换后取消或 systemd 重启失败会用独立超时恢复原版本，首次部署则移除新链接并停止服务；补偿前再次观察，拒绝覆盖外部漂移。驱动无关编排器会先持久化副作用意图并完成所有选中 Component 的 Prepare，再按所选子图拓扑顺序 Activate；失败或取消后观察失败点，将确认生效的 Component 按实际顺序逆序补偿，并把逐 Component 结果和人工恢复错误写入 SQLite。`HLT-00` 已实现 Destination 端 HTTP/HTTPS、systemd 稳定窗口和健康失败补偿。TUI 已支持最近列表、键盘目录浏览、有效 Project 直接打开、Component 发现与勾选、逐 Component 分配 Destination、滚动预览及确认写入；首次设置也已接入简单 SSH config 候选、SSH Agent/IdentityFile/文件选择、后台 Host Key 获取、显式指纹确认、严格 Host Key 下的身份认证和 Destination 自动分配。认证后会通过受限、限长、可取消的只读远端命令探测默认目录状态和 systemd unit，并在 TUI 中选择可选服务。SSH 设置通过应用服务隔离 transport 类型；root、systemd 和 Host Key 等概念明确属于 `linux-ssh`，不提升为通用 Driver 契约。真实 loopback SSH/SFTP 协议测试已覆盖握手、Host Key、公钥认证、exec、部分写入失败后的清理重试、进度、冲突、上传中取消、远端 SHA-256 成功与不匹配、完整 Release Prepare、原子激活、最终观察、远端 HTTP 健康检查、失败补偿及远端探测；外部 OpenSSH 认证、传输/命令取消、Host Key 轮换及 Windows 本机发布门禁见 `QA-01` 验收记录。SSH 高级配置、Shared Content 和 AI Agent 控制均已移出 MVP。工作包状态应在项目跟踪系统维护，本文只定义顺序、范围和门禁。
 
 `HLT-00` 现已实现：`linux-ssh` 可在 Destination 端执行带重试和限时的 HTTP/HTTPS 检查，建立 systemd `NRestarts` 基线并验证稳定窗口，健康失败可使用激活凭证进入独立令牌补偿。配置采用内置默认值，不增加必填项。
 
@@ -20,14 +20,14 @@ WSL Linux 客户端已通过原生单测（含 Unix 继承管道回归）、协�
 
 ```text
 TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux SSH 闭环 → 恢复与查询 → 交互加固
-             └──────── 测试、安全、持久化、跨平台验证贯穿全程 ────────┘
+             └──────── 本机测试、安全、持久化验证贯穿全程 ──────────┘
 ```
 
 ## 里程碑总览
 
 | 阶段 | 单人基线 | 核心结果 | 完成门槛 |
 | --- | --- | --- | --- |
-| M0 工程与模型 | 第 1～2 周 | TUI 骨架、首次设置、身份与版本字段、Driver SPI、配置 | 可在 TUI 完成无副作用项目设置；Fake Driver 和 CI 通过 |
+| M0 工程与模型 | 第 1～2 周 | TUI 骨架、首次设置、身份与版本字段、Driver SPI、配置 | 可在 TUI 完成无副作用项目设置；Fake Driver 和本机质量门禁通过 |
 | M1 安全部署闭环 | 第 3～6 周 | TUI 驱动的构建、Release 上传、Component 激活及补偿恢复 | 故障不会留下未记录的远端状态 |
 | M2 历史与恢复 | 第 7～8 周 | TUI 查询、观测、对账、中断恢复、保留策略 | 重启及本地数据库丢失场景可解释 |
 | M3 TUI 加固 | 第 9 周 | 完整、一致且高性能的交互体验 | 所有操作均可在 TUI 完成且终端可恢复 |
@@ -36,7 +36,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 ## M0：工程与领域模型
 
 - `FND-01`：初始化 Cargo 项目、模块边界及开发/发布 profile。
-- `FND-02`：建立格式化、严格 Clippy、单测、依赖审计和平台编译 CI。
+- `FND-02`：建立 Windows 本机格式化、严格 Clippy、单测、依赖审计和 release 编译门禁；不在 GitHub 运行测试。
 - `TUI-00`：实现 `crossterm` 终端守卫、输入循环、路由、对话框、表单、可搜索选择列表和错误边界。
 - `DOM-01`：实现 Project/Environment 强类型稳定 ID、自动生成的不可变 Destination ID、Environment/Component generation、Deployment/Step 和 Component Release 模型。
 - `DOM-02`：穷举 Deployment 与逐 Component 结果、Environment Observation、能力拒绝和引用保留规则测试。
@@ -56,7 +56,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 ## M1：安全部署闭环
 
 - `HIS-00`：先实现最小 SQLite 操作日志、编号迁移和滚动原始日志，副作用前写入意图。
-- `BLD-01`：Git 预检、结构化子进程、stdout/stderr 持续排空、超时及跨平台进程树取消。
+- `BLD-01`：Git 预检、结构化子进程、stdout/stderr 持续排空、超时及 Windows 进程树取消。
 - `ART-01`：校验每个 Component 的单一文件/目录构建输出，规范化归档路径、应用 Unix 模式，并恰好生成一次带 manifest 和 SHA-256 的 `<version>.tar.gz` Release。
 - `SSH-02`：实现连接、Host Key 验证、远端命令、SFTP 进度、有限重试和远端哈希验证。
 - `REL-01`：让 `linux-ssh` 接收 `ART-01` 生成的不可变 Release，上传并校验 SHA-256，原样保存压缩包并解压到对应版本目录；Driver 不参与重新打包。
@@ -110,25 +110,25 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 `TUI-05` 已实现并通过工作包验收：活动工作上的退出确认、全部 App 级任务的取消与线程 join、匹配请求结果分类、Unix/Windows 控制事件、部分终端初始化清理，以及正常/错误/panic 的脱敏恢复路径已接入。两轮独立审查无 P0/P1/P2；Windows 955 / Linux 976 项库测试、各 14 项协议与 1 项中断恢复父用例、双平台格式/严格 Clippy/release 均通过。Linux 发布构建还以真实 PTY 直接验证 `q` 及 `INT`/`TERM`/`HUP` 的退出码、termios、alternate screen 和光标恢复。范围、测试工具陷阱及不可拦截终止限制见 [TUI-05 记录](validation/tui-05.md)。
 
-`TUI-06` 已实现并通过工作包验收：空闲界面不再无效重绘，后台日志与活动进度以 50 ms 帧间隔合并，真实输入、resize 和页面完成仍立即安排帧；高频页面操作不再克隆完整配置、计划或日志，运行页与完成页共享规范实时日志。显式隔离门禁在 Windows 与 WSL Linux 上各以 80,000 条并发日志和 400 次合成输入验证与 UI 排空解耦的生产端有界淘汰、500 行展示窗口淘汰、256 MiB 整进程上限及 100 ms p99 提交尝试到帧阈值；双平台结果均有充足余量，因此未引入 `mimalloc`。两轮独立审查无 P0/P1/P2，完整范围和测量边界见 [TUI-06 记录](validation/tui-06.md)。M3 已完成，下一工作包为 M4 的 `QA-01`。
+`TUI-06` 已实现并通过工作包验收：空闲界面不再无效重绘，后台日志与活动进度以 50 ms 帧间隔合并，真实输入、resize 和页面完成仍立即安排帧；高频页面操作不再克隆完整配置、计划或日志，运行页与完成页共享规范实时日志。显式隔离门禁在 Windows 与 WSL Linux 上各以 80,000 条并发日志和 400 次合成输入验证与 UI 排空解耦的生产端有界淘汰、500 行展示窗口淘汰、256 MiB 整进程上限及 100 ms p99 提交尝试到帧阈值；双平台结果均有充足余量，因此未引入 `mimalloc`。两轮独立审查无 P0/P1/P2，完整范围和测量边界见 [TUI-06 记录](validation/tui-06.md)。M3 已完成，M4 进展见下文。
 
 完成门槛：全部 MVP 操作只能通过应用服务进入领域层；切换页面不取消 Deployment；安全退出等待恢复边界；正常退出、错误和 panic 均恢复 raw mode、光标及 alternate screen。该门槛及 TUI-01 至 TUI-06 的工作包验收均已通过，M3 完成。
 
 ## M4：发布加固
 
-`QA-01` 已形成待 CI 验证的发行候选：stable 与最低 Rust 1.88 的 Windows GNU、Linux GNU、macOS arm64 原生矩阵及准确 release 二进制 PTY/ConPTY smoke 已接入；Linux/macOS stable job 另运行各自的隔离 OpenSSH 门禁，Windows OpenSSH 门禁保留为需要已有系统 Agent 的显式运行。Windows MinGW 全量门禁、ConPTY smoke 和真实 OpenSSH ReleaseGate 已在干净的源码提交 `0b59f8f` 上复跑通过；Linux/macOS runner 的无副作用安全回归也已在候选实现期间通过。拟验收提交仍须取得 stable 三平台、Rust 1.88 三平台及 Linux/macOS 原生 live gate 的 CI 证据；仅文档更新须确认执行相关文件无差异，才能沿用已有本地证据。因此 `QA-01`、M4 与完整 MVP **仍未验收**，也不标注正式平台支持。当前证据与明确边界见 [QA-01 候选记录](validation/qa-01.md)。
+`QA-01` 已按 Windows-only 范围通过本机验收：既有 Rust 1.96.1 + MinGW 的全量测试、格式/严格 Clippy、GNU release 构建、准确二进制 ConPTY smoke、隔离性能门禁和 Windows runner 安全回归通过；真实 OpenSSH 认证、Host Key 轮换拒绝、SFTP 和命令取消沿用源码提交 `0b59f8f` 的已验证证据，执行代码未改动。GitHub 测试工作流已移除；Linux/macOS 客户端和最低 Rust 版本矩阵不再是本轮验收要求。该结论只覆盖 Windows x64 GNU 的已测条件，不宣称早期 SSH 超时已定位修复或整个 MVP 已完成。证据、兼容性边界及后续任务见 [QA-01 记录](validation/qa-01.md)。下一工作包为 `QA-02`。
 
-- `QA-01`：完成确认后的 Windows、macOS、Linux 编译及 smoke test 矩阵；复核 TUI-MGT-01 早期未定位 SSH 连接超时，在阶段化诊断证据基础上给出支持条件与发行结论，不把单次复跑通过当作根因修复。
+- `QA-01`：使用现有 Rust + MinGW 完成 Windows x64 GNU 本机编译、全量测试、ConPTY smoke、性能和真实 OpenSSH 门禁；不要求 Linux/macOS 客户端或 GitHub CI。复核 TUI-MGT-01 早期未定位 SSH 连接超时，在阶段化诊断证据基础上给出支持条件与发行结论，不把单次复跑通过当作根因修复。
 - `QA-02`：对路径穿越、Shell 注入、Host Key、凭据、日志和归档权限做安全审查。
 - `QA-03`：验证 Driver SPI 契约、Project/Environment ID、Destination ID/revision、Component generation、配置兼容、远端元数据前向兼容和安装升级。
-- `REL-03`：生成 ShipForge 单文件可执行程序与 SHA-256，编写安装、升级、回滚和排障文档。
+- `REL-03`：在本机生成 Windows x64 GNU 的 ShipForge 单文件可执行程序与 SHA-256，编写安装、升级、回滚和排障文档；不在 GitHub 构建或自动发布。
 - `ACC-01`：逐项执行需求文档的 12 条验收标准并保存证据。
 
 ## 质量门禁
 
 - 每个工作包同时提交成功、失败和边界测试；安全闭环不允许“后续再补测试”。
 - 每完成一个工作包，先审查代码、修复问题并通过门禁，再单独提交 Git；提交后才开始下一阶段。WIP 快照不计为阶段完成提交。
-- 合并必须通过 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`、依赖审计及平台编译。
+- 提交前在 Windows 本机通过 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`、依赖审计及 GNU release 编译。推送只同步仓库提交，不触发 GitHub 测试、合并或发布。
 - 领域层穷举状态和保留规则；每个 Driver 运行共享契约套件；真实 SSH 仅连接一次性环境。
 - 关键操作必须可安全重试，错误必须包含阶段、目标和建议动作。
 - 禁止测试发现或连接真实 Environment，禁止快照和日志包含真实密钥、Token 或主机。
@@ -152,7 +152,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ## 已延期能力
 
-Shared Content、SSH `ProxyJump`/`Include`/`Match`、TCP 与日志关键字健康检查均不进入 MVP。Windows、macOS 和 Linux 的发布等级在 `QA-01` 依据实际 smoke test 结果标注，不阻塞当前接口设计。
+Shared Content、SSH `ProxyJump`/`Include`/`Match`、TCP 与日志关键字健康检查均不进入 MVP。客户端只支持 Windows x64 GNU；Linux/macOS 客户端和三平台测试矩阵不再列为 MVP 门禁，既有实现及历史实测不表示支持承诺。目标服务器仍为 Linux。
 
 ## MVP 验收追踪
 

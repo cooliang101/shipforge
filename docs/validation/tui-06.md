@@ -47,6 +47,6 @@ Rust/Cargo 1.96.1；Windows 原生及 WSL Ubuntu-22.04 的隔离原生 Linux 工
 
 ## 测量边界与分配器结论
 
-该门禁验证合成输入生产者提交尝试到 Ratatui `TestBackend` 完成帧的 App 调度延迟，不读取真实 `crossterm` 输入，不测 PTY/终端 flush、物理显示、人工可用性、全部后台事件通道或磁盘 writer 吞吐。TUI-05 的 Linux PTY 证据验证退出与终端恢复，也不是显示延迟基准。macOS、Windows ConPTY 和最低 Rust 1.88 仍属 M4。
+该门禁验证合成输入生产者提交尝试到 Ratatui `TestBackend` 完成帧的 App 调度延迟，不读取真实 `crossterm` 输入，不测 PTY/终端 flush、物理显示、人工可用性、全部后台事件通道或磁盘 writer 吞吐。TUI-05 的 Linux PTY 证据验证退出与终端恢复，也不是显示延迟基准。Windows ConPTY 由 M4/QA-01 验证；现行 MVP 不要求 macOS 或最低 Rust 版本矩阵。
 
 标准分配器在 Windows/Linux 的整进程结果分别约为 13 MiB/24 MiB，远低于 256 MiB 门槛；时延也低于阈值。没有可重复证据支持增加 `mimalloc` 的依赖、二进制和平台复杂度，因此 MVP 不引入它。

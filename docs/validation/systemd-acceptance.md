@@ -46,7 +46,7 @@
 | `cargo audit` | 退出码 0，无已知漏洞报告；仍有 `wnaf 0.14.0` 撤回警告 |
 | `git diff --check` / Markdown 相对链接 | 通过 |
 
-安全回归已接入 CI，但本记录不宣称远端 CI 已运行。此前通过的 [双 Destination 实测](linux-ssh-acceptance.md) 与 [Linux 客户端验证](linux-client.md) 保持各自历史范围，本次未重跑其完整实机矩阵。
+安全回归在本机执行；现行策略已移除 GitHub CI，不宣称远端 CI 曾运行。此前通过的 [双 Destination 实测](linux-ssh-acceptance.md) 与 [Linux 客户端验证](linux-client.md) 保持各自历史范围，本次未重跑其完整实机矩阵。
 
 ## M1 门槛对应证据
 
@@ -60,4 +60,4 @@
 | 无端口 Worker 稳定性 | 本记录的真实 systemd 激活、稳定窗口和运行版本证据 |
 | 失败补偿及人工指引 | 双端 HTTP/取消实测、本 systemd 实测，以及 `failed_compensation_reports_manual_action_without_hiding_actual_current` 等失败恢复回归 |
 
-下一阶段是 M2 历史、对账与保留。普通非 root 部署账号授权、macOS/完整平台矩阵、最低 Rust 版本、SSH Agent/Host Key 轮换、全部 TUI 实机交互和异常退出仍需后续验证；不能将 M1 通过等同于 MVP 可发布。
+下一阶段是 M2 历史、对账与保留。普通非 root 部署账号授权、Windows SSH Agent/Host Key 轮换、全部 TUI 实机交互和异常退出需由后续工作包验证；现行 MVP 不要求 Linux/macOS 客户端或最低 Rust 版本矩阵，不能将 M1 通过等同于 MVP 可发布。

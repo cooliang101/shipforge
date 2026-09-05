@@ -16,7 +16,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Use `cargo build --release` for a release check. Disposable SSH/systemd tests are documented in `tests/README.md`.
+MVP supports Windows x64 GNU only. Reuse existing Rust/MinGW and test locally; never add GitHub test workflows. Release/SSH/systemd checks are in `tests/README.md`.
 
 ## Coding Style & Naming Conventions
 

@@ -50,4 +50,4 @@ cargo build --offline --locked --release
 
 所有 App 级操作 worker 会在退出前 join，部署/回滚等待安全恢复边界。内部部署日志 writer 关闭通道后最多等待五秒；超时会明确标记日志不完整，但不改变已知远端执行或补偿结论，因此不能声称每个进程内部辅助线程都必然 join。
 
-App 安全退出有意不设超时；若系统调用永久不返回，界面会继续等待而不假装任务已结束。`SIGKILL`、OOM、`panic=abort` 及宿主强制关闭期限不可恢复。全进程有界过载、内存和合成输入时延随后由 [TUI-06](tui-06.md) 覆盖；真实 Windows ConPTY 的 Break/Close/Shutdown、macOS、最低 Rust 1.88 及人工全页面体验仍留给 M4。
+App 安全退出有意不设超时；若系统调用永久不返回，界面会继续等待而不假装任务已结束。`SIGKILL`、OOM、`panic=abort` 及宿主强制关闭期限不可恢复。全进程有界过载、内存和合成输入时延随后由 [TUI-06](tui-06.md) 覆盖；真实 Windows ConPTY 的 Break/Close/Shutdown 及人工全页面体验仍留给 M4 最终验收；现行 MVP 不要求 macOS 或最低 Rust 版本矩阵。

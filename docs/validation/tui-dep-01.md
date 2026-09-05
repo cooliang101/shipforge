@@ -28,7 +28,7 @@
 ## 尚未通过的里程碑门禁
 
 - 本工作包提交时，M1 的真实 Linux 联合发布、回滚与 systemd 验收尚未执行；后续结果见 [双 Destination 记录](linux-ssh-acceptance.md) 和 [systemd/M1 门禁记录](systemd-acceptance.md)。不能将本记录单独视为 M1 整体验收。
-- 本工作包的 Windows 测试不执行两项 Unix 专用的后台子进程继承管道回归；它们已在后续 [WSL Linux 客户端验证](linux-client.md) 中补强并执行通过。完整平台矩阵仍属 QA-01。
+- 本工作包的 Windows 测试不执行两项 Unix 专用的后台子进程继承管道回归；它们已在后续 [WSL Linux 客户端验证](linux-client.md) 中补强并执行通过。现行 QA-01 仅验证 Windows 客户端，不再要求完整平台矩阵。
 - 审计提示传递依赖 `wnaf 0.14.0` 已被撤回，路径为 `russh → p256/p384/p521 → primeorder → wnaf`。本阶段未修改或隐藏告警；发布前须跟进上游可用版本并重新审计。
 - 历史浏览、重启对账、库存/保留管理、完整退出对话框和日志搜索导出仍属 M2/M3；远端容量校验只是瞬时检查，不做空间预留或并发协调。
 

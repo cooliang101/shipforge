@@ -1,5 +1,38 @@
 # Integration Tests
 
+## Windows-only local release gates
+
+MVP acceptance uses Windows x64 GNU with the existing Rust/MinGW toolchain (verified: Rust 1.96.1). Linux is the deployment target; WSL/Docker below only hosts disposable servers. Linux/macOS clients and a separate minimum-Rust matrix are outside MVP acceptance. No tests run on GitHub, including after pushes.
+
+From the repository root, run each command locally and stop on any nonzero exit code. `--offline` reuses cached dependencies; it does not install a toolchain.
+
+```powershell
+rustc -Vv # Confirm host: x86_64-pc-windows-gnu
+cargo fmt --all -- --check
+cargo clippy --offline --locked --all-targets --all-features -- -D warnings
+cargo test --offline --locked --all-targets --all-features --no-fail-fast
+cargo build --offline --locked --target x86_64-pc-windows-gnu --release
+cargo audit
+./tests/run-linux-acceptance-cleanup-tests.ps1
+./tests/run-systemd-acceptance-cleanup-tests.ps1
+cargo test --offline --locked --lib tui::app::performance_tests::isolated_tui_stress_stays_responsive_and_memory_bounded -- --ignored --exact --nocapture --test-threads=1
+```
+
+Run the performance gate alone. The existing `cargo-audit` command updates advisory data, not the Rust toolchain; `--no-fetch` checks cached advisories only and cannot establish freshness. Run these two release-binary ConPTY smokes after the release build:
+
+```powershell
+$shipforgePreviousSmokeBinary = $env:SHIPFORGE_RELEASE_SMOKE_BINARY
+try {
+    $env:SHIPFORGE_RELEASE_SMOKE_BINARY = (Resolve-Path -LiteralPath target/x86_64-pc-windows-gnu/release/shipforge.exe).Path
+    cargo test --offline --locked --target x86_64-pc-windows-gnu --test platform_smoke release_binary_q_exits_and_restores_terminal -- --ignored --exact --nocapture --test-threads=1
+    if ($LASTEXITCODE -ne 0) { throw 'Release q smoke failed' }
+    cargo test --offline --locked --target x86_64-pc-windows-gnu --test platform_smoke release_binary_recovers_after_idle_ctrl_c_bytes_then_q -- --ignored --exact --nocapture --test-threads=1
+    if ($LASTEXITCODE -ne 0) { throw 'Release idle Ctrl+C smoke failed' }
+} finally { $env:SHIPFORGE_RELEASE_SMOKE_BINARY = $shipforgePreviousSmokeBinary }
+```
+
+Run the explicit Windows `-Suite ReleaseGate` below separately. Default ignored tests are not counted as passed. Record the tested source commit and limits in [QA-01](../docs/validation/qa-01.md); only documentation changes and removal of GitHub workflows may reuse unchanged execution-code evidence.
+
 ## Local history and query model
 
 The default suite includes schema v1–v7 migration/reopen tests, frozen Component context and Release receipts, explicit unknown/absent observations, and fault-injected history writes during deployment and compensation. REC-01 adds immutable inspection reports, stale-source rejection, local-only startup attention and cache-only rebuilding after database loss; corrupt existing history is never replaced. Startup attention does not create a missing history database or parent directory, migrate schemas, or change history rows; SQLite may create/use WAL/SHM sidecars for an existing WAL database. The production service protocol fixture verifies metadata and timed steps, then exercises actual `RecoveryService` calls against pending local history and a fresh cache, asserting remote files/links and original history remain unchanged. These internal APIs do not add a user-facing CLI. The TUI reaches bounded local history, explicit rollback and read-only inspections through management application services.
@@ -24,9 +57,9 @@ The runner builds `tests/fixtures/openssh`, starts two independent Debian/OpenSS
 
 For the Windows GNU QA-01 release gate, first ensure the existing Windows OpenSSH Authentication Agent service is running, then run `./tests/run-linux-acceptance.ps1 -Suite ReleaseGate`. The runner explicitly passes `--target x86_64-pc-windows-gnu`, so a missing GNU target/toolchain fails instead of producing MSVC evidence. It never changes the service startup mode or clears the Agent. It checks that the Agent is reachable, adds one distinct test key, and removes only that exact public key during cleanup; failure to remove it retains exact recovery material and fails the run. Other Agent identities are not enumerated as an acceptance snapshot. The test itself uses the release profile and the same isolated Debian/OpenSSH targets described below. Run `./tests/run-linux-acceptance-cleanup-tests.ps1` for Job Object, deadline, Agent-key, delayed-resource and two-phase cleanup regressions without starting Docker.
 
-For the native-Linux QA-01 release gate, run `bash ./tests/run-linux-qa01-release-gate.sh`. It builds the exact ignored test in release mode, then exercises separate IdentityFile and SSH Agent keys, strict Host Key rotation rejection, SFTP success/cancellation, and remote-command cancellation against two disposable loopback OpenSSH containers. The runner starts its own foreground `ssh-agent` on an owned socket, adds only the Agent key, and never reads, adds to, clears, or stops an inherited Agent. Both public keys are copied into stopped containers instead of mounting a host or repository directory. Random names, ports, labels, an owner-marked remote root, and a mode-700 temporary directory isolate each run. Setup, Cargo, Docker, Agent, and cleanup commands have outer deadlines; one cleanup timeout does not skip later resources. The exit trap verifies ownership before removal and fails if it cannot prove that containers, the image tag, Agent process, and temporary directory are gone. Docker build cache may remain. Run `bash ./tests/run-linux-qa01-runner-tests.sh` for syntax, exact-selection, no-mount, key-isolation, timeout-continuation, ownership-refusal, and cleanup regressions without starting Docker or an Agent.
+For optional Linux-client experiments outside the Windows-only MVP, run `bash ./tests/run-linux-qa01-release-gate.sh`. It builds the exact ignored test in release mode, then exercises separate IdentityFile and SSH Agent keys, strict Host Key rotation rejection, SFTP success/cancellation, and remote-command cancellation against two disposable loopback OpenSSH containers. The runner starts its own foreground `ssh-agent` on an owned socket, adds only the Agent key, and never reads, adds to, clears, or stops an inherited Agent. Both public keys are copied into stopped containers instead of mounting a host or repository directory. Random names, ports, labels, an owner-marked remote root, and a mode-700 temporary directory isolate each run. Setup, Cargo, Docker, Agent, and cleanup commands have outer deadlines; one cleanup timeout does not skip later resources. The exit trap verifies ownership before removal and fails if it cannot prove that containers, the image tag, Agent process, and temporary directory are gone. Docker build cache may remain. Run `bash ./tests/run-linux-qa01-runner-tests.sh` for syntax, exact-selection, no-mount, key-isolation, timeout-continuation, ownership-refusal, and cleanup regressions without starting Docker or an Agent.
 
-For native macOS, run `bash ./tests/run-macos-qa01-release-gate.sh` as a non-root user. It requires the system `/usr/sbin/sshd`, OpenSSH client tools, Python 3 and the existing Rust toolchain, but never installs software, invokes `sudo`, or enables Remote Login. It starts one loopback-only per-run sshd and a private Agent under a mode-700 directory, then verifies exact process ownership and removal. Run `bash ./tests/run-macos-qa01-runner-tests.sh` for the no-service safety suite. The CI stable job runs both native runner suites and live gates; the Rust 1.88 job only compiles, tests and smokes the release binary.
+For optional, unsupported macOS-client experiments, run `bash ./tests/run-macos-qa01-release-gate.sh` as a non-root user. It requires the system `/usr/sbin/sshd`, OpenSSH client tools, Python 3 and the existing Rust toolchain, but never installs software, invokes `sudo`, or enables Remote Login. It starts one loopback-only per-run sshd and a private Agent under a mode-700 directory, then verifies exact process ownership and removal. Run `bash ./tests/run-macos-qa01-runner-tests.sh` for the no-service safety suite. Neither these runners nor a minimum-Rust matrix is an MVP gate. No test workflow runs on GitHub.
 
 The test refuses to write without the explicit opt-in, two distinct ports/Host Keys, and a fixture marker checked over pinned SSH. It exercises single-Component deployment, joint deployment, explicit rollback to an earlier version/undeployed state, actual destination-side HTTP failure compensation, and cancellation after one activation. It also queries archive metadata and original audit attribution, rejects wrong manifests and links, distinguishes archive-only/directory-only entries, tolerates missing/torn audit, and preserves successful rollback when audit permissions deny append. Remote commands, SFTP, files, hashes, links, and HTTP are real; test payloads are precreated files and the build command is `rustc --version`. This suite does **not** run systemd or prove the full M1 service-stability gate.
 
