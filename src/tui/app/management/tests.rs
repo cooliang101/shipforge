@@ -181,6 +181,9 @@ async fn management_is_single_flight_and_esc_waits_for_worker_completion() {
         assert!(!app.handle_key(key(code)));
         assert!(matches!(screen(&app).page, ManagementPage::Loading { .. }));
     }
+    // q opens the explicit process-exit confirmation while work is active;
+    // the first Esc rejects that prompt and the next Esc cancels this request.
+    app.handle_key(key(KeyCode::Esc));
     app.handle_key(key(KeyCode::Esc));
     assert!(matches!(
         screen(&app).page,
@@ -248,15 +251,111 @@ fn stale_results_do_not_replace_current_screen_or_clear_the_active_request() {
         id,
         origin: screen(&app),
         cancellation: CancellationToken::new(),
+        worker: Some(std::thread::spawn(|| {})),
         execution_progress: None,
         request: ManagementRequest::History(DeploymentQuery::default()),
     });
     app.finish_management(uuid::Uuid::now_v7(), Err("stale failure".into()));
     assert_eq!(app.management_task.as_ref().unwrap().id, id);
+    assert!(app.management_task.as_ref().unwrap().worker.is_some());
     assert!(app.message.is_none());
     app.finish_management(id, Err("current failure".into()));
     assert!(app.management_task.is_none());
     assert_eq!(app.message.as_deref(), Some("current failure"));
+}
+
+#[test]
+fn matching_completion_joins_worker_tail_and_reports_tail_panic_without_payload() {
+    let (_directory, mut app) = fixture();
+    let (release, wait) = std::sync::mpsc::channel();
+    let returned = Arc::new(AtomicBool::new(false));
+    let observed_return = Arc::clone(&returned);
+    let worker = std::thread::spawn(move || {
+        wait.recv().unwrap();
+        panic!("private-tail-panic-payload");
+    });
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!observed_return.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+    });
+    let id = uuid::Uuid::now_v7();
+    app.management_task = Some(ManagementTask {
+        id,
+        origin: screen(&app),
+        cancellation: CancellationToken::new(),
+        worker: Some(worker),
+        execution_progress: None,
+        request: ManagementRequest::History(DeploymentQuery::default()),
+    });
+    app.finish_management(
+        id,
+        Ok(ManagementPage::History {
+            page: Arc::new(HistoryPage {
+                items: Vec::new(),
+                more: false,
+                database_missing: false,
+            }),
+            offset: 0,
+            cursor: 0,
+        }),
+    );
+    returned.store(true, Ordering::SeqCst);
+    releaser.join().unwrap();
+    assert!(matches!(screen(&app).page, ManagementPage::Failed { .. }));
+    let message = app.message.as_deref().unwrap();
+    assert!(message.contains("worker stopped"));
+    assert!(!message.contains("private-tail-panic-payload"));
+    assert!(
+        screen(&app).notice.is_none(),
+        "a failed read must not be described as retained inspection or execution evidence"
+    );
+}
+
+#[test]
+fn cancelled_inspection_keeps_report_even_when_worker_tail_panics() {
+    let (_directory, mut app) = fixture();
+    let id = uuid::Uuid::now_v7();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    app.management_task = Some(ManagementTask {
+        id,
+        origin: screen(&app),
+        cancellation,
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-inspection-tail-payload");
+        })),
+        execution_progress: None,
+        request: ManagementRequest::Inspect {
+            source: None,
+            selected: BTreeSet::new(),
+        },
+    });
+    let report = Arc::new(RecoveryReport {
+        id: uuid::Uuid::now_v7(),
+        related_deployment: None,
+        source_revision: None,
+        started_at_ms: 1,
+        completed_at_ms: 2,
+        components: Vec::new(),
+    });
+    app.finish_management(
+        id,
+        Ok(ManagementPage::Report {
+            report: Arc::clone(&report),
+            warning: None,
+        }),
+    );
+    assert!(matches!(
+        screen(&app).page,
+        ManagementPage::Report {
+            report: accepted,
+            ..
+        } if Arc::ptr_eq(&accepted, &report)
+    ));
+    let notice = screen(&app).notice.unwrap();
+    assert!(notice.contains("Known evidence is retained"));
+    assert!(!notice.contains("private-inspection-tail-payload"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

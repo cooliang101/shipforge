@@ -97,6 +97,7 @@ pub(super) struct ReinitializeTask {
     origin: ReinitializeScreen,
     cancellation: CancellationToken,
     worker: Option<std::thread::JoinHandle<()>>,
+    saving: bool,
 }
 
 #[derive(Debug)]
@@ -241,6 +242,7 @@ impl App {
                     origin,
                     cancellation,
                     worker: Some(worker),
+                    saving,
                 });
             }
             Err(_) => {
@@ -266,7 +268,7 @@ impl App {
     pub(super) fn finish_reinitialize(
         &mut self,
         id: uuid::Uuid,
-        result: Result<ReinitializeResult, String>,
+        mut result: Result<ReinitializeResult, String>,
     ) {
         if self
             .reinitialize_task
@@ -279,8 +281,15 @@ impl App {
             return;
         };
         // Consume the final event and then join the worker before navigation or exit.
-        if let Some(worker) = task.worker.take() {
-            let _ = worker.join();
+        let worker_failed = task
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if worker_failed && !task.saving {
+            result = Err(
+                "Project reinitialization worker stopped unexpectedly. The preview was not accepted; reload this directory before retrying. No remote operation was requested."
+                    .into(),
+            );
         }
         match result {
             Ok(ReinitializeResult::Saved {
@@ -299,7 +308,9 @@ impl App {
                     }
                 }
                 self.show_overview(root, (*config).clone());
-                self.message = Some(if registered {
+                self.message = Some(if worker_failed {
+                    "Saved shipforge.yaml with NEW identities. The worker cleanup then stopped unexpectedly; the known YAML save is retained. Reload the directory before continuing. No deployment was performed."
+                } else if registered {
                     "Saved shipforge.yaml with NEW Project and Environment identities. No deployment was performed."
                 } else {
                     "Saved shipforge.yaml with NEW identities, but recent-Project registration or refresh failed. Open the directory again; no deployment was performed."
@@ -316,12 +327,16 @@ impl App {
                 });
             }
             Ok(ReinitializeResult::Preview(_)) => {
-                self.show_projects();
-                self.message =
-                    Some("Project reinitialization cancelled; nothing was saved.".into());
+                self.screen = Screen::Reinitialize(task.origin);
+                self.message = Some(
+                    "Project reinitialization preview cancelled. The previous page is retained; nothing was saved."
+                        .into(),
+                );
             }
             Err(error) => {
-                if task.cancellation.is_cancelled() {
+                if task.cancellation.is_cancelled() && !task.saving {
+                    self.screen = Screen::Reinitialize(task.origin);
+                } else if task.cancellation.is_cancelled() {
                     self.show_projects();
                 } else {
                     // A failed save cannot reuse a potentially stale preview. Retry
@@ -334,7 +349,14 @@ impl App {
                         ..task.origin
                     });
                 }
-                self.message = Some(safe_text(&error));
+                let message = safe_text(&error);
+                self.message = Some(if worker_failed && task.saving {
+                    format!(
+                        "{message} The reinitialization worker also stopped unexpectedly during final cleanup. Preserve this reported YAML durability outcome and reload the directory before retrying."
+                    )
+                } else {
+                    message
+                });
             }
         }
     }

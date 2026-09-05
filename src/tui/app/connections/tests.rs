@@ -216,6 +216,8 @@ async fn cancellation_and_late_results_do_not_allow_navigation_or_save() {
     assert!(app.connections_task.is_some());
     press(&mut app, KeyCode::Char('q'));
     press(&mut app, KeyCode::Esc);
+    assert!(app.connections_task.is_some());
+    press(&mut app, KeyCode::Esc);
     assert!(matches!(
         &app.screen,
         Screen::Connections(ConnectionsScreen {
@@ -236,6 +238,249 @@ async fn cancellation_and_late_results_do_not_allow_navigation_or_save() {
     ));
     assert!(!directory.path().join("destinations.yaml").exists());
     assert_eq!(gateway.auths.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_successful_capture_cannot_reopen_the_host_key_confirmation() {
+    let (directory, mut app, _) = fixture();
+    form(&mut app).await;
+    press(&mut app, KeyCode::Enter);
+    wait(&mut app).await;
+    let Screen::Connections(ConnectionsScreen {
+        page: ConnectionsPage::HostKey { form, confirmation },
+        ..
+    }) = &app.screen
+    else {
+        panic!("host-key confirmation expected");
+    };
+    let form = Arc::clone(form);
+    let confirmation = Arc::clone(confirmation);
+    let origin = ConnectionsScreen {
+        page: ConnectionsPage::Form(Arc::clone(&form)),
+        scroll: 7,
+    };
+    let id = uuid::Uuid::now_v7();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    app.connections_task = Some(ConnectionsTask {
+        id,
+        origin,
+        cancellation,
+        reading_list: false,
+        operation: ConnectionsOperation::Read,
+        worker: None,
+    });
+    app.screen = Screen::Connections(ConnectionsScreen {
+        page: ConnectionsPage::Loading {
+            label: "Capturing SSH host-key fingerprint; not authenticating yet",
+            started: Instant::now(),
+            cancelling: true,
+        },
+        scroll: 0,
+    });
+
+    app.finish_connections(id, Ok(ConnectionsPage::HostKey { form, confirmation }));
+
+    assert!(app.connections_task.is_none());
+    assert!(matches!(
+        &app.screen,
+        Screen::Connections(ConnectionsScreen {
+            page: ConnectionsPage::Form(_),
+            scroll: 7,
+        })
+    ));
+    assert!(!directory.path().join("destinations.yaml").exists());
+}
+
+#[test]
+fn matching_completion_joins_the_worker_and_stale_ids_leave_its_handle_tracked() {
+    let (_directory, mut app, _) = fixture();
+    let id = uuid::Uuid::now_v7();
+    let origin = empty_screen();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = Arc::clone(&finished);
+    let worker = std::thread::spawn(move || {
+        release_receiver.recv().unwrap();
+        worker_finished.store(true, Ordering::SeqCst);
+    });
+    app.connections_task = Some(ConnectionsTask {
+        id,
+        origin: origin.clone(),
+        cancellation: CancellationToken::new(),
+        reading_list: false,
+        operation: ConnectionsOperation::Read,
+        worker: Some(worker),
+    });
+    app.screen = Screen::Connections(ConnectionsScreen {
+        page: ConnectionsPage::Loading {
+            label: "Reading local connection choices",
+            started: Instant::now(),
+            cancelling: false,
+        },
+        scroll: 0,
+    });
+
+    app.finish_connections(uuid::Uuid::now_v7(), Err("stale result".into()));
+    assert!(app.connections_task.is_some());
+    assert!(!finished.load(Ordering::SeqCst));
+
+    let delayed_release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        release_sender.send(()).unwrap();
+    });
+    app.finish_connections(id, Err("current result".into()));
+    assert!(finished.load(Ordering::SeqCst));
+    delayed_release.join().unwrap();
+    assert!(app.connections_task.is_none());
+}
+
+#[test]
+fn worker_tail_panic_discards_reads_but_does_not_erase_known_write_success() {
+    let (_directory, mut app, _) = fixture();
+    let id = uuid::Uuid::now_v7();
+    app.connections_task = Some(ConnectionsTask {
+        id,
+        origin: empty_screen(),
+        cancellation: CancellationToken::new(),
+        reading_list: true,
+        operation: ConnectionsOperation::Read,
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-worker-tail-sentinel");
+        })),
+    });
+    app.finish_connections(
+        id,
+        Ok(ConnectionsPage::List {
+            items: Arc::new(vec![saved_connection("must-not-project.invalid")]),
+            cursor: 0,
+        }),
+    );
+    assert!(matches!(
+        &app.screen,
+        Screen::Connections(ConnectionsScreen {
+            page: ConnectionsPage::Unavailable,
+            ..
+        })
+    ));
+    let message = app.message.as_deref().unwrap();
+    assert!(message.contains("stopped unexpectedly"));
+    assert!(!message.contains("sentinel"));
+
+    let (_directory, mut app, _) = fixture();
+    let id = uuid::Uuid::now_v7();
+    app.connections_task = Some(ConnectionsTask {
+        id,
+        origin: empty_screen(),
+        cancellation: CancellationToken::new(),
+        reading_list: false,
+        operation: ConnectionsOperation::Save,
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-worker-tail-sentinel");
+        })),
+    });
+    app.finish_connections(
+        id,
+        Ok(ConnectionsPage::Detail {
+            connection: Arc::new(saved_connection("saved.invalid")),
+            notice: Some("known save".into()),
+        }),
+    );
+    assert!(matches!(
+        &app.screen,
+        Screen::Connections(ConnectionsScreen {
+            page: ConnectionsPage::Detail { connection, .. },
+            ..
+        }) if connection.current.settings.endpoint_label().contains("saved.invalid")
+    ));
+    let message = app.message.as_deref().unwrap();
+    assert!(message.contains("known successful result was retained"));
+    assert!(!message.contains("sentinel"));
+
+    let (_directory, mut app, _) = fixture();
+    let id = uuid::Uuid::now_v7();
+    app.connections_task = Some(ConnectionsTask {
+        id,
+        origin: empty_screen(),
+        cancellation: CancellationToken::new(),
+        reading_list: false,
+        operation: ConnectionsOperation::Remove,
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-worker-tail-sentinel");
+        })),
+    });
+    app.finish_connections(
+        id,
+        Err("Connection registration was removed, but refreshing the list failed; reload current connections.".into()),
+    );
+    let message = app.message.as_deref().unwrap();
+    assert!(message.contains("registration was removed"));
+    assert!(message.contains("reported durability outcome"));
+    assert!(!message.contains("sentinel"));
+}
+
+#[test]
+fn cancelled_known_save_remove_and_project_remove_results_are_retained() {
+    for operation in [
+        ConnectionsOperation::Save,
+        ConnectionsOperation::Remove,
+        ConnectionsOperation::ProjectRemove,
+    ] {
+        let (_directory, mut app, _) = fixture();
+        let id = uuid::Uuid::now_v7();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        app.connections_task = Some(ConnectionsTask {
+            id,
+            origin: empty_screen(),
+            cancellation,
+            reading_list: false,
+            operation,
+            worker: None,
+        });
+        let result = match operation {
+            ConnectionsOperation::Save => ConnectionsPage::Detail {
+                connection: Arc::new(saved_connection("saved.invalid")),
+                notice: Some("known save".into()),
+            },
+            ConnectionsOperation::Remove => ConnectionsPage::List {
+                items: Arc::new(Vec::new()),
+                cursor: 0,
+            },
+            ConnectionsOperation::ProjectRemove => {
+                ConnectionsPage::ProjectRemoved(Arc::new(Vec::new()))
+            }
+            ConnectionsOperation::Read => unreachable!(),
+        };
+
+        app.finish_connections(id, Ok(result));
+
+        match operation {
+            ConnectionsOperation::Save => assert!(matches!(
+                &app.screen,
+                Screen::Connections(ConnectionsScreen {
+                    page: ConnectionsPage::Detail { .. },
+                    ..
+                })
+            )),
+            ConnectionsOperation::Remove => assert!(matches!(
+                &app.screen,
+                Screen::Connections(ConnectionsScreen {
+                    page: ConnectionsPage::List { .. },
+                    ..
+                })
+            )),
+            ConnectionsOperation::ProjectRemove => {
+                assert!(matches!(app.screen, Screen::Projects));
+            }
+            ConnectionsOperation::Read => unreachable!(),
+        }
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.contains("known successful result was retained"))
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

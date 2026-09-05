@@ -179,13 +179,10 @@ impl App {
         draft: &NewSshDestinationState,
         request: EndpointProbeRequest,
     ) {
-        if let Some((request_id, cancellation)) =
-            self.start_setup_worker(SetupRequest::HostKey(request))
-        {
+        if let Some((request_id, _)) = self.start_setup_worker(SetupRequest::HostKey(request)) {
             self.screen = Screen::HostKeyPending {
                 request_id,
                 draft: draft.clone(),
-                cancellation,
                 cancellation_requested: false,
             };
         }
@@ -197,14 +194,13 @@ impl App {
         fingerprint: &HostKeyFingerprint,
         request: DestinationSetupRequest,
     ) {
-        if let Some((request_id, cancellation)) =
+        if let Some((request_id, _)) =
             self.start_setup_worker(SetupRequest::Authentication(request))
         {
             self.screen = Screen::SshAuthenticationPending {
                 request_id,
                 draft: draft.clone(),
                 fingerprint: fingerprint.clone(),
-                cancellation,
                 cancellation_requested: false,
             };
         }

@@ -9,10 +9,12 @@ mod presentation;
 use std::{
     fmt::Write as _,
     io::{self, BufWriter, Stdout},
+    sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
 };
 
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -26,45 +28,372 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use self::app::{App, Screen};
+use self::app::{App, ExitState, Screen};
 use self::presentation::{endpoint_label, environment_label, is_production, safe_text, step_label};
 
 type AppTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
 struct TerminalGuard {
     terminal: AppTerminal,
+    restoration: Restoration,
 }
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        let mut output = BufWriter::new(io::stdout());
-        if let Err(error) = execute!(output, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(error);
+        let mut setup = SetupGuard::raw();
+        setup.alternate_attempted = true;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+            return Err(with_cleanup(error, setup.restore()));
         }
 
+        let output = BufWriter::new(io::stdout());
         let backend = CrosstermBackend::new(output);
         match Terminal::new(backend) {
-            Ok(terminal) => Ok(Self { terminal }),
-            Err(error) => {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
-                Err(error)
+            Ok(terminal) => {
+                setup.disarm();
+                Ok(Self {
+                    terminal,
+                    restoration: Restoration::default(),
+                })
             }
+            Err(error) => Err(with_cleanup(error, setup.restore())),
         }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let mut cleanup = LiveTerminalCleanup {
+            terminal: &mut self.terminal,
+        };
+        self.restoration.run(&mut cleanup)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
+        let _ = self.restore();
     }
 }
 
-/// Runs the MVP terminal shell. Press `q` or `Esc` to exit.
+trait TerminalCleanup {
+    fn disable_raw(&mut self) -> io::Result<()>;
+    fn leave_alternate(&mut self) -> io::Result<()>;
+    fn show_cursor(&mut self) -> io::Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct Restoration {
+    attempted: bool,
+}
+
+impl Restoration {
+    fn run(&mut self, cleanup: &mut impl TerminalCleanup) -> io::Result<()> {
+        if std::mem::replace(&mut self.attempted, true) {
+            return Ok(());
+        }
+        restore_terminal(cleanup)
+    }
+}
+
+fn restore_terminal(cleanup: &mut impl TerminalCleanup) -> io::Result<()> {
+    let failures = [
+        ("disable raw mode", cleanup.disable_raw()),
+        ("leave alternate screen", cleanup.leave_alternate()),
+        ("show cursor", cleanup.show_cursor()),
+    ]
+    .into_iter()
+    .filter_map(|(operation, result)| result.err().map(|_| operation))
+    .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "Terminal restoration was incomplete: {}",
+            failures.join(", ")
+        )))
+    }
+}
+
+struct LiveTerminalCleanup<'a> {
+    terminal: &'a mut AppTerminal,
+}
+
+impl TerminalCleanup for LiveTerminalCleanup<'_> {
+    fn disable_raw(&mut self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+
+    fn leave_alternate(&mut self) -> io::Result<()> {
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.terminal.show_cursor()
+    }
+}
+
+#[derive(Debug)]
+struct SetupGuard {
+    raw_enabled: bool,
+    alternate_attempted: bool,
+    restored: bool,
+}
+
+impl SetupGuard {
+    const fn raw() -> Self {
+        Self {
+            raw_enabled: true,
+            alternate_attempted: false,
+            restored: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.raw_enabled = false;
+        self.alternate_attempted = false;
+        self.restored = true;
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if std::mem::replace(&mut self.restored, true) {
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        if self.raw_enabled && disable_raw_mode().is_err() {
+            failures.push("disable raw mode");
+        }
+        if self.alternate_attempted {
+            if execute!(io::stdout(), LeaveAlternateScreen).is_err() {
+                failures.push("leave alternate screen");
+            }
+            if execute!(io::stdout(), Show).is_err() {
+                failures.push("show cursor");
+            }
+        }
+        self.raw_enabled = false;
+        self.alternate_attempted = false;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "Terminal setup cleanup was incomplete: {}",
+                failures.join(", ")
+            )))
+        }
+    }
+}
+
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn with_cleanup(primary: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => io::Error::new(
+            primary.kind(),
+            format!("{primary}; additionally, {cleanup}"),
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessControl {
+    ExitRequested,
+}
+
+struct ProcessSignals {
+    receiver: Receiver<ProcessControl>,
+    watchers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ProcessSignals {
+    #[cfg(unix)]
+    fn install(runtime: &tokio::runtime::Handle) -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let watcher = runtime.spawn(async move {
+            loop {
+                let notification = tokio::select! {
+                    event = interrupt.recv() => event.is_some(),
+                    event = terminate.recv() => event.is_some(),
+                    event = hangup.recv() => event.is_some(),
+                };
+                if !notification {
+                    break;
+                }
+                let _ = sender.try_send(ProcessControl::ExitRequested);
+            }
+        });
+        Ok(Self {
+            receiver,
+            watchers: vec![watcher],
+        })
+    }
+
+    #[cfg(windows)]
+    fn install(runtime: &tokio::runtime::Handle) -> io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+
+        let mut interrupt = ctrl_c()?;
+        let mut ctrl_break = ctrl_break()?;
+        let mut close = ctrl_close()?;
+        let mut shutdown = ctrl_shutdown()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let watcher = runtime.spawn(async move {
+            loop {
+                let notification = tokio::select! {
+                    event = interrupt.recv() => event.is_some(),
+                    event = ctrl_break.recv() => event.is_some(),
+                    event = close.recv() => event.is_some(),
+                    event = shutdown.recv() => event.is_some(),
+                };
+                if !notification {
+                    break;
+                }
+                // Windows can impose a short deadline after close/shutdown
+                // notification. ShipForge requests orderly cancellation but
+                // cannot promise cleanup after the host forcibly terminates it.
+                let _ = sender.try_send(ProcessControl::ExitRequested);
+            }
+        });
+        Ok(Self {
+            receiver,
+            watchers: vec![watcher],
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn install(_: &tokio::runtime::Handle) -> io::Result<Self> {
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        Ok(Self {
+            receiver,
+            watchers: Vec::new(),
+        })
+    }
+
+    fn consume(&self, request_exit: impl FnOnce()) -> bool {
+        consume_process_control(&self.receiver, request_exit)
+    }
+}
+
+impl Drop for ProcessSignals {
+    fn drop(&mut self) {
+        for watcher in &self.watchers {
+            watcher.abort();
+        }
+    }
+}
+
+fn consume_process_control(
+    receiver: &Receiver<ProcessControl>,
+    request_exit: impl FnOnce(),
+) -> bool {
+    match receiver.try_recv() {
+        Ok(ProcessControl::ExitRequested) => {
+            while receiver.try_recv().is_ok() {}
+            request_exit();
+            true
+        }
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => false,
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeCleanup {
+        calls: Vec<&'static str>,
+        fail_disable: bool,
+        fail_leave: bool,
+        fail_cursor: bool,
+    }
+
+    impl TerminalCleanup for FakeCleanup {
+        fn disable_raw(&mut self) -> io::Result<()> {
+            self.calls.push("disable");
+            failure_if(self.fail_disable)
+        }
+
+        fn leave_alternate(&mut self) -> io::Result<()> {
+            self.calls.push("leave");
+            failure_if(self.fail_leave)
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.calls.push("cursor");
+            failure_if(self.fail_cursor)
+        }
+    }
+
+    fn failure_if(fail: bool) -> io::Result<()> {
+        if fail {
+            Err(io::Error::other("private cleanup failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn restoration_attempts_every_step_and_aggregates_failed_operations() {
+        let mut cleanup = FakeCleanup {
+            fail_disable: true,
+            fail_leave: true,
+            fail_cursor: true,
+            ..Default::default()
+        };
+        let error = restore_terminal(&mut cleanup).unwrap_err();
+        assert_eq!(cleanup.calls, ["disable", "leave", "cursor"]);
+        let error = error.to_string();
+        assert!(error.contains("disable raw mode"));
+        assert!(error.contains("leave alternate screen"));
+        assert!(error.contains("show cursor"));
+        assert!(!error.contains("private cleanup failure"));
+    }
+
+    #[test]
+    fn explicit_restoration_is_idempotent_and_drop_style_retry_is_a_noop() {
+        let mut cleanup = FakeCleanup::default();
+        let mut restoration = Restoration::default();
+        restoration.run(&mut cleanup).unwrap();
+        restoration.run(&mut cleanup).unwrap();
+        assert_eq!(cleanup.calls, ["disable", "leave", "cursor"]);
+    }
+
+    #[test]
+    fn process_control_event_invokes_the_exit_request_once_and_is_consumed() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(ProcessControl::ExitRequested).unwrap();
+        sender.send(ProcessControl::ExitRequested).unwrap();
+        let mut requests = 0;
+        assert!(consume_process_control(&receiver, || requests += 1));
+        assert_eq!(requests, 1);
+        assert!(!consume_process_control(&receiver, || requests += 1));
+        assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn session_and_restoration_failures_are_both_reported() {
+        let error = combine_session_result(
+            Err(io::Error::other("session failed")),
+            Err(io::Error::other("restoration failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("session failed"));
+        assert!(error.contains("restoration failed"));
+    }
+}
+
+/// Runs the MVP terminal shell. Press `q` from an idle top-level page to exit.
 ///
 /// # Errors
 ///
@@ -84,25 +413,46 @@ fn run_event_loop() -> io::Result<()> {
     let destination_registry_path = crate::config::default_destination_registry_path()
         .map_err(|error| io::Error::other(error.to_string()))?;
     let initial_directory = std::env::current_dir()?;
-    let mut app = App::new(registry_path, destination_registry_path, &initial_directory)
-        .map_err(|_| io::Error::other("Could not open the initial project directory. Check its path and local read permissions."))?;
+    let signals = ProcessSignals::install(&tokio::runtime::Handle::current())?;
     let mut guard = TerminalGuard::enter()?;
+    let Ok(mut app) = App::new(registry_path, destination_registry_path, &initial_directory) else {
+        let error = io::Error::other(
+            "Could not open the initial project directory. Check its path and local read permissions.",
+        );
+        return Err(with_cleanup(error, guard.restore()));
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drive_event_loop(&mut app, &mut guard)
+        drive_event_loop(&mut app, &mut guard, &signals)
     }));
     // Keep the runtime alive until safe cancellation finishes even if terminal
     // drawing or input fails. A broken terminal must not silently detach work.
-    drop(guard);
+    let restoration = guard.restore();
+    app.request_process_exit();
     app.shutdown();
     match result {
-        Ok(result) => result,
+        Ok(result) => combine_session_result(result, restoration),
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
-fn drive_event_loop(app: &mut App, guard: &mut TerminalGuard) -> io::Result<()> {
+fn combine_session_result(session: io::Result<()>, restoration: io::Result<()>) -> io::Result<()> {
+    match session {
+        Ok(()) => restoration,
+        Err(error) => Err(with_cleanup(error, restoration)),
+    }
+}
+
+fn drive_event_loop(
+    app: &mut App,
+    guard: &mut TerminalGuard,
+    signals: &ProcessSignals,
+) -> io::Result<()> {
     loop {
         app.poll_background();
+        signals.consume(|| app.request_process_exit());
+        if event_loop_exit_ready(app) {
+            break;
+        }
         if let Some(text) = app.take_clipboard_request() {
             let transport = clipboard_transport();
             let outcome = clipboard::request_copy(guard.terminal.backend_mut(), &text, transport);
@@ -115,11 +465,15 @@ fn drive_event_loop(app: &mut App, guard: &mut TerminalGuard) -> io::Result<()> 
             && key.kind == KeyEventKind::Press
             && app.handle_key(key)
         {
-            break;
+            app.request_process_exit();
         }
     }
 
     Ok(())
+}
+
+fn event_loop_exit_ready(app: &App) -> bool {
+    app.exit_ready()
 }
 
 fn clipboard_transport() -> clipboard::ClipboardTransport {
@@ -192,21 +546,58 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                     .scroll((app.help_scroll, 0)),
                 areas[1],
             );
-            return;
+        } else {
+            let message = app
+                .message
+                .as_deref()
+                .map_or_else(|| "No current message.".into(), safe_text);
+            let instructions = format!(
+                "Current page: {}\n\nPage keys: {help}\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nDeployment/rollback: only unmodified c confirms. SSH fingerprint: only unmodified y trusts.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
+                app.context_label()
+            );
+            frame.render_widget(
+                panel(" Keyboard help and current message ", instructions)
+                    .scroll((app.help_scroll, 0)),
+                areas[1],
+            );
         }
-        let message = app
-            .message
-            .as_deref()
-            .map_or_else(|| "No current message.".into(), safe_text);
-        let instructions = format!(
-            "Current page: {}\n\nPage keys: {help}\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nDeployment/rollback: only unmodified c confirms. SSH fingerprint: only unmodified y trusts.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
-            app.context_label()
-        );
-        frame.render_widget(
-            panel(" Keyboard help and current message ", instructions).scroll((app.help_scroll, 0)),
-            areas[1],
-        );
     }
+    render_exit_overlay(frame, app.exit_state());
+}
+
+fn render_exit_overlay(frame: &mut Frame<'_>, state: ExitState) {
+    let (title, message) = match state {
+        ExitState::Running => return,
+        ExitState::Confirm => (
+            " Exit? c / Esc ",
+            "c / Ctrl+C: cancel tracked work and exit safely.\nEsc / r: resume the task.\n\nWork is still active.",
+        ),
+        ExitState::Waiting => (
+            " Exiting safely ",
+            "Waiting for tracked workers to stop.\nCancellation requested; recovery may still be running.\n\nThe terminal will be restored before the process exits.",
+        ),
+    };
+    let bounds = frame.area();
+    let width = bounds.width.min(72);
+    let height = bounds.height.min(7);
+    let area = ratatui::layout::Rect::new(
+        bounds.x + bounds.width.saturating_sub(width) / 2,
+        bounds.y + bounds.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Paragraph::new(message)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn page_help(app: &App) -> &'static str {
@@ -1086,9 +1477,12 @@ fn panel(title: &'static str, content: String) -> Paragraph<'static> {
 mod tests {
     use std::collections::VecDeque;
 
-    use ratatui::{Terminal, backend::TestBackend};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect, widgets::Paragraph};
 
     use crate::drivers::DriverLog;
+
+    use super::ExitState;
 
     #[test]
     fn build_preview_distinguishes_shell_and_argument_boundaries() {
@@ -1150,5 +1544,83 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn exit_overlay_is_topmost_and_distinguishes_confirmation_from_waiting() {
+        for (state, expected) in [
+            (ExitState::Confirm, "c / Ctrl+C"),
+            (ExitState::Waiting, "Waiting for tracked workers"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(Paragraph::new("UNDERLAY-MARKER"), Rect::new(10, 4, 20, 1));
+                    super::render_exit_overlay(frame, state);
+                })
+                .unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(content.contains(expected));
+            assert!(!content.contains("UNDERLAY-MARKER"));
+        }
+    }
+
+    #[test]
+    fn exit_overlay_handles_tiny_and_empty_terminals() {
+        for (width, height) in [(0, 0), (1, 1), (8, 2), (20, 3)] {
+            for state in [ExitState::Confirm, ExitState::Waiting] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| super::render_exit_overlay(frame, state))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn short_exit_overlay_prioritizes_the_available_action() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|frame| super::render_exit_overlay(frame, ExitState::Confirm))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(content.contains("c / Ctrl+C"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q_then_c_exits_when_app_becomes_ready_without_a_signal_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = super::App::new(
+            directory.path().join("projects.yaml"),
+            directory.path().join("destinations.yaml"),
+            directory.path(),
+        )
+        .unwrap();
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE,)));
+        assert!(matches!(app.screen, super::Screen::Connections(_)));
+        // The Connections worker remains tracked until poll_background joins
+        // it, even if its local read finishes before the next key press.
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE,)));
+        assert_eq!(app.exit_state(), ExitState::Confirm);
+        assert!(!super::event_loop_exit_ready(&app));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE,)));
+        assert_eq!(app.exit_state(), ExitState::Waiting);
+        assert!(!super::event_loop_exit_ready(&app));
+        app.shutdown();
+        assert!(super::event_loop_exit_ready(&app));
     }
 }

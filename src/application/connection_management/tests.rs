@@ -246,6 +246,29 @@ async fn project_removal_rejects_stale_registry_and_busy_session() {
 }
 
 #[tokio::test]
+async fn cancelled_project_removal_stops_before_atomic_publish() {
+    let fixture = Fixture::new();
+    let root = fixture.project(fixture.key.clone());
+    let before = std::fs::read(&fixture.service.paths.projects).unwrap();
+    let preview = fixture.service.preview_project_removal(&root).unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    assert_eq!(
+        fixture
+            .service
+            .remove_project_with_cancellation(preview, &cancellation)
+            .await
+            .unwrap_err(),
+        ConnectionManagementError::Cancelled
+    );
+    assert_eq!(
+        std::fs::read(&fixture.service.paths.projects).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn unused_destination_removal_never_creates_missing_history_or_removes_credentials() {
     let fixture = Fixture::new();
     let credentials = std::fs::read(&fixture.service.paths.credentials).unwrap();
@@ -262,6 +285,65 @@ async fn unused_destination_removal_never_creates_missing_history_or_removes_cre
         std::fs::read(&fixture.service.paths.credentials).unwrap(),
         credentials
     );
+}
+
+#[tokio::test]
+async fn cancelled_destination_removal_stops_before_atomic_publish() {
+    let fixture = Fixture::new();
+    let before = std::fs::read(&fixture.service.paths.destinations).unwrap();
+    let preview = fixture
+        .service
+        .preview_destination_removal(&fixture.key)
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    assert_eq!(
+        fixture
+            .service
+            .remove_destination_with_cancellation(preview, &cancellation)
+            .await
+            .unwrap_err(),
+        ConnectionManagementError::Cancelled
+    );
+    assert_eq!(
+        std::fs::read(&fixture.service.paths.destinations).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_successful_removal_does_not_reclassify_or_restore_the_publish() {
+    let fixture = Fixture::new();
+    let root = fixture.project(fixture.key.clone());
+    let preview = fixture.service.preview_project_removal(&root).unwrap();
+    let cancellation = CancellationToken::new();
+    fixture
+        .service
+        .remove_project_with_cancellation(preview, &cancellation)
+        .await
+        .unwrap();
+    cancellation.cancel();
+    assert!(
+        ProjectRegistry::load(&fixture.service.paths.projects)
+            .unwrap()
+            .statuses()
+            .is_empty()
+    );
+
+    let fixture = Fixture::new();
+    let preview = fixture
+        .service
+        .preview_destination_removal(&fixture.key)
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    fixture
+        .service
+        .remove_destination_with_cancellation(preview, &cancellation)
+        .await
+        .unwrap();
+    cancellation.cancel();
+    assert!(fixture.service.list_connections().unwrap().is_empty());
 }
 
 #[tokio::test]

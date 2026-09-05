@@ -4,7 +4,7 @@ mod render;
 mod search;
 mod worker;
 
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, thread::JoinHandle, time::Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -121,6 +121,36 @@ impl ConnectionsRequest {
             Self::ProjectRemove(_) => "Removing only the recent-Project registration",
         }
     }
+
+    const fn operation(&self) -> ConnectionsOperation {
+        match self {
+            Self::Save(_) => ConnectionsOperation::Save,
+            Self::Remove(_) => ConnectionsOperation::Remove,
+            Self::ProjectRemove(_) => ConnectionsOperation::ProjectRemove,
+            Self::List
+            | Self::Form(_)
+            | Self::Keys { .. }
+            | Self::SelectKey { .. }
+            | Self::Capture(_)
+            | Self::Verify(_)
+            | Self::RemovePreview(_)
+            | Self::ProjectPreview(_) => ConnectionsOperation::Read,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionsOperation {
+    Read,
+    Save,
+    Remove,
+    ProjectRemove,
+}
+
+impl ConnectionsOperation {
+    const fn preserves_cancelled_result(self) -> bool {
+        !matches!(self, Self::Read)
+    }
 }
 
 #[derive(Debug)]
@@ -129,6 +159,8 @@ pub(super) struct ConnectionsTask {
     origin: ConnectionsScreen,
     cancellation: CancellationToken,
     reading_list: bool,
+    operation: ConnectionsOperation,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ConnectionsScreen {
@@ -339,6 +371,7 @@ impl App {
         let sender = self.background_sender.clone();
         let label = request.label();
         let reading_list = matches!(request, ConnectionsRequest::List);
+        let operation = request.operation();
         let spawned = std::thread::Builder::new()
             .name("shipforge-connections".into())
             .spawn(move || {
@@ -354,12 +387,14 @@ impl App {
                 let _ = sender.send(BackgroundEvent::Connections(id, result));
             });
         match spawned {
-            Ok(_) => {
+            Ok(worker) => {
                 self.connections_task = Some(ConnectionsTask {
                     id,
                     origin,
                     cancellation,
                     reading_list,
+                    operation,
+                    worker: Some(worker),
                 });
                 self.screen = Screen::Connections(ConnectionsScreen {
                     page: ConnectionsPage::Loading {
@@ -417,21 +452,73 @@ impl App {
         {
             return;
         }
-        let Some(task) = self.connections_task.take() else {
+        let Some(mut task) = self.connections_task.take() else {
             return;
         };
+        // The event is emitted after the operation result is known, but receiving
+        // it does not prove the sender thread has completed its final cleanup.
+        // Join before projecting the result or allowing shutdown to return.
+        let worker_failed = task
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        let cancelled = task.cancellation.is_cancelled();
+        let persistent_result = task.operation.preserves_cancelled_result();
+        let known_write_succeeded = persistent_result && result.is_ok();
         let mut screen = task.origin;
+        if cancelled && !persistent_result {
+            self.screen = Screen::Connections(screen);
+            self.message = Some(if worker_failed {
+                "Connection worker stopped unexpectedly during cleanup. The cancelled read result was discarded; reload Connections before retrying."
+                    .into()
+            } else {
+                "Connection operation cancelled. No new read result or confirmation was applied."
+                    .into()
+            });
+            return;
+        }
+        if worker_failed && !persistent_result {
+            self.screen = Screen::Connections(screen);
+            self.message = Some(
+                "Connection worker stopped unexpectedly during cleanup. Its result was not applied; reload Connections before retrying."
+                    .into(),
+            );
+            return;
+        }
+        let completion_warning = if worker_failed && known_write_succeeded {
+            Some(
+                "The connection change completed, but its worker stopped unexpectedly during final cleanup. The known successful result was retained; reload Connections before another change.",
+            )
+        } else if worker_failed {
+            Some(
+                "The connection worker also stopped unexpectedly during final cleanup. Preserve the reported durability outcome and reload Connections before retrying.",
+            )
+        } else if cancelled && known_write_succeeded {
+            Some(
+                "Cancellation arrived after the local connection change completed. The known successful result was retained.",
+            )
+        } else {
+            None
+        };
         match result {
             Ok(ConnectionsPage::ProjectRemoved(projects)) => {
                 self.recent.clone_from(&projects);
                 self.selected_recent = self.selected_recent.min(self.recent.len());
                 self.screen = Screen::Projects;
-                self.message = Some("Removed from recents only. Project files and deployment history are unchanged.".into());
+                self.message = Some(match completion_warning {
+                    Some(warning) => format!(
+                        "Removed from recents only. Project files and deployment history are unchanged. {warning}"
+                    ),
+                    None => "Removed from recents only. Project files and deployment history are unchanged.".into(),
+                });
                 return;
             }
             Ok(page) => {
                 screen.page = page;
                 screen.scroll = 0;
+                if let Some(warning) = completion_warning {
+                    self.message = Some(warning.into());
+                }
             }
             Err(error) => {
                 // A failed refresh is unknown, not proof that an earlier list
@@ -440,7 +527,11 @@ impl App {
                     screen.page = ConnectionsPage::Unavailable;
                     screen.scroll = 0;
                 }
-                self.message = Some(render::safe_text(&error));
+                let error = render::safe_text(&error);
+                self.message = Some(match completion_warning {
+                    Some(warning) => format!("{error} {warning}"),
+                    None => error,
+                });
             }
         }
         self.screen = Screen::Connections(screen);

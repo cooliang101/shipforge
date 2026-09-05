@@ -2,52 +2,36 @@
 
 ## Project Structure & Module Organization
 
-`docs/requirements.md` is the product specification:
+`docs/requirements.md` is the product specification; `docs/architecture.md` defines safety invariants. Rust code is under `src/`: `main.rs` owns the TUI lifecycle; `domain/` and `application/` hold Driver-neutral rules; `drivers/linux_ssh/` owns SSH/SFTP behavior; `config/`, `projects/`, `history/`, `telemetry/`, and `adapters/` handle local boundaries; `tui/` contains input, state, and Ratatui views.
 
-- `src/main.rs`: TUI entry point and runtime setup.
-- `src/domain/`, `application/`: Destination/Component Release rules and Driver-neutral orchestration.
-- `src/drivers/linux_ssh/`: the MVP Deployment Driver; provider APIs stay inside Drivers.
-- `src/config/`, `adapters/`, `projects/`, `history/`, `telemetry/`: config, low-level I/O, discovery, persistence, and events.
-- `src/tui/`: `ratatui` views, bounded UI state, input, and event projection.
-
-Keep unit tests in `#[cfg(test)]` modules, integration tests in `tests/`, and fixtures in `tests/fixtures/`. Do not commit archives, logs, credentials, or local databases.
-
-For schema work, follow `docs/configuration-guide.md`. Project configuration is TUI-managed in the MVP; do not add AI Agent editing, automation paths, alternate YAML forms, or user-facing Driver fields. Preserve `_shipforge`. `artifact` means the configured build-output path; `Release` means the sole generated versioned `tar.gz` deployment product.
+Keep unit tests beside code in `#[cfg(test)]` modules, integration tests in `tests/`, and fixtures in `tests/fixtures/`. Never commit generated Releases, logs, credentials, local databases, or private test keys.
 
 ## Build, Test, and Development Commands
 
 ```bash
-cargo run                    # run the TUI locally
-cargo build                  # compile a debug executable
-cargo test                   # run unit and integration tests
+cargo run
+cargo build
+cargo test
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check   # verify formatting
 ```
+
+Use `cargo build --release` for a release check. Disposable SSH/systemd tests are documented in `tests/README.md`.
 
 ## Coding Style & Naming Conventions
 
-Accept `rustfmt` output. Use `snake_case` for modules, functions, and files; `PascalCase` for types and traits; and `SCREAMING_SNAKE_CASE` for constants. Keep platform behavior behind focused traits. Add operation, Component, and Destination context to errors without exposing secrets.
+Accept `rustfmt` output. Use `snake_case` for modules, files, and functions; `PascalCase` for types and traits; `SCREAMING_SNAKE_CASE` for constants. Keep platform behavior behind focused traits. Errors need operation, Component, and Destination context without secrets or raw parser/Driver diagnostics.
 
 ## Testing Guidelines
 
-Use Rust's built-in harness and behavioral names such as `validate_config_rejects_missing_destination`. Test lifecycles, capabilities, path safety, rollback, and interruption. A Fake Driver tests orchestration; real Drivers pass shared contracts. Tests never contact production.
+Use Rust’s built-in harness and behavioral names such as `validate_config_rejects_missing_destination`. Cover success, failure, cancellation, persistence faults, rollback, and interruption. Use a Fake Driver for orchestration and shared contracts for real Drivers; tests never contact production. Every bug fix needs a regression test.
 
-## TUI Architecture
+## TUI & Configuration Rules
 
-Use `ratatui` with the `crossterm` backend. Build frames off-screen and flush changed cells through buffered output. Separate input, state, and rendering; use bounded event/log windows; cap redraw frequency; and restore raw mode, cursor, and alternate screen on every exit. Active deployments may only return to the UI or cancel safely—MVP has no detach mode. Add `mimalloc` only when benchmarks show a benefit.
+Use `ratatui` with the `crossterm` backend and buffered, off-screen rendering. Keep input, state, and rendering separate and memory windows bounded. App workers retain cancellation and join ownership; event-delivering workers also retain request IDs, while directly polled tasks are held exactly once. Join before navigation or exit. Cancelled reads/plans cannot open confirmation pages, while known writes and execution outcomes survive late cancellation. Every handled exit, error, or catchable panic must restore raw mode, alternate screen, and cursor. MVP has no detach mode.
+
+Follow `docs/configuration-guide.md`. Configuration is TUI-managed: do not add Agent editing, alternate YAML forms, locks, or user-facing Driver fields. Preserve `_shipforge`; `artifact` is build output and `Release` is the sole versioned `tar.gz` product. Never store secrets in `shipforge.yaml`; validate Host Keys and keep argv separate from Shell text. Follow `docs/architecture.md` for history, evidence, retention, and unknown-result rules.
 
 ## Commit & Pull Request Guidelines
 
-Use imperative Conventional Commits, such as `feat: validate release paths`; the initial snapshot uses `chore:`. Finish each roadmap work package with code review, passing tests and quality gates, then a separate commit before starting the next. Do not label a WIP snapshot as completed work. Pull requests must describe changes, tests, risks, and rollback impact; link issues and include TUI screenshots when applicable. Highlight schema changes and update `docs/requirements.md` when behavior changes.
-
-## Security & Deployment Safety
-
-Never store secrets in `shipforge.yaml`. Validate SSH host keys, separate arguments from Shell text, redact Driver data, and preserve protected Component Releases.
-
-History browsing must not create or migrate storage. Public errors must not echo raw parser/SQLite diagnostics; retain operation context and known outcomes. Require unmodified confirmation keys, and wait for tracked workers before leaving or exiting.
-
-Management return snapshots preserve exact scope and selection. Cancelled read/plan results cannot become confirmation pages; execution consumes old rollback plans. Preserve known inspection/execution results and mark stale snapshots explicitly. Cached evidence must remain reachable through the full logical-line viewport.
-
-Log format comes from the history index, never JSON-looking output. Reassemble explicit fragments before redaction; search/export only verified retained evidence. Copy recorded failed argv, never reconstructed commands. Export freezes sanitized bytes and requires explicit no-clobber confirmation; clipboard requests have no acknowledgement.
-
-History rules are in `docs/architecture.md`: distinguish unknown from absent and retain known outcomes on persistence failures. Keep `recovery_reports`/`recovery_report_components` and `deployment_revisions` separate from original outcomes; never complete old intents or reconstruct missing YAML/history. Inventory is not health or historical endpoint proof; auxiliary JSONL must not prevent compensation. Cleanup needs original package evidence and a fresh per-version intent; unknown outcomes stay pending, and cleanup failure never compensates a successful deployment.
+Use imperative Conventional Commits, for example `feat: harden TUI shutdown`. Finish each roadmap package with review, passing gates, synced docs, and a separate commit. Pull requests describe changes, tests, risks, rollback impact, schema changes, linked issues, and relevant TUI screenshots.

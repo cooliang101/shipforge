@@ -12,6 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
+    thread::JoinHandle,
     time::Instant,
 };
 
@@ -128,6 +129,8 @@ pub(super) struct ProjectEditTask {
     id: uuid::Uuid,
     origin: ProjectEditScreen,
     cancellation: CancellationToken,
+    worker: Option<JoinHandle<()>>,
+    preserve_cancelled_result: bool,
 }
 
 impl App {
@@ -406,6 +409,7 @@ impl App {
         let gateway = Arc::clone(&self.project_edit_gateway);
         let sender = self.background_sender.clone();
         let label = request.label();
+        let preserve_cancelled_result = matches!(request, ProjectEditRequest::Save(_));
         let spawned = std::thread::Builder::new()
             .name("shipforge-project-edit".into())
             .spawn(move || {
@@ -415,7 +419,7 @@ impl App {
                 let _ = sender.send(BackgroundEvent::ProjectEdit(id, result));
             });
         match spawned {
-            Ok(_) => {
+            Ok(worker) => {
                 self.invalidate_attention();
                 let mut loading = origin.clone();
                 loading.page = ProjectEditPage::Loading {
@@ -429,6 +433,8 @@ impl App {
                     id,
                     origin,
                     cancellation,
+                    worker: Some(worker),
+                    preserve_cancelled_result,
                 });
             }
             Err(_) => {
@@ -462,10 +468,31 @@ impl App {
         {
             return;
         }
-        let Some(task) = self.project_edit_task.take() else {
+        let Some(mut task) = self.project_edit_task.take() else {
             return;
         };
+        let worker_failed = task
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        let cancelled = task.cancellation.is_cancelled();
         let mut screen = task.origin;
+        if cancelled && !task.preserve_cancelled_result {
+            self.message = Some(
+                "Project editor request cancelled. The previous draft is retained; no new read or preview result was accepted."
+                    .into(),
+            );
+            self.screen = Screen::ProjectEdit(screen);
+            return;
+        }
+        if worker_failed && !task.preserve_cancelled_result {
+            self.message = Some(
+                "Project editor worker stopped unexpectedly. The previous draft is retained; retry the request."
+                    .into(),
+            );
+            self.screen = Screen::ProjectEdit(screen);
+            return;
+        }
         match result {
             Ok(ProjectEditPage::Loaded(draft)) => {
                 draft.root().clone_into(&mut screen.root);
@@ -474,15 +501,27 @@ impl App {
             }
             Ok(ProjectEditPage::Saved(config)) => {
                 self.show_overview(screen.root, (*config).clone());
-                self.message =
-                    Some("Saved the confirmed shipforge.yaml. No deployment was performed.".into());
+                self.message = Some(if worker_failed {
+                    "Saved the confirmed shipforge.yaml. Worker cleanup then stopped unexpectedly; the known YAML save is retained. No deployment was performed."
+                } else {
+                    "Saved the confirmed shipforge.yaml. No deployment was performed."
+                }.into());
                 return;
             }
             Ok(page) => {
                 screen.page = page;
                 screen.scroll = 0;
             }
-            Err(error) => self.message = Some(render::safe_text(&error)),
+            Err(error) => {
+                let message = render::safe_text(&error);
+                self.message = Some(if worker_failed {
+                    format!(
+                        "{message} The project editor worker also stopped unexpectedly during final cleanup. Preserve this reported YAML durability outcome and reload the directory before retrying."
+                    )
+                } else {
+                    message
+                });
+            }
         }
         self.screen = Screen::ProjectEdit(screen);
     }

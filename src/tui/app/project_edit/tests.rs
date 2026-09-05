@@ -200,6 +200,8 @@ async fn target_children_and_text_preserve_project_environment_and_component_con
         id: uuid::Uuid::now_v7(),
         origin,
         cancellation: CancellationToken::new(),
+        worker: None,
+        preserve_cancelled_result: false,
     });
     set_page(
         &mut fixture.app,
@@ -1141,6 +1143,15 @@ async fn editor_single_flight_cancellation_waits_and_stale_uuid_cannot_replace_s
         .app
         .finish_project_edit(uuid::Uuid::now_v7(), Ok(ProjectEditPage::Home));
     assert_eq!(fixture.app.project_edit_task.as_ref().unwrap().id, id);
+    assert!(
+        fixture
+            .app
+            .project_edit_task
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_some()
+    );
     for key in [KeyCode::Char('p'), KeyCode::Char('c'), KeyCode::Enter] {
         press(&mut fixture.app, key);
     }
@@ -1171,6 +1182,135 @@ async fn editor_shutdown_waits_even_before_service_session_acquisition() {
     fixture.app.shutdown();
     assert!(fake.completed.load(Ordering::SeqCst));
     assert!(fixture.app.project_edit_task.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_read_success_is_discarded_but_known_save_success_is_retained() {
+    let mut fixture = Fixture::new().await;
+    set_page(&mut fixture.app, ProjectEditPage::Components { cursor: 1 });
+    let origin = screen(&fixture.app);
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let id = uuid::Uuid::now_v7();
+    fixture.app.project_edit_task = Some(ProjectEditTask {
+        id,
+        origin,
+        cancellation,
+        worker: None,
+        preserve_cancelled_result: false,
+    });
+    fixture
+        .app
+        .finish_project_edit(id, Ok(ProjectEditPage::Home));
+    assert!(matches!(
+        screen(&fixture.app).page,
+        ProjectEditPage::Components { cursor: 1 }
+    ));
+    assert!(
+        fixture
+            .app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("cancelled"))
+    );
+
+    let preview = fixture.preview().await;
+    let config = Arc::new(preview.config().clone());
+    let origin = screen(&fixture.app);
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let id = uuid::Uuid::now_v7();
+    fixture.app.project_edit_task = Some(ProjectEditTask {
+        id,
+        origin,
+        cancellation,
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-project-tail-payload");
+        })),
+        preserve_cancelled_result: true,
+    });
+    fixture
+        .app
+        .finish_project_edit(id, Ok(ProjectEditPage::Saved(config)));
+    assert!(matches!(fixture.app.screen, Screen::Overview { .. }));
+    assert!(
+        fixture
+            .app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Saved the confirmed"))
+    );
+    assert!(
+        fixture
+            .app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("cleanup"))
+    );
+    assert!(
+        !fixture
+            .app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("private-project-tail-payload")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_error_survives_worker_tail_failure_without_exposing_the_panic() {
+    let mut fixture = Fixture::new().await;
+    let id = uuid::Uuid::now_v7();
+    fixture.app.project_edit_task = Some(ProjectEditTask {
+        id,
+        origin: screen(&fixture.app),
+        cancellation: CancellationToken::new(),
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-project-save-tail-payload");
+        })),
+        preserve_cancelled_result: true,
+    });
+    fixture.app.finish_project_edit(
+        id,
+        Err("Known YAML durability outcome; reload before retrying.".into()),
+    );
+    let message = fixture.app.message.as_deref().unwrap();
+    assert!(message.contains("Known YAML durability outcome"));
+    assert!(message.contains("worker"));
+    assert!(!message.contains("private-project-save-tail-payload"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_completion_joins_the_worker_tail_before_returning() {
+    let mut fixture = Fixture::new().await;
+    let (release, wait) = std::sync::mpsc::channel();
+    let tail_finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = Arc::clone(&tail_finished);
+    let worker = std::thread::spawn(move || {
+        wait.recv().unwrap();
+        worker_finished.store(true, Ordering::SeqCst);
+    });
+    let returned = Arc::new(AtomicBool::new(false));
+    let observed_return = Arc::clone(&returned);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!observed_return.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+    });
+    let id = uuid::Uuid::now_v7();
+    fixture.app.project_edit_task = Some(ProjectEditTask {
+        id,
+        origin: screen(&fixture.app),
+        cancellation: CancellationToken::new(),
+        worker: Some(worker),
+        preserve_cancelled_result: false,
+    });
+    fixture
+        .app
+        .finish_project_edit(id, Ok(ProjectEditPage::Home));
+    returned.store(true, Ordering::SeqCst);
+    releaser.join().unwrap();
+    assert!(tail_finished.load(Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

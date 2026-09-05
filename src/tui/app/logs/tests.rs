@@ -505,6 +505,8 @@ fn busy_escape_cancels_without_closing_or_detaching_the_real_local_worker() {
     assert!(app.log_workspace_busy());
     assert!(!control.completed.load(std::sync::atomic::Ordering::SeqCst));
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    assert_eq!(app.exit_state(), super::super::ExitState::Running);
+    assert!(app.log_workspace_busy());
     app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
     assert!(app.help_open);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

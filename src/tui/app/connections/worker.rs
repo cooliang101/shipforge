@@ -88,7 +88,7 @@ pub(super) async fn run(
             .map_err(error),
         ConnectionsRequest::Remove(preview) => {
             service
-                .remove_destination((*preview).clone())
+                .remove_destination_with_cancellation((*preview).clone(), cancellation)
                 .await
                 .map_err(error)?;
             list(service).map_err(|_| "Connection registration was removed, but refreshing the list failed; reload current connections.".into())
@@ -99,7 +99,7 @@ pub(super) async fn run(
             .map_err(error),
         ConnectionsRequest::ProjectRemove(preview) => {
             service
-                .remove_project((*preview).clone())
+                .remove_project_with_cancellation((*preview).clone(), cancellation)
                 .await
                 .map_err(error)?;
             service.list_projects().map(|projects| ConnectionsPage::ProjectRemoved(Arc::new(projects)))

@@ -206,7 +206,11 @@ async fn escape_discards_preview_or_cancels_tracked_preparation_without_writing(
             assert!(fixture.app.reinitialize_task.is_some());
         }
         finished(&mut fixture.app).await;
-        assert!(matches!(fixture.app.screen, Screen::Projects));
+        if pending {
+            assert!(matches!(screen(&fixture.app).page, ReinitializePage::Intro));
+        } else {
+            assert!(matches!(fixture.app.screen, Screen::Projects));
+        }
         assert_eq!(fixture.bytes(), before);
         assert!(!fixture.directory.path().join("projects.yaml").exists());
     }
@@ -376,7 +380,10 @@ async fn completion_matches_request_id_and_known_save_wins_over_late_cancellatio
         id,
         origin,
         cancellation,
-        worker: None,
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-reinitialize-tail-payload");
+        })),
+        saving: true,
     });
     fixture
         .app
@@ -393,7 +400,77 @@ async fn completion_matches_request_id_and_known_save_wins_over_late_cancellatio
             .unwrap()
             .contains("Saved shipforge.yaml")
     );
+    assert!(
+        fixture
+            .app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("worker cleanup")
+    );
+    assert!(
+        !fixture
+            .app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("private-reinitialize-tail-payload")
+    );
     assert_eq!(fixture.bytes(), preview.yaml().as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_tail_panic_rejects_preview_with_a_static_diagnostic() {
+    let mut fixture = Fixture::new();
+    let preview = fixture.preview().await;
+    let origin = ReinitializeScreen {
+        root: fixture.directory.path().to_owned(),
+        page: ReinitializePage::Intro,
+        scroll: 0,
+        horizontal: 0,
+        document: None,
+    };
+    let id = uuid::Uuid::now_v7();
+    fixture.app.reinitialize_task = Some(ReinitializeTask {
+        id,
+        origin,
+        cancellation: CancellationToken::new(),
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-reinitialize-tail-payload");
+        })),
+        saving: false,
+    });
+    fixture
+        .app
+        .finish_reinitialize(id, Ok(ReinitializeResult::Preview(preview)));
+    assert!(matches!(screen(&fixture.app).page, ReinitializePage::Intro));
+    let message = fixture.app.message.as_deref().unwrap();
+    assert!(message.contains("worker stopped"));
+    assert!(!message.contains("private-reinitialize-tail-payload"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_error_survives_worker_tail_failure_without_exposing_the_panic() {
+    let mut fixture = Fixture::new();
+    let origin = screen(&fixture.app).clone();
+    let id = uuid::Uuid::now_v7();
+    fixture.app.reinitialize_task = Some(ReinitializeTask {
+        id,
+        origin,
+        cancellation: CancellationToken::new(),
+        worker: Some(std::thread::spawn(|| {
+            panic!("private-reinitialize-save-tail-payload");
+        })),
+        saving: true,
+    });
+    fixture.app.finish_reinitialize(
+        id,
+        Err("Known reinitialization durability outcome; reload required.".into()),
+    );
+    let message = fixture.app.message.as_deref().unwrap();
+    assert!(message.contains("Known reinitialization durability outcome"));
+    assert!(message.contains("worker"));
+    assert!(!message.contains("private-reinitialize-save-tail-payload"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

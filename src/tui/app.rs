@@ -5,6 +5,7 @@ use std::{
         Arc,
         mpsc::{self, Receiver, SyncSender},
     },
+    thread::JoinHandle,
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -93,7 +94,6 @@ pub(super) enum Screen {
     HostKeyPending {
         request_id: uuid::Uuid,
         draft: NewSshDestinationState,
-        cancellation: tokio_util::sync::CancellationToken,
         cancellation_requested: bool,
     },
     HostKeyConfirm {
@@ -104,7 +104,6 @@ pub(super) enum Screen {
         request_id: uuid::Uuid,
         draft: NewSshDestinationState,
         fingerprint: HostKeyFingerprint,
-        cancellation: tokio_util::sync::CancellationToken,
         cancellation_requested: bool,
     },
     RemoteSetupSelection(RemoteSetupSelectionState),
@@ -288,7 +287,34 @@ enum BackgroundEvent {
     HostKey(uuid::Uuid, Result<String, String>),
     Authentication(uuid::Uuid, Result<RemoteSetupCandidates, String>),
     DeploymentPlan(uuid::Uuid, Result<DeploymentPlan, String>),
-    DeploymentFinished(Result<DeploymentReport, String>),
+    DeploymentFinished(uuid::Uuid, Result<DeploymentReport, String>),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::tui) enum ExitState {
+    #[default]
+    Running,
+    Confirm,
+    Waiting,
+}
+
+#[derive(Debug)]
+struct DeploymentTask {
+    id: uuid::Uuid,
+    cancellation: tokio_util::sync::CancellationToken,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DeploymentTask {
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn join(mut self) -> bool {
+        self.worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -427,6 +453,8 @@ pub(super) struct App {
     background_receiver: Receiver<BackgroundEvent>,
     setup_service: DestinationSetupService,
     setup_task: Option<setup_async::SetupTask>,
+    deployment_plan_task: Option<DeploymentTask>,
+    deployment_execution_task: Option<DeploymentTask>,
     deployment_gateway: Arc<dyn TuiDeploymentGateway>,
     attention_gateway: Arc<dyn TuiAttentionGateway>,
     attention: AttentionState,
@@ -446,6 +474,7 @@ pub(super) struct App {
     live_environment: Option<(ProjectId, EnvironmentId)>,
     pub log_workspace: Option<logs::LogWorkspace>,
     pending_clipboard: Option<String>,
+    exit_state: ExitState,
 }
 
 impl App {
@@ -531,6 +560,8 @@ impl App {
             background_receiver,
             setup_service,
             setup_task: None,
+            deployment_plan_task: None,
+            deployment_execution_task: None,
             deployment_gateway,
             attention_gateway,
             attention: AttentionState::default(),
@@ -550,6 +581,7 @@ impl App {
             live_environment: None,
             log_workspace: None,
             pending_clipboard: None,
+            exit_state: ExitState::Running,
         };
         app.refresh_attention(None);
         Ok(app)
@@ -579,8 +611,8 @@ impl App {
                 BackgroundEvent::DeploymentPlan(completed_id, result) => {
                     self.finish_deployment_plan(completed_id, result);
                 }
-                BackgroundEvent::DeploymentFinished(result) => {
-                    self.finish_deployment(result);
+                BackgroundEvent::DeploymentFinished(id, result) => {
+                    self.finish_deployment(id, result);
                 }
             }
         }
@@ -591,12 +623,30 @@ impl App {
     fn finish_deployment_plan(
         &mut self,
         completed_id: uuid::Uuid,
-        result: Result<DeploymentPlan, String>,
+        mut result: Result<DeploymentPlan, String>,
     ) {
+        if self
+            .deployment_plan_task
+            .as_ref()
+            .is_none_or(|task| task.id != completed_id)
+        {
+            return;
+        }
+        let task = self
+            .deployment_plan_task
+            .take()
+            .expect("matched Deployment planning task");
+        let cancelled = task.cancellation.is_cancelled();
+        if task.join() {
+            result = Err(
+                "Deployment check worker stopped unexpectedly. No completed plan was accepted."
+                    .into(),
+            );
+        }
         let Screen::DeploymentPlanning {
             request_id,
             selection,
-            cancellation,
+            ..
         } = self.screen.clone()
         else {
             return;
@@ -604,7 +654,7 @@ impl App {
         if completed_id != request_id {
             return;
         }
-        if cancellation.is_cancelled() {
+        if cancelled {
             self.screen = Screen::DeploySelection(selection);
             self.message = Some("Deployment check cancelled. The completed plan was discarded; review the selection before checking again.".into());
             return;
@@ -619,8 +669,8 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if self.handle_overlay_key(key) {
-            return false;
+        if let Some(should_exit) = self.handle_modal_key(key) {
+            return should_exit;
         }
         // In raw mode Ctrl+C is an input event, not a process signal. Never
         // let modified shortcuts fall through to plain confirmation keys.
@@ -718,6 +768,85 @@ impl App {
         false
     }
 
+    fn handle_modal_key(&mut self, key: KeyEvent) -> Option<bool> {
+        // An open exit dialog is topmost; otherwise text overlays own ordinary `q` input.
+        if self.exit_state != ExitState::Running {
+            return self.handle_exit_key(key);
+        }
+        if self.handle_overlay_key(key) {
+            Some(false)
+        } else {
+            self.handle_exit_key(key)
+        }
+    }
+
+    fn handle_exit_key(&mut self, key: KeyEvent) -> Option<bool> {
+        match self.exit_state {
+            ExitState::Confirm => {
+                if key.modifiers.is_empty() && matches!(key.code, KeyCode::Esc | KeyCode::Char('r'))
+                {
+                    self.exit_state = ExitState::Running;
+                } else if (key.modifiers.is_empty() && key.code == KeyCode::Char('c'))
+                    || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c'))
+                {
+                    self.request_process_exit();
+                }
+                return Some(false);
+            }
+            ExitState::Waiting => {
+                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                    self.request_deployment_cancellation();
+                }
+                return Some(false);
+            }
+            ExitState::Running => {}
+        }
+
+        if key.modifiers.is_empty()
+            && key.code == KeyCode::Char('q')
+            && (matches!(self.screen, Screen::Projects | Screen::Overview { .. })
+                || self.interactive_work_active())
+        {
+            if self.interactive_work_active() {
+                self.exit_state = ExitState::Confirm;
+                return Some(false);
+            }
+            return Some(true);
+        }
+        None
+    }
+
+    fn interactive_work_active(&self) -> bool {
+        self.deployment_plan_task.is_some()
+            || self.deployment_execution_task.is_some()
+            || self.management_task.is_some()
+            || self.connections_task.is_some()
+            || self.project_edit_task.is_some()
+            || self.reinitialize_task.is_some()
+            || self.remote_target_task.is_some()
+            || self.setup_task.is_some()
+            || self.log_workspace_busy()
+            || self.deployment_session.is_active()
+    }
+
+    fn tracked_work_active(&self) -> bool {
+        self.interactive_work_active() || self.attention_busy()
+    }
+
+    pub(in crate::tui) fn exit_state(&self) -> ExitState {
+        self.exit_state
+    }
+
+    pub(in crate::tui) fn exit_ready(&self) -> bool {
+        self.exit_state == ExitState::Waiting && !self.tracked_work_active()
+    }
+
+    pub(in crate::tui) fn request_process_exit(&mut self) {
+        self.exit_state = ExitState::Waiting;
+        self.cancel_attention_for_shutdown();
+        self.request_deployment_cancellation();
+    }
+
     fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
         if key.code == KeyCode::F(1) && key.modifiers.is_empty() {
             self.help_open = !self.help_open;
@@ -807,6 +936,12 @@ impl App {
         self.cancel_reinitialize();
         self.cancel_remote_target();
         self.cancel_setup();
+        if let Some(task) = &self.deployment_plan_task {
+            task.cancel();
+        }
+        if let Some(task) = &self.deployment_execution_task {
+            task.cancel();
+        }
         if let Screen::DeploymentPlanning { cancellation, .. } = &self.screen {
             cancellation.cancel();
         }
@@ -822,24 +957,8 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
-        match &self.screen {
-            Screen::DeploymentPlanning { cancellation, .. }
-            | Screen::HostKeyPending { cancellation, .. }
-            | Screen::SshAuthenticationPending { cancellation, .. } => cancellation.cancel(),
-            _ => {}
-        }
-        self.request_deployment_cancellation();
-        // The Running screen is set before the worker acquires its session
-        // permit, so waiting on is_active alone would introduce an exit race.
-        while matches!(self.screen, Screen::DeploymentRunning { .. })
-            || self.management_task.is_some()
-            || self.connections_task.is_some()
-            || self.project_edit_task.is_some()
-            || self.reinitialize_task.is_some()
-            || self.remote_target_task.is_some()
-            || self.setup_task.is_some()
-            || self.log_workspace_busy()
-        {
+        self.request_process_exit();
+        while self.tracked_work_active() {
             self.poll_background();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -977,18 +1096,25 @@ impl App {
             components: selection.selected.clone(),
         };
         let request_id = uuid::Uuid::now_v7();
-        let result = spawn_plan_thread(
+        let worker = match spawn_plan_thread(
             request_id,
             runtime,
             Arc::clone(&self.deployment_gateway),
             request,
             cancellation.clone(),
             self.background_sender.clone(),
-        );
-        if let Err(error) = result {
-            self.message = Some(format!("Could not start Deployment check: {error}"));
-            return;
-        }
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.message = Some(format!("Could not start Deployment check: {error}"));
+                return;
+            }
+        };
+        self.deployment_plan_task = Some(DeploymentTask {
+            id: request_id,
+            cancellation: cancellation.clone(),
+            worker: Some(worker),
+        });
         self.screen = Screen::DeploymentPlanning {
             request_id,
             selection: selection.clone(),
@@ -1032,19 +1158,28 @@ impl App {
         let progress = crate::tui::live_progress::LiveProgress::default();
         self.remember_environment(&config, &plan.selection.environment);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let result = spawn_execute_thread(
+        let request_id = uuid::Uuid::now_v7();
+        let worker = match spawn_execute_thread(DeploymentExecutionWorker {
+            request_id,
             runtime,
-            Arc::clone(&self.deployment_gateway),
-            Arc::clone(&self.deployment_session),
+            gateway: Arc::clone(&self.deployment_gateway),
+            session: Arc::clone(&self.deployment_session),
             plan,
-            cancellation.clone(),
-            self.background_sender.clone(),
-            progress.clone(),
-        );
-        if let Err(error) = result {
-            self.message = Some(format!("Could not start Deployment: {error}"));
-            return;
-        }
+            cancellation: cancellation.clone(),
+            sender: self.background_sender.clone(),
+            progress: progress.clone(),
+        }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.message = Some(format!("Could not start Deployment: {error}"));
+                return;
+            }
+        };
+        self.deployment_execution_task = Some(DeploymentTask {
+            id: request_id,
+            cancellation: cancellation.clone(),
+            worker: Some(worker),
+        });
         self.live_environment = live_environment;
         self.live_progress = Some(progress);
         self.live_logs = crate::tui::log_view::LogView::default();
@@ -1058,7 +1193,33 @@ impl App {
         self.invalidate_attention();
     }
 
-    fn finish_deployment(&mut self, result: Result<DeploymentReport, String>) {
+    fn finish_deployment(
+        &mut self,
+        completed_id: uuid::Uuid,
+        mut result: Result<DeploymentReport, String>,
+    ) {
+        if self
+            .deployment_execution_task
+            .as_ref()
+            .is_none_or(|task| task.id != completed_id)
+        {
+            return;
+        }
+        let task = self
+            .deployment_execution_task
+            .take()
+            .expect("matched Deployment execution task");
+        if task.join() {
+            match &mut result {
+                Ok(report) => report.warnings.push(
+                    "Deployment worker cleanup stopped unexpectedly after reporting an outcome; inspect recorded and remote state before retrying."
+                        .into(),
+                ),
+                Err(error) => {
+                    *error = "Deployment worker stopped unexpectedly. Remote state may be incomplete; inspect deployment history and remote state before retrying.".into();
+                }
+            }
+        }
         if let Some(progress) = &self.live_progress {
             progress.finish();
         }
@@ -1953,7 +2114,7 @@ fn spawn_plan_thread(
     selection: DeploymentSelection,
     cancellation: tokio_util::sync::CancellationToken,
     sender: SyncSender<BackgroundEvent>,
-) -> std::io::Result<()> {
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("shipforge-deployment-plan".into())
         .spawn(move || {
@@ -1961,10 +2122,10 @@ fn spawn_plan_thread(
                 catch_worker_failure(|| runtime.block_on(gateway.plan(selection, &cancellation)));
             let _ = sender.send(BackgroundEvent::DeploymentPlan(request_id, result));
         })
-        .map(drop)
 }
 
-fn spawn_execute_thread(
+struct DeploymentExecutionWorker {
+    request_id: uuid::Uuid,
     runtime: tokio::runtime::Handle,
     gateway: Arc<dyn TuiDeploymentGateway>,
     session: Arc<DeploymentSession>,
@@ -1972,15 +2133,24 @@ fn spawn_execute_thread(
     cancellation: tokio_util::sync::CancellationToken,
     sender: SyncSender<BackgroundEvent>,
     progress: crate::tui::live_progress::LiveProgress,
-) -> std::io::Result<()> {
+}
+
+fn spawn_execute_thread(request: DeploymentExecutionWorker) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("shipforge-deployment-run".into())
         .spawn(move || {
-            let events = ProgressEvents { progress };
+            let events = ProgressEvents {
+                progress: request.progress,
+            };
             let result = catch_worker_failure(|| {
-                runtime.block_on(async {
-                    session
-                        .run(gateway.execute(plan, &events, &cancellation))
+                request.runtime.block_on(async {
+                    request
+                        .session
+                        .run(
+                            request
+                                .gateway
+                                .execute(request.plan, &events, &request.cancellation),
+                        )
                         .await
                         .map_err(|error| error.to_string())
                         .and_then(|result| result)
@@ -1989,9 +2159,11 @@ fn spawn_execute_thread(
             // Freeze operation time at the worker boundary, not when the UI
             // eventually consumes a queued completion notification.
             events.progress.finish();
-            let _ = sender.send(BackgroundEvent::DeploymentFinished(result));
+            let _ = request.sender.send(BackgroundEvent::DeploymentFinished(
+                request.request_id,
+                result,
+            ));
         })
-        .map(drop)
 }
 
 fn selected_components(setup: &DestinationSetupState) -> Vec<ComponentName> {
@@ -2174,15 +2346,17 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(0);
         let progress = crate::tui::live_progress::LiveProgress::default();
         cancellation.cancel();
-        spawn_execute_thread(
-            tokio::runtime::Handle::current(),
+        let request_id = uuid::Uuid::now_v7();
+        let worker = spawn_execute_thread(DeploymentExecutionWorker {
+            request_id,
+            runtime: tokio::runtime::Handle::current(),
             gateway,
-            Arc::new(DeploymentSession::default()),
+            session: Arc::new(DeploymentSession::default()),
             plan,
             cancellation,
             sender,
-            progress.clone(),
-        )
+            progress: progress.clone(),
+        })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while !progress.snapshot().finished {
@@ -2196,8 +2370,9 @@ mod tests {
         assert_eq!(progress.snapshot().elapsed_ms, elapsed);
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
-            BackgroundEvent::DeploymentFinished(Ok(_))
+            BackgroundEvent::DeploymentFinished(completed_id, Ok(_)) if completed_id == request_id
         ));
+        worker.join().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2212,6 +2387,7 @@ mod tests {
     }
 
     async fn assert_confirmation_and_cancellation(cancel_key: Option<KeyEvent>) {
+        let process_exit = cancel_key.is_none();
         let directory = tempdir().unwrap();
         std::fs::write(
             directory.path().join("shipforge.yaml"),
@@ -2258,7 +2434,11 @@ mod tests {
         assert!(matches!(app.screen, Screen::DeploymentRunning { .. }));
         assert!(!app.handle_key(key(KeyCode::Char('q'))));
         assert!(matches!(app.screen, Screen::DeploymentRunning { .. }));
+        assert_eq!(app.exit_state(), ExitState::Confirm);
+        assert!(!gateway.cancelled.load(Ordering::SeqCst));
         if let Some(cancel_key) = cancel_key {
+            assert!(!app.handle_key(key(KeyCode::Esc)));
+            assert_eq!(app.exit_state(), ExitState::Running);
             assert!(!app.handle_key(cancel_key));
             assert!(matches!(
                 app.screen,
@@ -2268,8 +2448,19 @@ mod tests {
                 }
             ));
         } else {
+            assert!(!app.handle_key(key(KeyCode::Char('c'))));
+            assert_eq!(app.exit_state(), ExitState::Waiting);
+            assert!(!app.exit_ready());
+            assert!(matches!(
+                app.screen,
+                Screen::DeploymentRunning {
+                    cancellation_requested: true,
+                    ..
+                }
+            ));
             app.shutdown();
             assert!(matches!(app.screen, Screen::DeploymentFinished { .. }));
+            assert!(app.exit_ready());
         }
         wait_for_screen(&mut app, |screen| {
             matches!(screen, Screen::DeploymentFinished { .. })
@@ -2278,8 +2469,12 @@ mod tests {
         assert!(gateway.executed.load(Ordering::SeqCst));
         assert!(gateway.cancelled.load(Ordering::SeqCst));
         assert!(!app.deployment_session.is_active());
-        assert!(!app.handle_key(key(KeyCode::Enter)));
-        assert!(matches!(app.screen, Screen::Overview { .. }));
+        if process_exit {
+            assert_eq!(app.exit_state(), ExitState::Waiting);
+        } else {
+            assert!(!app.handle_key(key(KeyCode::Enter)));
+            assert!(matches!(app.screen, Screen::Overview { .. }));
+        }
     }
 
     #[test]
@@ -2305,11 +2500,17 @@ mod tests {
             component_cursor: 0,
             selected: BTreeSet::new(),
         };
+        let cancellation = tokio_util::sync::CancellationToken::new();
         app.screen = Screen::DeploymentPlanning {
             request_id,
             selection,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation: cancellation.clone(),
         };
+        app.deployment_plan_task = Some(DeploymentTask {
+            id: request_id,
+            cancellation,
+            worker: Some(std::thread::spawn(|| {})),
+        });
         app.background_sender
             .send(BackgroundEvent::DeploymentPlan(
                 uuid::Uuid::now_v7(),
@@ -2820,7 +3021,6 @@ mod tests {
             request_id,
             draft,
             fingerprint,
-            cancellation,
             cancellation_requested: false,
         };
         app.background_sender
@@ -2903,7 +3103,6 @@ mod tests {
             request_id,
             draft,
             fingerprint,
-            cancellation,
             cancellation_requested: false,
         };
         app.background_sender

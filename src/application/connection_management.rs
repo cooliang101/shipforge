@@ -313,14 +313,29 @@ impl ConnectionManagementService {
         &self,
         preview: ProjectRemovalPreview,
     ) -> Result<(), ConnectionManagementError> {
+        let cancellation = CancellationToken::new();
+        self.remove_project_with_cancellation(preview, &cancellation)
+            .await
+    }
+
+    pub(crate) async fn remove_project_with_cancellation(
+        &self,
+        preview: ProjectRemovalPreview,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ConnectionManagementError> {
+        check_cancelled(cancellation)?;
         self.session
             .run(async {
+                check_cancelled(cancellation)?;
                 Self::ensure_path(&preview.registry, &self.paths.projects)?;
                 preview.registry.ensure_unchanged()?;
                 let mut registry = project_registry(&preview.registry)?;
                 if !registry.unregister(&preview.root) {
                     return Err(ConnectionManagementError::Missing);
                 }
+                // Cancellation is accepted up to the atomic publish boundary.
+                // Once save succeeds, a late request must not rewrite that fact.
+                check_cancelled(cancellation)?;
                 registry
                     .save(&self.paths.projects)
                     .map_err(|_| unavailable(ManagementSource::Projects, "could not save registry"))
@@ -368,8 +383,20 @@ impl ConnectionManagementService {
         &self,
         preview: DestinationRemovalPreview,
     ) -> Result<(), ConnectionManagementError> {
+        let cancellation = CancellationToken::new();
+        self.remove_destination_with_cancellation(preview, &cancellation)
+            .await
+    }
+
+    pub(crate) async fn remove_destination_with_cancellation(
+        &self,
+        preview: DestinationRemovalPreview,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ConnectionManagementError> {
+        check_cancelled(cancellation)?;
         self.session
             .run(async {
+                check_cancelled(cancellation)?;
                 Self::ensure_path(&preview.registry, &self.paths.destinations)?;
                 if !preview.can_remove() {
                     return Err(ConnectionManagementError::Referenced);
@@ -391,6 +418,9 @@ impl ConnectionManagementService {
                 registry
                     .remove(&fresh.details.key, DestinationReferences::default())
                     .map_err(|_| ConnectionManagementError::Referenced)?;
+                // This is the final cancellation point. A successful atomic save
+                // is a known removal and is never rolled back for late cancellation.
+                check_cancelled(cancellation)?;
                 registry.save(&self.paths.destinations).map_err(|_| {
                     unavailable(ManagementSource::Destinations, "could not save registry")
                 })

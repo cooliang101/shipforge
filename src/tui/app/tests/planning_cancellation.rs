@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+
 use tokio::sync::Notify;
 
 use super::*;
@@ -142,4 +144,44 @@ async fn cancelled_real_planning_worker_discards_late_success_before_allowing_a_
         assert!(!gateway.executed.load(Ordering::SeqCst));
         assert!(!directory.path().join("history.sqlite3").exists());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_and_joins_the_real_planning_worker() {
+    let (_directory, mut app, gateway) = fixture();
+    app.handle_key(key(KeyCode::Enter));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !gateway.started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("real planning thread must start");
+
+    let (returned_tx, returned_rx) = mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        app.shutdown();
+        returned_tx.send(()).unwrap();
+        app
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !gateway.cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("shutdown must propagate cancellation to planning");
+    assert!(matches!(
+        returned_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    gateway.release.notify_one();
+    returned_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("shutdown must return after the planning worker exits");
+    let app = shutdown.join().unwrap();
+    assert!(app.deployment_plan_task.is_none());
+    assert!(matches!(app.screen, Screen::DeploySelection(_)));
+    assert!(gateway.completed.load(Ordering::SeqCst));
 }

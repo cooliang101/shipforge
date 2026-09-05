@@ -1,11 +1,17 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, thread::JoinHandle};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::{application::LocalAttentionSummary, domain::ProjectId};
 
 use super::{App, BackgroundEvent, Screen, catch_worker_failure};
 
 pub(super) trait TuiAttentionGateway: std::fmt::Debug + Send + Sync {
-    fn query(&self, project: Option<&ProjectId>) -> Result<LocalAttentionSummary, String>;
+    fn query(
+        &self,
+        project: Option<&ProjectId>,
+        cancellation: &CancellationToken,
+    ) -> Result<LocalAttentionSummary, String>;
 }
 
 #[derive(Debug)]
@@ -14,9 +20,21 @@ pub(super) struct LocalAttentionGateway {
 }
 
 impl TuiAttentionGateway for LocalAttentionGateway {
-    fn query(&self, project: Option<&ProjectId>) -> Result<LocalAttentionSummary, String> {
-        crate::application::local_attention(&self.history, project, None)
-            .map_err(|error| error.to_string())
+    fn query(
+        &self,
+        project: Option<&ProjectId>,
+        cancellation: &CancellationToken,
+    ) -> Result<LocalAttentionSummary, String> {
+        if cancellation.is_cancelled() {
+            return Err("Local attention check cancelled.".into());
+        }
+        let result = crate::application::local_attention(&self.history, project, None)
+            .map_err(|error| error.to_string());
+        if cancellation.is_cancelled() {
+            Err("Local attention check cancelled.".into())
+        } else {
+            result
+        }
     }
 }
 
@@ -31,6 +49,8 @@ pub(super) struct AttentionState {
     /// At most one worker runs; opening more projects replaces the queued request.
     pub request: Option<AttentionRequest>,
     pub in_flight: Option<uuid::Uuid>,
+    cancellation: Option<CancellationToken>,
+    worker: Option<JoinHandle<()>>,
     pub project: Option<ProjectId>,
     pub notice: Option<String>,
 }
@@ -52,10 +72,14 @@ impl App {
     pub(super) fn invalidate_attention(&mut self) {
         self.attention.request = None;
         self.attention.notice = None;
+        if let Some(cancellation) = &self.attention.cancellation {
+            cancellation.cancel();
+        }
     }
 
     fn attention_suppressed(&self) -> bool {
-        self.deployment_session.is_active()
+        self.exit_state == super::ExitState::Waiting
+            || self.deployment_session.is_active()
             || self.management_task.is_some()
             || self.connections_task.is_some()
             || self.project_edit_task.is_some()
@@ -72,16 +96,22 @@ impl App {
             return;
         };
         let id = request.id;
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
         let gateway = Arc::clone(&self.attention_gateway);
         let sender = self.background_sender.clone();
         let spawned = std::thread::Builder::new()
             .name("shipforge-local-attention".into())
             .spawn(move || {
-                let result = catch_worker_failure(|| gateway.query(request.project.as_ref()));
+                let result = catch_worker_failure(|| {
+                    gateway.query(request.project.as_ref(), &worker_cancellation)
+                });
                 let _ = sender.send(BackgroundEvent::LocalAttention(request, result));
             });
-        if spawned.is_ok() {
+        if let Ok(worker) = spawned {
             self.attention.in_flight = Some(id);
+            self.attention.cancellation = Some(cancellation);
+            self.attention.worker = Some(worker);
         } else {
             self.attention.request = None;
             self.attention.notice = Some(unavailable_notice().into());
@@ -96,14 +126,39 @@ impl App {
         if self.attention.in_flight != Some(request.id) {
             return;
         }
+        let cancelled = self
+            .attention
+            .cancellation
+            .take()
+            .is_some_and(|cancellation| cancellation.is_cancelled());
+        let worker_failed = self
+            .attention
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
         self.attention.in_flight = None;
         if self.attention.request.as_ref() == Some(request) {
             self.attention.request = None;
-            if !self.attention_suppressed() {
-                self.attention.notice = attention_notice(result);
+            if !cancelled && !self.attention_suppressed() {
+                self.attention.notice = attention_notice(if worker_failed {
+                    Err("Local attention worker stopped unexpectedly.".into())
+                } else {
+                    result
+                });
             }
         }
         self.start_attention_worker();
+    }
+
+    pub(super) fn cancel_attention_for_shutdown(&mut self) {
+        self.attention.request = None;
+        if let Some(cancellation) = &self.attention.cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    pub(super) fn attention_busy(&self) -> bool {
+        self.attention.in_flight.is_some() || self.attention.worker.is_some()
     }
 
     pub(super) fn show_projects(&mut self) {
@@ -165,7 +220,11 @@ mod tests {
     use std::{
         collections::VecDeque,
         path::Path,
-        sync::{Condvar, Mutex},
+        sync::{
+            Condvar, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         time::{Duration, Instant},
     };
 
@@ -222,7 +281,11 @@ mod tests {
     }
 
     impl TuiAttentionGateway for FakeAttentionGateway {
-        fn query(&self, project: Option<&ProjectId>) -> Result<LocalAttentionSummary, String> {
+        fn query(
+            &self,
+            project: Option<&ProjectId>,
+            _: &CancellationToken,
+        ) -> Result<LocalAttentionSummary, String> {
             self.queries.lock().unwrap().push(project.cloned());
             if let Some(gate) = &self.gate {
                 let (open, changed) = &**gate;
@@ -239,6 +302,45 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected local query")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ControlledShutdownAttentionGateway {
+        started: AtomicBool,
+        cancelled: AtomicBool,
+        release: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl TuiAttentionGateway for ControlledShutdownAttentionGateway {
+        fn query(
+            &self,
+            _: Option<&ProjectId>,
+            cancellation: &CancellationToken,
+        ) -> Result<LocalAttentionSummary, String> {
+            self.started.store(true, Ordering::SeqCst);
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.cancelled.store(true, Ordering::SeqCst);
+            let (released, timeout) = self
+                .changed
+                .wait_timeout_while(
+                    self.release.lock().unwrap(),
+                    Duration::from_secs(3),
+                    |released| !*released,
+                )
+                .unwrap();
+            assert!(
+                *released && !timeout.timed_out(),
+                "test must release the cancelled attention worker"
+            );
+            Ok(LocalAttentionSummary {
+                database_missing: false,
+                more: false,
+                candidates: Vec::new(),
+            })
         }
     }
 
@@ -349,6 +451,37 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_cancels_and_joins_attention_without_starting_a_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Arc::new(ControlledShutdownAttentionGateway::default());
+        let app = new_app(directory.path(), gateway.clone());
+        wait_until(|| gateway.started.load(Ordering::SeqCst));
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            let mut app = app;
+            app.shutdown();
+            returned_tx.send(()).unwrap();
+            app
+        });
+        wait_until(|| gateway.cancelled.load(Ordering::SeqCst));
+        assert!(matches!(
+            returned_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        *gateway.release.lock().unwrap() = true;
+        gateway.changed.notify_all();
+        returned_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown must wait until the attention worker exits");
+        let app = shutdown.join().unwrap();
+        assert!(!app.attention_busy());
+        assert!(app.attention.request.is_none());
+        assert!(app.exit_ready());
+    }
+
+    #[test]
     fn rapid_project_changes_keep_one_worker_and_ignore_stale_requests() {
         let directory = tempfile::tempdir().unwrap();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -433,14 +566,21 @@ mod tests {
         let mut app = new_app(directory.path(), gateway.clone());
         wait_attention(&mut app);
         let project = config(directory.path());
+        let request_id = uuid::Uuid::now_v7();
+        let cancellation = tokio_util::sync::CancellationToken::new();
         app.screen = Screen::DeploymentRunning {
             root: directory.path().to_owned(),
             config: project.clone(),
-            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation: cancellation.clone(),
             cancellation_requested: false,
             logs: VecDeque::new(),
         };
-        app.finish_deployment(Err("execution failed".into()));
+        app.deployment_execution_task = Some(super::super::DeploymentTask {
+            id: request_id,
+            cancellation,
+            worker: Some(std::thread::spawn(|| {})),
+        });
+        app.finish_deployment(request_id, Err("execution failed".into()));
         wait_attention(&mut app);
         assert!(matches!(app.screen, Screen::DeploymentFinished { .. }));
         assert_eq!(

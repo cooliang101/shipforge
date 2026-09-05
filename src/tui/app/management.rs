@@ -17,7 +17,7 @@ mod search;
 mod tests;
 mod viewport;
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, thread::JoinHandle, time::Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -207,6 +207,7 @@ pub(super) struct ManagementTask {
     id: uuid::Uuid,
     origin: ManagementScreen,
     cancellation: CancellationToken,
+    worker: Option<JoinHandle<()>>,
     execution_progress: Option<crate::tui::live_progress::LiveProgress>,
     request: ManagementRequest,
 }
@@ -618,7 +619,7 @@ impl App {
                 let _ = sender.send(BackgroundEvent::Management(id, result));
             });
         match spawn {
-            Ok(_) => {
+            Ok(worker) => {
                 if let Some(progress) = &execution_progress {
                     self.live_environment = origin.scope.environment_id().map(|environment| {
                         (origin.scope.config.project_id.clone(), environment.clone())
@@ -642,6 +643,7 @@ impl App {
                     id,
                     origin,
                     cancellation,
+                    worker: Some(worker),
                     execution_progress,
                     request,
                 });
@@ -672,7 +674,7 @@ impl App {
     pub(super) fn finish_management(
         &mut self,
         id: uuid::Uuid,
-        result: Result<ManagementPage, String>,
+        mut result: Result<ManagementPage, String>,
     ) {
         if self
             .management_task
@@ -681,22 +683,34 @@ impl App {
         {
             return;
         }
-        let Some(task) = self.management_task.take() else {
+        let Some(mut task) = self.management_task.take() else {
             return;
         };
+        let worker_failed = task
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
         if let Some(progress) = &task.execution_progress {
             progress.finish();
         }
         self.poll_live_logs();
         let mut screen = task.origin;
         let cancelled = task.cancellation.is_cancelled();
-        if cancelled && task.request.discards_cancelled_result() {
-            screen.notice = Some(
+        let discards_cancelled_result = task.request.discards_cancelled_result();
+        if cancelled && discards_cancelled_result {
+            screen.notice = Some(if worker_failed {
+                "Request cancelled and the worker stopped unexpectedly during cleanup. The previous page is retained; no new query result or rollback preview was accepted."
+            } else {
                 "Request cancelled. The previous page is retained; no new query result or rollback preview was accepted. Refresh or check again explicitly."
-                    .into(),
-            );
+            }.into());
             self.screen = Screen::Management(screen);
             return;
+        }
+        if worker_failed && discards_cancelled_result {
+            result = Err(
+                "Management worker stopped unexpectedly. The previous evidence remains unchanged; retry the read or preview."
+                    .into(),
+            );
         }
         if matches!(task.request, ManagementRequest::Execute(_)) {
             screen.consume_rollback_navigation();
@@ -726,6 +740,14 @@ impl App {
             screen.notice = Some(
                 "Cancellation was requested. Available observations and execution outcomes are retained below; cancellation does not prove that nothing happened."
                     .into(),
+            );
+        }
+        if worker_failed && !discards_cancelled_result {
+            let warning = "The worker stopped unexpectedly after reporting this inspection or execution result. Known evidence is retained; inspect durable history before retrying.";
+            screen.notice = Some(
+                screen
+                    .notice
+                    .map_or_else(|| warning.into(), |notice| format!("{notice} {warning}")),
             );
         }
         self.screen = Screen::Management(screen);
