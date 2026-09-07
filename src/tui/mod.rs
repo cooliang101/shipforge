@@ -1154,13 +1154,12 @@ fn render_deployment_review(
 
 fn service_preview(service: &crate::config::ServiceConfig, root: &str) -> String {
     let root = safe_text(root);
-    let mut content =
-        format!("  Service directory: {root}/releases/<selected or restored version>\n");
+    let mut content = format!("  Service directory: {root}\n");
     for (stage, commands) in [
         ("First start", &service.start),
         ("Update", service.update_commands()),
         ("Restore", service.restore_commands()),
-        ("Stop when undeployed", &service.stop),
+        ("Stop before publishing / on empty rollback", &service.stop),
     ] {
         for argv in commands {
             let _ = writeln!(content, "  {stage}: {argv:?}");
@@ -1170,7 +1169,7 @@ fn service_preview(service: &crate::config::ServiceConfig, root: &str) -> String
         Some(crate::config::ServiceCheck::Command { argv }) => {
             let _ = writeln!(
                 content,
-                "  Read-only check in {root}/current: {argv:?}; exit 0 required, at most 5 attempts"
+                "  Read-only check in {root}: {argv:?}; exit 0 required, at most 5 attempts"
             );
         }
         Some(crate::config::ServiceCheck::Systemd { unit }) => {
@@ -1191,7 +1190,12 @@ mod service_preview_tests {
         let service = crate::config::ServiceConfig::systemd("api.service");
         let preview = super::service_preview(&service, "/srv/a\u{202e}\u{1b}[2J");
         assert!(!preview.contains('\u{202e}') && !preview.contains('\u{1b}'));
-        for stage in ["First start", "Update", "Restore", "Stop when undeployed"] {
+        for stage in [
+            "First start",
+            "Update",
+            "Restore",
+            "Stop before publishing / on empty rollback",
+        ] {
             assert!(preview.contains(stage));
         }
         assert_eq!(preview.matches("\"restart\"").count(), 3);

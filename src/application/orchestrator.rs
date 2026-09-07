@@ -772,6 +772,20 @@ impl<'a> DeploymentOrchestrator<'a> {
         activated: &[ActivatedComponent],
         events: &dyn EventSink,
     ) -> Result<DeploymentReport, OrchestrationError> {
+        for component in components.values() {
+            let mut context = component.planned.context.clone();
+            context.cancellation = CancellationToken::new();
+            if let Err(error) = component
+                .planned
+                .driver
+                .discard_prepared(&deployment.id, &context)
+                .await
+            {
+                self.driver_warnings.borrow_mut().push(format!(
+                    "Unactivated upload could not be discarded: {error}"
+                ));
+            }
+        }
         let mut component_results = BTreeMap::new();
         let compensation_failures = self
             .compensate(

@@ -132,7 +132,7 @@ fn clock_error() -> &'static str {
 
 pub(super) fn driver_error(error: &DriverError) -> String {
     if error.recovery_blocked {
-        return "Remote service outcome is unknown. Automatic recovery of this Component was blocked. Inspect the remote process and service before retrying; the current link is not proof of service completion.".into();
+        return "Remote service outcome is unknown. Automatic recovery of this Component was blocked. Inspect the remote process and service before retrying; updated application files are not proof of service completion.".into();
     }
     // These public string fields are not guaranteed to be redacted. Only known
     // metadata enter the control diagnostic. A syntactically valid target is

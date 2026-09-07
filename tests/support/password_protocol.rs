@@ -18,7 +18,7 @@ fn destination(port: u16, pin: &str, user: &str) -> LinuxSshDestination {
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn password_authentication_preserves_host_pin_cancellation_and_release_protocol() {
+async fn password_authentication_preserves_host_pin_cancellation_and_transfer() {
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let pin = key
         .public_key()
@@ -35,7 +35,6 @@ async fn password_authentication_preserves_host_pin_cancellation_and_release_pro
     let port = listener.local_addr().unwrap().port();
     let mut peer = ProtocolServer::default();
     let transfer = Arc::clone(&peer.transfer);
-    transfer.lock().await.health_status = 204;
     let commands = Arc::clone(&peer.commands);
     let running = peer.run_on_socket(config, &listener);
     let shutdown = running.handle();
@@ -95,16 +94,6 @@ async fn password_authentication_preserves_host_pin_cancellation_and_release_pro
         validate_sudo(&session, &cancellation, &transfer).await;
         transfer.lock().await.fail_writes_remaining = 1;
         validate_transfer(&session, directory.path(), &cancellation, &transfer).await;
-        let deployment = DeploymentId::new();
-        let activation = validate_release_prepare(
-            &session,
-            directory.path(),
-            &cancellation,
-            &transfer,
-            &deployment,
-        )
-        .await;
-        assert_eq!(activation.release().component.as_str(), "api");
         assert!(
             !commands
                 .lock()

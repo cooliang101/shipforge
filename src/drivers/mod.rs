@@ -518,6 +518,14 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         package: &ReleasePackage,
         events: &dyn EventSink,
     ) -> Result<PreparedRelease, DriverError>;
+    /// Discard only this operation's unactivated upload. Applied or unknown effects remain untouched.
+    async fn discard_prepared(
+        &self,
+        _deployment: &crate::domain::DeploymentId,
+        _context: &ComponentExecutionContext,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
     async fn activate(
         &self,
         deployment: &crate::domain::DeploymentId,

@@ -83,7 +83,7 @@ fn options() -> HealthCheckOptions {
 }
 
 #[tokio::test]
-async fn custom_check_retries_in_current_directory_without_systemd() {
+async fn custom_check_retries_in_application_directory_without_systemd() {
     let mut target = target(None, None);
     let mut service = crate::config::ServiceConfig::systemd("api.service");
     service.check = Some(crate::config::ServiceCheck::Command {
@@ -98,7 +98,7 @@ async fn custom_check_retries_in_current_directory_without_systemd() {
     assert!(report.systemd.is_none() && report.http.is_none());
     assert_eq!(
         remote.commands(),
-        vec!["cd -- '/srv/app/current' && exec 'node' 'check.cjs'"; 2]
+        vec!["cd -- '/srv/app' && exec 'node' 'check.cjs'"; 2]
     );
     let remote = FakeRemote::new([Err(SshConnectionError::Cancelled)]);
     assert!(matches!(

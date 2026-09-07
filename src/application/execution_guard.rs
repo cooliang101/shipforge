@@ -224,6 +224,13 @@ impl DeploymentDriver for GuardedDriver {
             .await
     }
 
+    async fn discard_prepared(
+        &self,
+        deployment: &DeploymentId,
+        context: &ComponentExecutionContext,
+    ) -> Result<(), DriverError> {
+        self.inner.discard_prepared(deployment, context).await
+    }
     async fn activate(
         &self,
         deployment: &DeploymentId,

@@ -130,7 +130,7 @@ impl server::Handler for DirectoryServer {
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8(data.to_vec()).expect("structured UTF-8 SSH command");
         self.evidence.commands.lock().unwrap().push(command.clone());
-        let arguments = super::structured_arguments(&command).unwrap_or_default();
+        let arguments = structured_arguments(&command).unwrap_or_default();
         let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         session.channel_success(channel)?;
         match words.as_slice() {
@@ -315,7 +315,7 @@ fn assert_read_only_commands(evidence: &Evidence, count: usize) {
     let commands = evidence.commands.lock().unwrap();
     assert_eq!(commands.len(), count);
     for (command, expected) in commands.iter().zip(expected.iter()) {
-        assert_eq!(super::structured_arguments(command).unwrap(), *expected);
+        assert_eq!(structured_arguments(command).unwrap(), *expected);
     }
     assert_eq!(evidence.unexpected_requests.load(Ordering::SeqCst), 0);
     assert_eq!(evidence.connections.load(Ordering::SeqCst), 1);
@@ -535,4 +535,31 @@ async fn directory_service_times_out_an_in_flight_exec_and_closes_the_ssh_connec
         assert_read_only_commands(&fixture.evidence, 3);
     })
     .await;
+}
+
+fn structured_arguments(mut command: &str) -> Option<Vec<String>> {
+    let mut arguments = Vec::new();
+    while !command.is_empty() {
+        command = command.strip_prefix('\'')?;
+        let mut argument = String::new();
+        loop {
+            let end = command.find('\'')?;
+            argument.push_str(&command[..end]);
+            command = &command[end + 1..];
+            if let Some(rest) = command.strip_prefix("\\''") {
+                argument.push('\'');
+                command = rest;
+            } else {
+                break;
+            }
+        }
+        arguments.push(argument);
+        if !command.is_empty() {
+            command = command.strip_prefix(' ')?;
+            if command.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(arguments)
 }

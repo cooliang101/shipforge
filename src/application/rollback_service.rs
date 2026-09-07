@@ -886,8 +886,7 @@ async fn remote_evidence(
             component_error(name, "original package evidence is missing or conflicting")
         })?;
         if !inventory.releases.releases.iter().any(|entry| {
-            entry.extracted
-                && entry.manifest == package.manifest
+            entry.manifest == package.manifest
                 && entry.sha256 == package.sha256
                 && entry.size == package.size
         }) {

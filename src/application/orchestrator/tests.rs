@@ -46,6 +46,7 @@ impl ValidatedDestinationSettings for Settings {
 #[allow(clippy::struct_excessive_bools)] // Independently injected faults.
 struct FakeState {
     actions: Vec<String>,
+    discarded: Vec<(ComponentName, bool)>,
     audit_warning: Option<String>,
     fail_prepare: Option<ComponentName>,
     fail_activate: Option<ComponentName>,
@@ -213,6 +214,17 @@ impl DeploymentDriver for FakeDriver {
             release: self.release(context, version),
             already_active: false,
         })
+    }
+    async fn discard_prepared(
+        &self,
+        _: &crate::domain::DeploymentId,
+        context: &ComponentExecutionContext,
+    ) -> Result<(), DriverError> {
+        self.state.lock().unwrap().discarded.push((
+            context.component.clone(),
+            context.cancellation.is_cancelled(),
+        ));
+        Ok(())
     }
     async fn activate(
         &self,
@@ -1283,4 +1295,23 @@ async fn recovery_observation_is_bounded_even_if_a_driver_does_not_return() {
         records.0.lock().unwrap()[0].kind,
         crate::telemetry::log_record::LogEventKind::CommandUnavailable { .. }
     ));
+}
+
+#[tokio::test]
+async fn failed_or_cancelled_preparation_discards_unactivated_uploads_with_fresh_tokens() {
+    for cancelled in [false, true] {
+        let fixture = Fixture::new();
+        if cancelled {
+            fixture.state.lock().unwrap().cancel_during_prepare = true;
+        } else {
+            fixture.state.lock().unwrap().fail_prepare =
+                Some(ComponentName::parse("frontend").unwrap());
+        }
+        let report = fixture.deploy(&["backend", "frontend", "worker"]).await;
+        assert_ne!(report.deployment.state, DeploymentState::Succeeded);
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.discarded.len(), 3);
+        assert!(state.discarded.iter().all(|(_, cancelled)| !cancelled));
+        assert!(!state.actions.iter().any(|a| a.starts_with("activate:")));
+    }
 }

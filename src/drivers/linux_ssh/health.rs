@@ -5,14 +5,11 @@ use thiserror::Error;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    domain::DeploymentId,
-    telemetry::{CommandArgument, CommandSpec},
-};
+use crate::telemetry::{CommandArgument, CommandSpec};
 
 use super::{
-    ActivateReleaseError, ActivatedRemoteRelease, ActivationOptions, AuthenticatedSession,
-    LinuxSshTarget, RemoteCommandOutput, SshConnectionError, transfer::sanitize_remote_error,
+    AuthenticatedSession, LinuxSshTarget, RemoteCommandOutput, SshConnectionError,
+    transfer::sanitize_remote_error,
 };
 
 const MAX_ATTEMPTS: u32 = 100;
@@ -76,42 +73,6 @@ impl AuthenticatedSession {
     ) -> Result<HealthCheckReport, HealthCheckError> {
         check_with_remote(self, target, options, cancellation).await
     }
-
-    /// Verifies health and compensates the activation on any failed check.
-    ///
-    /// Compensation uses the activation layer's independent bounded token, so
-    /// cancelling a health wait cannot interrupt restoration.
-    ///
-    /// # Errors
-    ///
-    /// Returns the health failure after successful compensation, or both the
-    /// health and compensation failures with manual recovery context.
-    pub async fn verify_activation_health(
-        &self,
-        target: &LinuxSshTarget,
-        activation: &ActivatedRemoteRelease,
-        deployment: &DeploymentId,
-        health_options: HealthCheckOptions,
-        activation_options: ActivationOptions,
-        cancellation: &CancellationToken,
-    ) -> Result<HealthCheckReport, HealthVerificationError> {
-        match self
-            .check_health(target, health_options, cancellation)
-            .await
-        {
-            Ok(report) => Ok(report),
-            Err(health) => match self
-                .compensate_activation(target, activation, deployment, activation_options)
-                .await
-            {
-                Ok(()) => Err(HealthVerificationError::FailedAndCompensated { health }),
-                Err(compensation) => Err(HealthVerificationError::CompensationFailed {
-                    health,
-                    compensation,
-                }),
-            },
-        }
-    }
 }
 
 #[async_trait]
@@ -164,10 +125,9 @@ async fn check_with_remote<R: HealthRemote>(
         .and_then(|service| service.check.as_ref())
     {
         Some(crate::config::ServiceCheck::Command { argv }) => {
-            let command = super::service_command(argv, &format!("{}/current", target.root))
-                .map_err(|_| {
-                    HealthCheckError::InvalidCommand("Invalid service check context".into())
-                })?;
+            let command = super::service_command(argv, &target.root).map_err(|_| {
+                HealthCheckError::InvalidCommand("Invalid service check context".into())
+            })?;
             let mut passed = None;
             for attempt in 1..=options.attempts {
                 let result = execute(
@@ -517,17 +477,6 @@ pub enum HealthCheckError {
     },
     #[error("Destination-side HTTP health check failed after {attempts} attempts: {last_error}")]
     HttpUnhealthy { attempts: u32, last_error: String },
-}
-
-#[derive(Debug, Error)]
-pub enum HealthVerificationError {
-    #[error("health check failed and activation was compensated: {health}")]
-    FailedAndCompensated { health: HealthCheckError },
-    #[error("health check failed ({health}); activation compensation failed ({compensation})")]
-    CompensationFailed {
-        health: HealthCheckError,
-        compensation: ActivateReleaseError,
-    },
 }
 
 #[cfg(test)]
