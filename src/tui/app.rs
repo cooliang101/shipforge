@@ -1,3 +1,4 @@
+mod language;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -486,6 +487,8 @@ pub(super) struct App {
     remote_target_task: Option<remote_target::RemoteTargetTask>,
     navigation: navigation::ProjectNavigation,
     pub picker: Option<crate::tui::picker::Picker>,
+    pub language: crate::tui::i18n::Language,
+    pub language_menu: Option<crate::tui::i18n::Language>,
     pub help_open: bool,
     pub help_scroll: u16,
     pub live_progress: Option<crate::tui::live_progress::LiveProgress>,
@@ -562,7 +565,10 @@ impl App {
             destinations: destination_registry_path.clone(),
             session: Arc::clone(&deployment_session),
         });
+        let language = crate::tui::i18n::Language::load(&registry_path.with_file_name("ui.json"));
         let mut app = Self {
+            language: language.unwrap_or_default(),
+            language_menu: None,
             screen: Screen::Projects,
             recent,
             recent_unavailable,
@@ -602,6 +608,12 @@ impl App {
             pending_clipboard: None,
             exit_state: ExitState::Running,
         };
+        if language.is_err() {
+            app.message = Some(
+                "Language preferences could not be read; using English. F6 opens language settings."
+                    .into(),
+            );
+        }
         app.refresh_attention(None);
         Ok(app)
     }
@@ -1016,6 +1028,9 @@ impl App {
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if self.handle_language_key(key) {
+            return true;
+        }
         if key.code == KeyCode::F(1) && key.modifiers.is_empty() {
             self.help_open = !self.help_open;
             self.help_scroll = 0;

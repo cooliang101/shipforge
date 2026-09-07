@@ -348,9 +348,11 @@ fn duration_label(start: Option<u64>, end: Option<u64>) -> String {
 fn panel(title: &'static str, text: String) -> Paragraph<'static> {
     // These bodies have already passed the log/export field sanitizer. The
     // single-line label helper would erase LF and truncate inspectable evidence.
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(title))
+    Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(crate::tui::i18n::tr(title)),
+    )
 }
 
 fn render_choices(
@@ -381,7 +383,11 @@ fn render_choices(
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(crate::tui::i18n::tr(title)),
+        ),
         area,
     );
 }

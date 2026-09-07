@@ -179,7 +179,7 @@ impl ManagementScreen {
         );
         let heading = format!(
             " {} · {} / {} ",
-            document.title,
+            crate::tui::i18n::tr(document.title),
             safe_text(&self.scope.config.project),
             safe_text(&environment),
         );
@@ -370,8 +370,9 @@ impl ManagementScreen {
         match &self.page {
             ManagementPage::Home if self.scope.historical_environment.is_some() => (
                 "Historical Environment · read-only",
-                format!(
+                crate::tui::i18n::format!(
                     "Project directory: {}\nEnvironment: {}\n\n[h] Local deployment history and logs\n[p] Saved inspection reports\n\nRead-only local evidence; no remote connections or rollback.\nEnvironment identity, not its name, determines this scope.\nOld configuration is not reconstructed. Esc returns to the previous page.",
+                    "项目目录：{}\n环境：{}\n\n[h] 本地发布历史与日志\n[p] 已保存的检查报告\n\n此页只读取本地记录，不连接远端或执行回退。\n查看范围由环境标识确定，旧配置不会被重建。Esc 返回。",
                     safe_text(&crate::tui::presentation::path_label(&self.scope.root)),
                     self.scope
                         .historical_environment
@@ -382,8 +383,9 @@ impl ManagementScreen {
             ),
             ManagementPage::Home => (
                 "Manage",
-                format!(
+                crate::tui::i18n::format!(
                     "Project directory: {}\n\n[h] Local deployment history and logs\n[i] Inspect selected Components / remote Releases\n[p] Saved inspection reports\n[a] Historical Environment IDs (including removed Environments)\n\nOpening history never connects to a server.\nInspection is read-only on the server; it saves a separate local report.\nInventory is not an environment preflight or a health check.\nIt does not prove service health or historical success.",
+                    "项目目录：{}\n\n[h] 本地发布历史与日志\n[i] 检查所选组件 / 远端发布包\n[p] 已保存的检查报告\n[a] 历史环境（包括已移除环境）\n\n打开历史不会连接服务器。\n检查操作只读取服务器，并在本地保存独立报告。\n文件清单不等于环境预检或健康检查，不能据此判定服务健康或历史发布成功。",
                     safe_text(&crate::tui::presentation::path_label(&self.scope.root))
                 ),
                 None,

@@ -1,8 +1,10 @@
 mod app;
 mod clipboard;
 mod deployment_error;
+mod i18n;
 mod live_progress;
 mod log_view;
+mod overview;
 mod picker;
 mod presentation;
 
@@ -642,12 +644,16 @@ fn clipboard_transport() -> clipboard::ClipboardTransport {
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
+    i18n::with_language(app.language, || render_localized(frame, app));
+}
+
+fn render_localized(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(if frame.area().height >= 18 { 2 } else { 1 }),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(if frame.area().height >= 18 { 3 } else { 2 }),
         ])
         .split(frame.area());
     let context = app.context_label();
@@ -661,12 +667,16 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             });
     frame.render_widget(Paragraph::new(context).style(context_style), areas[0]);
     render_screen(frame, areas[1], app);
-    let help = page_help(app);
+    let help = i18n::tr(page_help(app));
     let mut footer = vec![Line::from(help)];
-    if let Some(message) = &app.message {
+    if let Some(message) = app.message.as_deref().or_else(|| {
+        matches!(app.screen, Screen::Overview { .. })
+            .then(|| app.attention_notice())
+            .flatten()
+    }) {
         footer.push(Line::from(vec![
             Span::styled(
-                "Message: ",
+                i18n::tr("Message: "),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -674,12 +684,25 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             Span::raw(safe_text(message)),
         ]));
     }
-    frame.render_widget(Paragraph::new(footer), areas[2]);
+    let footer = Paragraph::new(footer);
+    let footer = if frame.area().height >= 18 {
+        footer.block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+    } else {
+        footer
+    };
+    frame.render_widget(footer, areas[2]);
     if areas[0].width >= 48 {
-        let hints = ratatui::layout::Rect::new(areas[0].right() - 16, areas[0].y, 16, 1);
+        let hints = ratatui::layout::Rect::new(areas[0].right() - 34, areas[0].y, 34, 1);
         frame.render_widget(
-            Paragraph::new(" F1 help F4 find ")
-                .style(Style::default().add_modifier(Modifier::REVERSED)),
+            Paragraph::new(i18n::choose(
+                " F1 Help  F4 Find  F6 Language ",
+                " F1 帮助  F4 搜索  F6 语言 ",
+            ))
+            .style(Style::default().add_modifier(Modifier::REVERSED)),
             hints,
         );
     }
@@ -702,8 +725,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 .message
                 .as_deref()
                 .map_or_else(|| "No current message.".into(), safe_text);
-            let instructions = format!(
-                "Current page: {}\n\nPage keys: {help}\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nDeployment/rollback: only unmodified c confirms. SSH fingerprint: only unmodified y trusts.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
+            let instructions = crate::tui::i18n::format!(
+                "Current page: {}\n\nPage keys: {help}\n\nF6 selects and saves the interface language.\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nDeployment/rollback: only unmodified c confirms. SSH fingerprint: only unmodified y trusts.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
+                "当前页面：{}\n\n页面快捷键：{help}\n\nF6 选择语言并保存，F4 搜索候选；Enter 仅定位，不执行操作。\n\nF1 / Esc 关闭帮助，↑/↓ 或 PgUp/PgDn 滚动。Ctrl+C 安全取消活动任务。\n\n发布/回退仅普通 c 确认；SSH 指纹仅普通 y 信任。\n\n> 和反色表示焦点，[x]/[ ] 表示勾选；警告和生产环境有文字标识。\n\n提示：{message}",
                 app.context_label()
             );
             frame.render_widget(
@@ -712,6 +736,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 areas[1],
             );
         }
+    }
+    if app.language_menu.is_some() {
+        overview::render_language(frame, app);
     }
     render_exit_overlay(frame, app.exit_state());
 }
@@ -739,10 +766,10 @@ fn render_exit_overlay(frame: &mut Frame<'_>, state: ExitState) {
     );
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(
-        Paragraph::new(message)
+        Paragraph::new(crate::tui::i18n::tr(message))
             .block(
                 Block::default()
-                    .title(title)
+                    .title(crate::tui::i18n::tr(title))
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Yellow)),
             )
@@ -852,23 +879,7 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
         Screen::Reinitialize(screen) => screen.render(frame, area),
         Screen::Projects => render_projects(frame, area, app),
         Screen::Browser(browser) => render_project_browser(frame, area, browser),
-        Screen::Overview { root, config } => {
-            let mut content = format!(
-                "Project: {}\nRoot: {}\nComponents: {}\nEnvironments: {}\n\n{}",
-                safe_text(&config.project),
-                safe_text(&crate::tui::presentation::path_label(root)),
-                config.components.len(),
-                config.environments.len(),
-                app.overview_targets(config)
-            );
-            if let Some(notice) = app.attention_notice() {
-                let _ = write!(content, "\n\n{notice}");
-            }
-            frame.render_widget(
-                panel(" Project overview ", content).scroll((app.overview_scroll(), 0)),
-                area,
-            );
-        }
+        Screen::Overview { root, config } => overview::render(frame, area, app, root, config),
         Screen::DeploySelection(selection) => render_deploy_selection(frame, area, selection, app),
         Screen::DeploymentPlanning { selection, .. } => {
             render_deployment_planning(frame, area, selection);
@@ -918,7 +929,7 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
                 Paragraph::new(prepared.preview().to_owned())
                     .block(
                         Block::default()
-                            .title(" First-time setup · Review shipforge.yaml ")
+                            .title(i18n::tr(" First-time setup · Review shipforge.yaml "))
                             .borders(Borders::ALL),
                     )
                     .scroll((*scroll, 0))
@@ -934,8 +945,9 @@ fn render_project_browser(
     area: ratatui::layout::Rect,
     browser: &app::DirectoryBrowser,
 ) {
-    let mut lines = vec![Line::from(format!(
+    let mut lines = vec![Line::from(crate::tui::i18n::format!(
         "Current: {}",
+        "当前位置：{}",
         crate::tui::presentation::path_label(&browser.directory)
     ))];
     if browser.children.is_empty() {
@@ -976,8 +988,16 @@ fn render_deploy_selection(
         .get(selection.environment_cursor)
         .map_or("none", String::as_str);
     let mut lines = vec![
-        Line::from(format!("Project: {}", safe_text(&selection.config.project))),
-        Line::from(format!("Environment: {}", environment_label(environment))),
+        Line::from(crate::tui::i18n::format!(
+            "Project: {}",
+            "项目：{}",
+            safe_text(&selection.config.project)
+        )),
+        Line::from(crate::tui::i18n::format!(
+            "Environment: {}",
+            "环境：{}",
+            environment_label(environment)
+        )),
         Line::from(""),
     ];
     for (index, component) in components.iter().enumerate() {
@@ -1000,7 +1020,11 @@ fn render_deploy_selection(
                 "    {}",
                 app.destination_label(&target.destination)
             )));
-            lines.push(Line::from(format!("    Root: {}", safe_text(&target.root))));
+            lines.push(Line::from(crate::tui::i18n::format!(
+                "    Root: {}",
+                "    目录：{}",
+                safe_text(&target.root)
+            )));
         } else {
             lines.push(Line::from("    Target unavailable; edit configuration"));
             lines.push(Line::from(""));
@@ -1037,8 +1061,8 @@ fn render_deployment_planning(
     frame.render_widget(
         panel(
             " New Deployment · Environment check ",
-            format!(
-                "Checking Git state and {} selected Component target(s)…\n\nNo build, upload, or remote mutation occurs in this step.",
+            crate::tui::i18n::format!(
+                "Checking Git state and {} selected Component target(s)…\n\nNo build, upload, or remote mutation occurs in this step.","正在检查 Git 状态和 {} 个已选组件目标…\n\n此步骤不会构建、上传或修改远端。",
                 selection.selected.len()
             ),
         ),
@@ -1046,12 +1070,7 @@ fn render_deployment_planning(
     );
 }
 
-fn render_deployment_review(
-    frame: &mut Frame<'_>,
-    area: ratatui::layout::Rect,
-    plan: &crate::application::DeploymentPlan,
-    scroll: u16,
-) {
+fn deployment_review_header(plan: &crate::application::DeploymentPlan) -> String {
     let git = match &plan.git {
         crate::application::GitWorktreeState::Clean => "clean",
         crate::application::GitWorktreeState::Dirty { .. } => {
@@ -1059,14 +1078,17 @@ fn render_deployment_review(
         }
         crate::application::GitWorktreeState::NotRepository => "not a Git repository",
     };
-    let mut content = format!(
+    let git = i18n::tr(git);
+    let mut content = crate::tui::i18n::format!(
         "CONFIRM DEPLOYMENT — changes selected servers.\nProject: {}\nEnvironment: {}\nGit: {git}\n\n",
+        "确认发布 — 将修改所选服务器。\n项目：{}\n环境：{}\nGit：{git}\n\n",
         safe_text(&plan.selection.config.project),
         environment_label(&plan.selection.environment)
     );
-    let _ = writeln!(
+    let _ = crate::tui::i18n::writeln!(
         content,
         "Branch: {}\nCommit: {}",
+        "分支：{}\n提交：{}",
         plan.git_metadata
             .branch
             .as_deref()
@@ -1079,25 +1101,40 @@ fn render_deployment_review(
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" → ");
-    let _ = writeln!(content, "Activation order: {order}");
-    content.push_str(
+    let _ = crate::tui::i18n::writeln!(content, "Activation order: {order}", "发布顺序：{order}");
+    content.push_str(i18n::tr(
         "Build order: Component name order. Only selected Components will be deployed.\n\n",
-    );
+    ));
+    content
+}
+
+fn render_deployment_review(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    plan: &crate::application::DeploymentPlan,
+    scroll: u16,
+) {
+    let mut content = deployment_review_header(plan);
     for entry in &plan.entries {
         let current = entry
             .current
             .as_ref()
             .map_or("not_deployed".into(), ToString::to_string);
-        let _ = write!(
+        let _ = crate::tui::i18n::write!(
             content,
             "{}: {current} → {}\n  Destination: {}\n  Root: {}\n",
+            "{}：{current} → {}\n  目标：{}\n  目录：{}\n",
             entry.component,
             entry.release,
             safe_text(&entry.destination),
             safe_text(&entry.root)
         );
         for notice in &entry.notices {
-            let _ = writeln!(content, "  Environment check: {notice}");
+            let _ = crate::tui::i18n::writeln!(
+                content,
+                "  Environment check: {notice}",
+                "  环境检查：{notice}"
+            );
         }
         if let Some(build) = plan.selection.config.components.get(&entry.component) {
             content.push_str(&build_preview(build));
@@ -1112,10 +1149,12 @@ fn render_deployment_review(
             let label = target
                 .service
                 .as_ref()
-                .map_or("none; files only", |service| {
-                    service.preset_unit().unwrap_or("custom commands")
+                .map_or(i18n::tr("none; files only"), |service| {
+                    service
+                        .preset_unit()
+                        .unwrap_or_else(|| i18n::tr("custom commands"))
                 });
-            let _ = writeln!(content, "  Service: {label}");
+            let _ = crate::tui::i18n::writeln!(content, "  Service: {label}", "  服务：{label}");
             if let Some(service) = &target.service {
                 content.push_str(&service_preview(service, &target.root));
             }
@@ -1131,19 +1170,26 @@ fn render_deployment_review(
                 (false, true) => "remote HTTP/HTTPS",
                 (false, false) => "none configured; application health will not be verified",
             };
-            let _ = writeln!(content, "  Health: {health}\n");
+            let health = i18n::tr(health);
+            let _ = crate::tui::i18n::writeln!(
+                content,
+                "  Health: {health}\n",
+                "  健康检查：{health}\n"
+            );
         }
     }
-    content.push_str("\nConfirm to build, package, upload, activate, and check health.");
+    content.push_str(crate::tui::i18n::tr(
+        "\nConfirm to build, package, upload, activate, and check health.",
+    ));
     frame.render_widget(
         Paragraph::new(content)
             .block(
                 Block::default()
-                    .title(if is_production(&plan.selection.environment) {
+                    .title(i18n::tr(if is_production(&plan.selection.environment) {
                         " [PRODUCTION] Confirm deployment "
                     } else {
                         " Confirm deployment "
-                    })
+                    }))
                     .borders(Borders::ALL),
             )
             .scroll((scroll, 0))
@@ -1154,7 +1200,8 @@ fn render_deployment_review(
 
 fn service_preview(service: &crate::config::ServiceConfig, root: &str) -> String {
     let root = safe_text(root);
-    let mut content = format!("  Service directory: {root}\n");
+    let mut content =
+        crate::tui::i18n::format!("  Service directory: {root}\n", "  服务工作目录：{root}\n");
     for (stage, commands) in [
         ("First start", &service.start),
         ("Update", service.update_commands()),
@@ -1167,15 +1214,17 @@ fn service_preview(service: &crate::config::ServiceConfig, root: &str) -> String
     }
     match &service.check {
         Some(crate::config::ServiceCheck::Command { argv }) => {
-            let _ = writeln!(
+            let _ = crate::tui::i18n::writeln!(
                 content,
-                "  Read-only check in {root}: {argv:?}; exit 0 required, at most 5 attempts"
+                "  Read-only check in {root}: {argv:?}; exit 0 required, at most 5 attempts",
+                "  只读检查目录 {root}：{argv:?}；退出码须为 0，最多 5 次"
             );
         }
         Some(crate::config::ServiceCheck::Systemd { unit }) => {
-            let _ = writeln!(
+            let _ = crate::tui::i18n::writeln!(
                 content,
-                "  Systemd check: {unit}; active and stable NRestarts for 10 seconds"
+                "  Systemd check: {unit}; active and stable NRestarts for 10 seconds",
+                "  Systemd 检查：{unit}；active 且重启次数稳定 10 秒"
             );
         }
         None => content.push_str("  No service health check configured\n"),
@@ -1203,19 +1252,27 @@ mod service_preview_tests {
 }
 
 fn build_preview(build: &crate::config::ComponentConfig) -> String {
-    let mut content = format!(
+    let mut content = crate::tui::i18n::format!(
         "  Working directory: {}\n  Artifact (relative to working directory): {}\n",
+        "  构建目录：{}\n  产物（相对构建目录）：{}\n",
         crate::tui::presentation::path_label(&build.working_directory),
         crate::tui::presentation::path_label(&build.artifact.path)
     );
     for command in &build.build {
         if command.shell {
-            let _ = writeln!(content, "  Build [explicit shell]: {:?}", command.program);
+            let _ = crate::tui::i18n::writeln!(
+                content,
+                "  Build [explicit shell]: {:?}",
+                "  构建 [显式 Shell]：{:?}",
+                command.program
+            );
         } else {
-            let _ = writeln!(
+            let _ = crate::tui::i18n::writeln!(
                 content,
                 "  Build [program + arguments]: {:?} {:?}",
-                command.program, command.args
+                "  构建 [程序 + 参数]：{:?} {:?}",
+                command.program,
+                command.args
             );
         }
     }
@@ -1237,8 +1294,9 @@ fn render_deployment_running(
     let progress = progress.map(live_progress::LiveProgress::snapshot);
     if let Some(progress) = progress {
         let areas = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).split(area);
-        let mut text = format!(
+        let mut text = crate::tui::i18n::format!(
             "{status}\nElapsed: {}.{}s · l opens logs/search/export\n",
+            "{status}\n耗时：{}.{} 秒 · l 日志/搜索/导出\n",
             progress.elapsed_ms / 1000,
             (progress.elapsed_ms % 1000) / 100
         );
@@ -1288,7 +1346,8 @@ fn render_deployment_finished(
     logs: &log_view::LogView,
     scroll: u16,
 ) {
-    let mut content = format!("{summary}\nRecent events:\n");
+    let mut content =
+        crate::tui::i18n::format!("{summary}\nRecent events:\n", "{summary}\n最近事件：\n");
     for row in logs.matching() {
         let _ = writeln!(
             content,
@@ -1328,7 +1387,7 @@ fn render_deployment_log(
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(" Recent events ")
+                .title(i18n::tr(" Recent events "))
                 .borders(Borders::ALL),
         ),
         areas[1],
@@ -1343,8 +1402,8 @@ fn render_host_key_pending(
     frame.render_widget(
         panel(
             " New SSH Destination · Host Key ",
-            format!(
-                "Connecting to {}…\n\nOnly the SSH handshake is performed. No authentication or remote command is attempted.",
+            crate::tui::i18n::format!(
+                "Connecting to {}…\n\nOnly the SSH handshake is performed. No authentication or remote command is attempted.","正在连接 {}…\n\n仅执行 SSH 握手，不进行认证或运行远端命令。",
                 setup_endpoint(draft)
             ),
         ),
@@ -1361,8 +1420,8 @@ fn render_host_key_confirmation(
     frame.render_widget(
         panel(
             " New SSH Destination · Confirm Host Key ",
-            format!(
-                "Endpoint: {}\n\nHost Key:\n{}\n\nVerify this fingerprint through a trusted channel before confirming. Only y accepts; Enter does not trust the key.",
+            crate::tui::i18n::format!(
+                "Endpoint: {}\n\nHost Key:\n{}\n\nVerify this fingerprint through a trusted channel before confirming. Only y accepts; Enter does not trust the key.","地址：{}\n\n主机密钥：\n{}\n\n请通过可信渠道核对指纹。仅按 y 表示信任，Enter 不会接受密钥。",
                 setup_endpoint(draft),
                 fingerprint.as_str()
             ),
@@ -1379,8 +1438,8 @@ fn render_authentication_pending(
     frame.render_widget(
         panel(
             " New SSH Destination · Authentication ",
-            format!(
-                "Authenticating {}…\n\nAfter authentication, ShipForge runs read-only probes for the default root and systemd service candidates.",
+            crate::tui::i18n::format!(
+                "Authenticating {}…\n\nAfter authentication, ShipForge runs read-only probes for the default root and systemd service candidates.","正在认证 {}…\n\n认证后仅探测默认目录和 systemd 候选服务。",
                 setup_endpoint(draft)
             ),
         ),
@@ -1393,8 +1452,9 @@ fn render_key_browser(
     area: ratatui::layout::Rect,
     browser: &app::KeyFileBrowser,
 ) {
-    let mut lines = vec![Line::from(format!(
+    let mut lines = vec![Line::from(crate::tui::i18n::format!(
         "Directory: {}",
+        "目录：{}",
         crate::tui::presentation::path_label(&browser.directory)
     ))];
     if browser.entries.is_empty() {
@@ -1462,7 +1522,7 @@ fn render_new_ssh_destination(
             Style::default().fg(Color::Yellow),
         )));
     } else {
-        lines.push(Line::from("Identity:"));
+        lines.push(Line::from(i18n::tr("Identity:")));
         lines.extend(
             draft
                 .credentials
@@ -1476,8 +1536,9 @@ fn render_new_ssh_destination(
         );
     }
     if !draft.connections.is_empty() {
-        lines.push(Line::from(format!(
+        lines.push(Line::from(crate::tui::i18n::format!(
             "SSH config candidate {}/{} (press F2 to cycle)",
+            "SSH 配置候选 {}/{}（F2 切换）",
             draft.connection_cursor + 1,
             draft.connections.len()
         )));
@@ -1499,7 +1560,7 @@ fn render_new_ssh_destination(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" New SSH Destination ")
+                    .title(i18n::tr(" New SSH Destination "))
                     .borders(Borders::ALL),
             )
             .scroll((choice_scroll(focused_row, area.height), 0)),
@@ -1527,7 +1588,7 @@ fn render_password_connection(
             field == app::SshField::Credential,
         ),
         Line::from(""),
-        Line::from("Enter: review host key before connecting"),
+        Line::from(i18n::tr("Enter: review host key before connecting")),
     ];
     let focus = match field {
         app::SshField::Host => 0,
@@ -1539,7 +1600,7 @@ fn render_password_connection(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" SSH connection · Password ")
+                    .title(i18n::tr(" SSH connection · Password "))
                     .borders(Borders::ALL),
             )
             .scroll((choice_scroll(focus, area.height), 0)),
@@ -1548,6 +1609,7 @@ fn render_password_connection(
 }
 
 fn form_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    let label = i18n::tr(label);
     let value = safe_text(value);
     let marker = if selected { ">" } else { " " };
     let style = if selected {
@@ -1586,8 +1648,9 @@ fn render_destination_setup(
         .iter()
         .filter(|candidate| setup.components.selected.contains(&candidate.name))
         .collect::<Vec<_>>();
-    let mut lines = vec![Line::from(format!(
+    let mut lines = vec![Line::from(crate::tui::i18n::format!(
         "Root: {}",
+        "目录：{}",
         crate::tui::presentation::path_label(&setup.components.root)
     ))];
     if let Some(component) = components.get(setup.component_cursor) {
@@ -1601,8 +1664,9 @@ fn render_destination_setup(
                     .find(|destination| destination.key == *key)
             })
             .map_or("not assigned", |destination| destination.endpoint.as_str());
-        lines.push(Line::from(format!(
+        lines.push(Line::from(crate::tui::i18n::format!(
             "Component {}/{}: {}   assigned: {assigned}",
+            "组件 {}/{}：{}   已分配：{assigned}",
             setup.component_cursor + 1,
             components.len(),
             component.name
@@ -1645,8 +1709,9 @@ fn render_component_setup(
     area: ratatui::layout::Rect,
     setup: &app::ComponentSetupState,
 ) {
-    let mut lines = vec![Line::from(format!(
+    let mut lines = vec![Line::from(crate::tui::i18n::format!(
         "Root: {}",
+        "目录：{}",
         crate::tui::presentation::path_label(&setup.root)
     ))];
     if setup.report.components.is_empty() {
@@ -1669,7 +1734,7 @@ fn render_component_setup(
     }
     for notice in &setup.report.notices {
         lines.push(Line::from(Span::styled(
-            format!("Note: {notice}"),
+            crate::tui::i18n::format!("Note: {notice}", "提示：{notice}"),
             Style::default().fg(Color::Yellow),
         )));
     }
@@ -1725,11 +1790,15 @@ fn render_projects(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App
     }
     lines.push(selected_line(
         app.selected_recent == app.recent.len(),
-        "Browse directories…",
+        i18n::tr("Browse directories…"),
     ));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(" Projects ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(i18n::tr(" Projects "))
+                    .borders(Borders::ALL),
+            )
             .scroll((choice_scroll(selected_row, area.height), 0)),
         area,
     );
@@ -1753,7 +1822,11 @@ fn choice_scroll(row: usize, height: u16) -> u16 {
 
 fn panel(title: &'static str, content: String) -> Paragraph<'static> {
     Paragraph::new(content)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(i18n::tr(title))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false })
 }
 

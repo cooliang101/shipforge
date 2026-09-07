@@ -40,7 +40,7 @@ impl App {
         };
     }
 
-    pub(super) fn preferred_environment(&self, config: &ProjectConfig) -> Option<String> {
+    pub(in crate::tui) fn preferred_environment(&self, config: &ProjectConfig) -> Option<String> {
         self.navigation
             .selected
             .as_ref()
@@ -138,8 +138,8 @@ impl App {
             Screen::ProjectEdit(screen) => self.project_edit_context_label(screen),
             Screen::ManualComponent(screen) => screen.context_label(),
             Screen::Reinitialize(screen) => screen.context_label(),
-            Screen::Projects => "Projects".into(),
-            Screen::Browser(_) => "Projects / Choose directory".into(),
+            Screen::Projects => crate::tui::i18n::tr("Projects").into(),
+            Screen::Browser(_) => crate::tui::i18n::tr("Projects / Choose directory").into(),
             Screen::Overview { config, .. } => self.project_context("Overview", config),
             Screen::DeploySelection(selection) | Screen::DeploymentPlanning { selection, .. } => {
                 context_label(
@@ -223,22 +223,27 @@ impl App {
 
     pub(in crate::tui) fn overview_targets(&self, config: &ProjectConfig) -> String {
         let Some(environment) = self.preferred_environment(config) else {
-            return "No Environment is available; edit configuration before deploying.".into();
+            return crate::tui::i18n::tr(
+                "No Environment is available; edit configuration before deploying.",
+            )
+            .into();
         };
         let mut text = format!(
-            "Environment: {}\n",
+            "{}: {}\n",
+            self.language.choose("Environment", "环境"),
             crate::tui::presentation::environment_label(&environment)
         );
         for (name, target) in &config.environments[&environment].components {
             use std::fmt::Write as _;
             let _ = writeln!(
                 text,
-                "{name} → {}\n  Root: {}",
+                "{name} → {}\n  {}: {}\n",
                 self.destination_label(&target.destination),
+                self.language.choose("Root", "目录"),
                 safe_text(&target.root)
             );
         }
-        text.push_str("\n[d] Select Components and preview deployment\n[m] History / read-only inspection / rollback planning\n[e] Edit local configuration (no deployment)\nConnection labels are local hints, not connectivity or health checks.");
+
         text
     }
 }

@@ -116,7 +116,11 @@ impl RemoteSetupSelectionState {
         let first = selected.map_or(0, |row| row.saturating_sub(available.saturating_sub(1)));
         fixed.extend(rows.into_iter().skip(first).take(available));
         frame.render_widget(
-            Paragraph::new(fixed).block(Block::default().title(title).borders(Borders::ALL)),
+            Paragraph::new(fixed).block(
+                Block::default()
+                    .title(crate::tui::i18n::tr(title))
+                    .borders(Borders::ALL),
+            ),
             area,
         );
     }

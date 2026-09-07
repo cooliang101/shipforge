@@ -72,7 +72,7 @@ pub(super) fn context_label(
     environment: Option<&str>,
     component: Option<&str>,
 ) -> String {
-    let page = safe_text(page);
+    let page = safe_text(crate::tui::i18n::tr(page));
     let Some(project) = project else {
         return page;
     };

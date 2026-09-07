@@ -27,9 +27,11 @@ impl super::App {
 impl ConnectionsScreen {
     pub(in crate::tui) fn context_label(&self) -> String {
         let label = match &self.page {
-            ConnectionsPage::Unavailable => "Connections / Unavailable saved connections".into(),
+            ConnectionsPage::Unavailable => {
+                crate::tui::i18n::tr("Connections / Unavailable saved connections").into()
+            }
             ConnectionsPage::List { items, cursor } => items.get(*cursor).map_or_else(
-                || "Connections / Saved connections".into(),
+                || crate::tui::i18n::tr("Connections / Saved connections").into(),
                 |connection| connection_context("Connections", connection),
             ),
             ConnectionsPage::Detail { connection, .. } => {
@@ -128,7 +130,11 @@ impl ConnectionsScreen {
             u16::try_from(cursor.saturating_sub(visible.saturating_sub(1))).unwrap_or(u16::MAX)
         });
         let mut paragraph = Paragraph::new(body)
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(crate::tui::i18n::tr(title))
+                    .borders(Borders::ALL),
+            )
             .scroll((scroll, 0));
         // Cursor offsets are logical rows. Wrapping a long hostname/path would
         // otherwise push the selected entry outside a small terminal's viewport.
@@ -147,9 +153,9 @@ impl ConnectionsScreen {
             ),
             ConnectionsPage::List { items, cursor } => {
                 let mut body =
-                    "Standalone saved connections · no Project is required\n\n".to_owned();
+                    crate::tui::i18n::tr("Standalone saved connections · no Project is required\n\n").to_owned();
                 if items.is_empty() {
-                    body.push_str("No saved connections.\nPress a to add one, f to refresh, or Esc to return.\n");
+                    body.push_str(crate::tui::i18n::tr("No saved connections.\nPress a to add one, f to refresh, or Esc to return.\n"));
                 }
                 for (index, connection) in items.iter().enumerate() {
                     let DestinationSettings::LinuxSsh {
@@ -178,8 +184,8 @@ impl ConnectionsScreen {
             ConnectionsPage::Keys {
                 directory, cursor, ..
             } => {
-                let mut body = format!(
-                    "Directory: {}\nSelect a private key; file contents are never displayed.\n\n",
+                let mut body = crate::tui::i18n::format!(
+                    "Directory: {}\nSelect a private key; file contents are never displayed.\n\n","目录：{}\n选择私钥文件，不会显示文件内容。\n\n",
                     safe_text(&crate::tui::presentation::path_label(&directory.path))
                 );
                 if directory.entries.is_empty() {
@@ -214,7 +220,7 @@ impl ConnectionsScreen {
             ),
             ConnectionsPage::ProjectRemoved(_) => (
                 " Project removed from recents ",
-                "Project files and local history remain unchanged.".into(),
+                crate::tui::i18n::tr("Project files and local history remain unchanged.").into(),
                 None,
             ),
             ConnectionsPage::Loading {
@@ -223,8 +229,8 @@ impl ConnectionsScreen {
                 cancelling,
             } => (
                 " Working ",
-                format!(
-                    "{label}\nElapsed: {}s\n\n{}",
+                crate::tui::i18n::format!(
+                    "{label}\nElapsed: {}s\n\n{}","{label}\n耗时：{} 秒\n\n{}",
                     started.elapsed().as_secs(),
                     if *cancelling {
                         "Cancellation requested. Waiting for the worker result; saved effects will be reported accurately."
@@ -257,8 +263,9 @@ fn form_context(page: &str, form: &ConnectionForm) -> String {
 }
 
 fn form_text(form: &ConnectionForm) -> String {
-    let mut body = format!(
+    let mut body = crate::tui::i18n::format!(
         "{}\n\n{} Host: {}\n{} User: {}\n{} Port: {}\n\n{} SSH identity (↑/↓):\n",
+        "{}\n\n{} 主机：{}\n{} 用户：{}\n{} 端口：{}\n\n{} SSH 身份（↑/↓）：\n",
         if form.existing.is_some() {
             "Edit connection: append a revision after Host Key confirmation"
         } else {
@@ -282,12 +289,18 @@ fn form_text(form: &ConnectionForm) -> String {
         );
     }
     if form.credentials.is_empty() {
-        body.push_str("No identity found. F3: private key; F5: password.\n");
+        body.push_str(crate::tui::i18n::tr(
+            "No identity found. F3: private key; F5: password.\n",
+        ));
     }
     if form.hosts.is_empty() {
-        body.push_str("No suggested hosts. Type a hostname in the Host field.\n");
+        body.push_str(crate::tui::i18n::tr(
+            "No suggested hosts. Type a hostname in the Host field.\n",
+        ));
     } else {
-        body.push_str("Host field: F4 searches suggested hosts; F2 cycles them.\n");
+        body.push_str(crate::tui::i18n::tr(
+            "Host field: F4 searches suggested hosts; F2 cycles them.\n",
+        ));
     }
     body.push_str(
         "F5: enter/change password (hidden); Backspace: erase last; Delete: clear.\nPassword is saved encrypted for this Windows user after authentication.\nEnter captures the host-key fingerprint only. Review it before plain y saves.\n",
@@ -301,8 +314,9 @@ fn form_text(form: &ConnectionForm) -> String {
 fn host_key_text(confirmation: &crate::application::HostKeyConfirmation) -> String {
     let preview = confirmation.preview();
     let draft = preview.draft();
-    let mut body = format!(
+    let mut body = crate::tui::i18n::format!(
         "Proposed connection: {}\nConnection ID: {}\n\nCaptured Host Key:\n{}\n\nVerify this fingerprint through a trusted channel.\nPress y only if you trust it. Authentication happens after confirmation.\nNo connection settings have been saved yet.\n",
+        "待保存连接：{}\n连接 ID：{}\n\n获取的主机密钥：\n{}\n\n请通过可信渠道核对指纹。\n确认可信后按 y，随后才会认证。\n当前尚未保存连接。\n",
         endpoint_label(&draft.user, &draft.host, draft.port),
         preview.key(),
         safe_text(confirmation.fingerprint())
@@ -315,7 +329,9 @@ fn host_key_text(confirmation: &crate::application::HostKeyConfirmation) -> Stri
             safe_text(host_key.as_str())
         );
         if host_key.as_str() != confirmation.fingerprint() {
-            body.push_str("WARNING: host-key fingerprint differs from the saved connection.\n");
+            body.push_str(crate::tui::i18n::tr(
+                "WARNING: host-key fingerprint differs from the saved connection.\n",
+            ));
         }
     }
     body
@@ -365,8 +381,9 @@ fn connection_text(connection: &ConnectionDetails) -> String {
         host_key,
         ..
     } = &connection.current.settings;
-    format!(
+    crate::tui::i18n::format!(
         "Connection ID: {}\nSSH: {}\nRevision: {}\nSaved Host Key: {}\n",
+        "连接 ID：{}\nSSH：{}\n修订：{}\n已保存主机密钥：{}\n",
         connection.key,
         endpoint_label(user, host, *port),
         connection.current.revision.get(),

@@ -153,7 +153,7 @@ fn long_directory_list_keeps_keyboard_focus_visible_and_help_renders_message() {
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
     assert!(text.contains("> directory-119"));
-    assert!(text.contains("F1 help F4 find"));
+    assert!(text.contains("F1 Help  F4 Find  F6 Language"));
     app.message = Some("Preserve the diagnostic while opening help".into());
     press(&mut app, KeyCode::F(1));
     assert!(app.message.as_deref().unwrap().contains("diagnostic"));
