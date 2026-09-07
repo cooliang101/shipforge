@@ -121,7 +121,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 - `QA-01`：使用现有 Rust + MinGW 完成 Windows x64 GNU 本机编译、全量测试、ConPTY smoke、性能和真实 OpenSSH 门禁；不要求 Linux/macOS 客户端或 GitHub CI。复核 TUI-MGT-01 早期未定位 SSH 连接超时，在阶段化诊断证据基础上给出支持条件与发行结论，不把单次复跑通过当作根因修复。
 - `QA-02`：对路径穿越、Shell 注入、Host Key、凭据、日志和归档权限做安全审查。
 - `QA-03`：验证 Driver SPI 契约、Project/Environment ID、Destination ID/revision、Component generation、配置兼容、远端元数据前向兼容和安装升级。
-- `REL-03`：在本机生成 Windows x64 GNU 的 ShipForge 单文件可执行程序与 SHA-256，编写安装、升级、回滚和排障文档；不在 GitHub 构建或自动发布。
+- `REL-03`：使用 `cargo build --release` 在本机固定生成 `target/release/shipforge.exe` 和 SHA-256，编写安装、升级、回滚和排障文档；不添加 `--target` 或另设平台/版本输出树，不在 GitHub 构建或自动发布。
 - `ACC-01`：逐项执行需求文档的 12 条验收标准并保存证据。
 
 ## 质量门禁

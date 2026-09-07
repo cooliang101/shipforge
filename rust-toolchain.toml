@@ -1,0 +1,3 @@
+[toolchain]
+# Reuse the installed Windows GNU toolchain; no per-platform output trees.
+channel = "stable-x86_64-pc-windows-gnu"

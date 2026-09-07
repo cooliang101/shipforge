@@ -24,6 +24,15 @@ During execution or from history details, `l` opens logs: `/` searches retained 
 
 ## Verify changes
 
+Build with `cargo build --release`; the executable is always `target/release/shipforge.exe`. The project selects the installed Windows GNU toolchain through `rust-toolchain.toml` and fixes the cache root in `.cargo/config.toml`. Do not add `--target` or override Cargo output directories: explicit cross-compilation creates another platform subdirectory.
+
+```powershell
+cargo build --release
+& .\target\release\shipforge.exe
+```
+
+Use `cargo clean --profile dev` to reclaim development caches while keeping the release build. A full `cargo clean` removes all project build output, including the executable; rebuild it afterward. Neither command removes downloaded crates or installed toolchains. See [build-layout verification](docs/validation/build-layout.md).
+
 ```sh
 cargo test
 cargo fmt --all -- --check

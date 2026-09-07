@@ -20,6 +20,7 @@ foreach ($name in @(
     'Invoke-SshKeygen',
     'Invoke-CargoCommand',
     'Invoke-FixtureCase',
+    'Assert-ReleaseGateNativeBuild',
     'Invoke-ReleaseGate',
     'Get-SshPublicKeyFingerprint',
     'Invoke-SshAdd',
@@ -131,17 +132,39 @@ Assert-Cleanup $failedCaseRejected 'Nonzero test execution must fail the runner'
 $script:nativeRunExit = 0
 
 $releaseCase = 'qa01_release_gate_validates_host_key_rotation_agent_sftp_and_cancellation'
+$script:nativeStdout = 'host: x86_64-pc-windows-gnu'
 $script:caseListing = @("${releaseCase}: test", '1 test, 0 benchmarks')
 $script:nativeCalls.Clear()
 Invoke-ReleaseGate
-Assert-Cleanup ($script:nativeCalls.Count -eq 2) 'Release gate must be discovered and executed exactly once'
-Assert-Cleanup (($script:nativeCalls[0].Arguments -join ' ') -eq "test --locked --release --target x86_64-pc-windows-gnu --test linux_ssh_release_gate $releaseCase -- --ignored --exact --list") 'Release gate discovery must pin its exact release-profile GNU target'
-Assert-Cleanup (($script:nativeCalls[1].Arguments -join ' ') -eq "test --locked --release --target x86_64-pc-windows-gnu --test linux_ssh_release_gate $releaseCase -- --ignored --exact --nocapture --test-threads=1") 'Release gate execution must retain the exact GNU target and ignored single-thread selection'
-Assert-Cleanup ($script:nativeCalls[0].Timeout -eq 600000 -and $script:nativeCalls[1].Timeout -eq 150000) 'Release build and live gate must have separate deadlines with room for forced-abort reconciliation'
+Assert-Cleanup ($script:nativeCalls.Count -eq 3) 'Release gate must validate the native host, then discover and execute exactly once'
+Assert-Cleanup ($script:nativeCalls[0].FilePath -eq 'rustc.exe' -and ($script:nativeCalls[0].Arguments -join ' ') -eq '-vV' -and $script:nativeCalls[0].Timeout -eq 10000) 'Native GNU host validation must be bounded and precede Cargo'
+Assert-Cleanup (($script:nativeCalls[1].Arguments -join ' ') -eq "test --locked --release --test linux_ssh_release_gate $releaseCase -- --ignored --exact --list") 'Release gate discovery must use the native release directory without --target'
+Assert-Cleanup (($script:nativeCalls[2].Arguments -join ' ') -eq "test --locked --release --test linux_ssh_release_gate $releaseCase -- --ignored --exact --nocapture --test-threads=1") 'Release gate execution must reuse the native release directory and exact ignored selection'
+Assert-Cleanup ($script:nativeCalls[1].Timeout -eq 600000 -and $script:nativeCalls[2].Timeout -eq 150000) 'Release build and live gate must have separate deadlines with room for forced-abort reconciliation'
 $script:caseListing = @()
 $missingReleaseGateRejected = $false
 try { Invoke-ReleaseGate } catch { $missingReleaseGateRejected = $true }
 Assert-Cleanup $missingReleaseGateRejected 'Zero matching release gates must fail before execution'
+
+foreach ($unsupportedHost in @('host: x86_64-pc-windows-msvc', 'host: x86_64-unknown-linux-gnu', 'malformed compiler output')) {
+    $script:nativeStdout = $unsupportedHost
+    $script:nativeCalls.Clear()
+    $hostRejected = $false
+    try { Invoke-ReleaseGate } catch { $hostRejected = $_.Exception.Message.Contains('native Windows GNU compiler') }
+    Assert-Cleanup ($hostRejected -and $script:nativeCalls.Count -eq 1) 'Unsupported or unknown hosts must fail before Cargo creates a target tree'
+}
+$script:nativeStdout = 'host: x86_64-pc-windows-gnu'
+foreach ($overrideName in @('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR')) {
+    $previousOverride = [Environment]::GetEnvironmentVariable($overrideName, 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable($overrideName, 'fixture-override', 'Process')
+        $script:nativeCalls.Clear()
+        $overrideRejected = $false
+        try { Invoke-ReleaseGate } catch { $overrideRejected = $_.Exception.Message.Contains('environment overrides') }
+        Assert-Cleanup ($overrideRejected -and $script:nativeCalls.Count -eq 0) 'Target-directory overrides must be rejected before starting a native command'
+    } finally { [Environment]::SetEnvironmentVariable($overrideName, $previousOverride, 'Process') }
+}
+$script:nativeStdout = ''
 
 # Evaluate only the case-selection AST, never the fixture setup/cleanup body.
 $caseInitialization = $ast.Find({

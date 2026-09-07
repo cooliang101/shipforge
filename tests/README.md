@@ -11,7 +11,7 @@ rustc -Vv # Confirm host: x86_64-pc-windows-gnu
 cargo fmt --all -- --check
 cargo clippy --offline --locked --all-targets --all-features -- -D warnings
 cargo test --offline --locked --all-targets --all-features --no-fail-fast
-cargo build --offline --locked --target x86_64-pc-windows-gnu --release
+cargo build --offline --locked --release
 cargo audit
 ./tests/run-linux-acceptance-cleanup-tests.ps1
 ./tests/run-systemd-acceptance-cleanup-tests.ps1
@@ -23,10 +23,10 @@ Run the performance gate alone. The existing `cargo-audit` command updates advis
 ```powershell
 $shipforgePreviousSmokeBinary = $env:SHIPFORGE_RELEASE_SMOKE_BINARY
 try {
-    $env:SHIPFORGE_RELEASE_SMOKE_BINARY = (Resolve-Path -LiteralPath target/x86_64-pc-windows-gnu/release/shipforge.exe).Path
-    cargo test --offline --locked --target x86_64-pc-windows-gnu --test platform_smoke release_binary_q_exits_and_restores_terminal -- --ignored --exact --nocapture --test-threads=1
+    $env:SHIPFORGE_RELEASE_SMOKE_BINARY = (Resolve-Path -LiteralPath target/release/shipforge.exe).Path
+    cargo test --offline --locked --test platform_smoke release_binary_q_exits_and_restores_terminal -- --ignored --exact --nocapture --test-threads=1
     if ($LASTEXITCODE -ne 0) { throw 'Release q smoke failed' }
-    cargo test --offline --locked --target x86_64-pc-windows-gnu --test platform_smoke release_binary_recovers_after_idle_ctrl_c_bytes_then_q -- --ignored --exact --nocapture --test-threads=1
+    cargo test --offline --locked --test platform_smoke release_binary_recovers_after_idle_ctrl_c_bytes_then_q -- --ignored --exact --nocapture --test-threads=1
     if ($LASTEXITCODE -ne 0) { throw 'Release idle Ctrl+C smoke failed' }
 } finally { $env:SHIPFORGE_RELEASE_SMOKE_BINARY = $shipforgePreviousSmokeBinary }
 ```
@@ -55,7 +55,7 @@ On Windows with PowerShell 7, WSL Docker, `ssh-keygen`, Git and the repository's
 
 The runner builds `tests/fixtures/openssh`, starts two independent Debian/OpenSSH containers without `--privileged`, with random loopback-only ports and temporary keys, obtains Host Key fingerprints through Docker, and runs the explicitly ignored `linux_ssh_deployment.rs` cases. Default `-Suite All` runs `Deployment`, `Retention`, `AutomaticRetention`, then `Management` sequentially; select one suite for focused verification. Each exact test name must first be found once with `--ignored --exact --list`, preventing a zero-test false success. SSH deployment uses the `deploy` account; this is not a rootless container setup. A foreground WSL input pipe keeps the Docker runtime available while Windows cargo runs. It does not modify WSL settings, existing containers, saved Destinations, or real project configurations. Cleanup checks per-run container labels and the exact temporary directory before deleting its containers, image tag, and test identity; ordinary Docker build cache can remain. Cleanup errors fail the runner, while still attempting to restore environment variables and release its WSL helper.
 
-For the Windows GNU QA-01 release gate, first ensure the existing Windows OpenSSH Authentication Agent service is running, then run `./tests/run-linux-acceptance.ps1 -Suite ReleaseGate`. The runner explicitly passes `--target x86_64-pc-windows-gnu`, so a missing GNU target/toolchain fails instead of producing MSVC evidence. It never changes the service startup mode or clears the Agent. It checks that the Agent is reachable, adds one distinct test key, and removes only that exact public key during cleanup; failure to remove it retains exact recovery material and fails the run. Other Agent identities are not enumerated as an acceptance snapshot. The test itself uses the release profile and the same isolated Debian/OpenSSH targets described below. Run `./tests/run-linux-acceptance-cleanup-tests.ps1` for Job Object, deadline, Agent-key, delayed-resource and two-phase cleanup regressions without starting Docker.
+For the Windows GNU QA-01 release gate, first ensure the existing Windows OpenSSH Authentication Agent service is running, then run `./tests/run-linux-acceptance.ps1 -Suite ReleaseGate`. The runner validates the native Windows GNU compiler with a bounded `rustc -vV` check and rejects Cargo target/output-directory environment overrides; it never adds `--target`. This reuses `target/release` rather than producing another platform tree or accepting MSVC evidence. It never changes the service startup mode or clears the Agent. It checks that the Agent is reachable, adds one distinct test key, and removes only that exact public key during cleanup; failure to remove it retains exact recovery material and fails the run. Other Agent identities are not enumerated as an acceptance snapshot. The test itself uses the release profile and the same isolated Debian/OpenSSH targets described below. Run `./tests/run-linux-acceptance-cleanup-tests.ps1` for Job Object, deadline, Agent-key, delayed-resource and two-phase cleanup regressions without starting Docker.
 
 For optional Linux-client experiments outside the Windows-only MVP, run `bash ./tests/run-linux-qa01-release-gate.sh`. It builds the exact ignored test in release mode, then exercises separate IdentityFile and SSH Agent keys, strict Host Key rotation rejection, SFTP success/cancellation, and remote-command cancellation against two disposable loopback OpenSSH containers. The runner starts its own foreground `ssh-agent` on an owned socket, adds only the Agent key, and never reads, adds to, clears, or stops an inherited Agent. Both public keys are copied into stopped containers instead of mounting a host or repository directory. Random names, ports, labels, an owner-marked remote root, and a mode-700 temporary directory isolate each run. Setup, Cargo, Docker, Agent, and cleanup commands have outer deadlines; one cleanup timeout does not skip later resources. The exit trap verifies ownership before removal and fails if it cannot prove that containers, the image tag, Agent process, and temporary directory are gone. Docker build cache may remain. Run `bash ./tests/run-linux-qa01-runner-tests.sh` for syntax, exact-selection, no-mount, key-isolation, timeout-continuation, ownership-refusal, and cleanup regressions without starting Docker or an Agent.
 

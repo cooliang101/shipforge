@@ -1,0 +1,3 @@
+[build]
+# Keep native builds in one repository-local cache; do not add build.target.
+target-dir = "target"

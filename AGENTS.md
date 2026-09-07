@@ -18,6 +18,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 MVP supports Windows x64 GNU only. Reuse existing Rust/MinGW and test locally; never add GitHub test workflows. Release/SSH/systemd checks are in `tests/README.md`.
 
+Use `cargo build --release`; the executable is always `target/release/shipforge.exe`. Respect `.cargo/config.toml` and `rust-toolchain.toml`; do not add `--target` or override Cargo output directories. `cargo clean --profile dev` clears development caches without removing the release build.
+
 ## Coding Style & Naming Conventions
 
 Accept `rustfmt` output. Use `snake_case` for modules, files, and functions; `PascalCase` for types and traits; `SCREAMING_SNAKE_CASE` for constants. Keep platform behavior behind focused traits. Errors need operation, Component, and Destination context without secrets or raw parser/Driver diagnostics.

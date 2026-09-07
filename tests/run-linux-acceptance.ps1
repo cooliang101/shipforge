@@ -441,17 +441,29 @@ function Invoke-FixtureCase {
     [void](Invoke-CargoCommand -Arguments $arguments -TimeoutMilliseconds 300000 -PublishOutput)
 }
 
+function Assert-ReleaseGateNativeBuild {
+    foreach ($name in @('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR')) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, 'Process'))) {
+            throw 'ReleaseGate requires the repository native build layout; remove Cargo target/build-directory environment overrides before running it.'
+        }
+    }
+    $compiler = Invoke-CheckedNativeCommand -FilePath 'rustc.exe' -Arguments @('-vV') -TimeoutMilliseconds 10000 -Operation 'Rust host check'
+    if (@($compiler.Stdout -split '\r?\n' | Where-Object { $_ -eq 'host: x86_64-pc-windows-gnu' }).Count -ne 1) {
+        throw 'ReleaseGate requires the native Windows GNU compiler selected by rust-toolchain.toml; do not substitute an MSVC or cross-compilation target.'
+    }
+}
+
 function Invoke-ReleaseGate {
+    Assert-ReleaseGateNativeBuild
     $case = 'qa01_release_gate_validates_host_key_rotation_agent_sftp_and_cancellation'
     # The gate rejects debug builds, and Cargo succeeds when a filter selects zero tests.
-    # Pin GNU explicitly so a caller's active MSVC host cannot be recorded as
-    # evidence for the Windows GNU platform target.
-    $arguments = @('test', '--locked', '--release', '--target', 'x86_64-pc-windows-gnu', '--test', 'linux_ssh_release_gate', $case, '--', '--ignored', '--exact', '--list')
+    # Native GNU validation above avoids creating a second --target output tree.
+    $arguments = @('test', '--locked', '--release', '--test', 'linux_ssh_release_gate', $case, '--', '--ignored', '--exact', '--list')
     $listed = Invoke-CargoCommand -Arguments $arguments -TimeoutMilliseconds 600000
     if (@($listed.Stdout -split '\r?\n' | Where-Object { $_ -eq "${case}: test" }).Count -ne 1) {
         throw "Expected exactly one available QA-01 release gate: $case"
     }
-    $arguments = @('test', '--locked', '--release', '--target', 'x86_64-pc-windows-gnu', '--test', 'linux_ssh_release_gate', $case, '--', '--ignored', '--exact', '--nocapture', '--test-threads=1')
+    $arguments = @('test', '--locked', '--release', '--test', 'linux_ssh_release_gate', $case, '--', '--ignored', '--exact', '--nocapture', '--test-threads=1')
     [void](Invoke-CargoCommand -Arguments $arguments -TimeoutMilliseconds 150000 -PublishOutput)
 }
 
