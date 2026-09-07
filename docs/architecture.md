@@ -1,5 +1,7 @@
 # ShipForge Architecture
 
+> Product correction, 2026-09-07: [Deployment responsibility contract](deployment-contract.md) supersedes mandatory releases/current layout and migration assumptions. The existing implementation described below awaits replacement for in-place publishing. Do not migrate user applications to satisfy it. Runtime data and database backup/restore are outside scope; retain only the previous application archive for failed-deployment recovery.
+
 ## Goals and Boundaries
 
 Explicit service argv `sudo -S -- <program> ...` opts into saved-login-password sudo authentication. A pinned authenticated session retains only a protected password reference; it decrypts on a bounded stderr prompt and sends one stdin line followed by EOF. No server authorization is added. Password-channel output is suppressed before logging (including interruption settlement), while exit status and conservative unknown-outcome handling remain authoritative. Ordinary commands, key/Agent authentication, frozen service command schema and retention are unchanged. Preflight validates credential availability/format without running privileged commands; existing sudo policy is enforced by the server at execution.

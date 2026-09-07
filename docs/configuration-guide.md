@@ -1,5 +1,7 @@
 # ShipForge Configuration Guide
 
+> 2026-09-07：以 [部署助手职责](deployment-contract.md) 为准。部署目录应兼容现有应用；不得要求迁移目录或调整 systemd/Nginx。当前代码的 releases/current 流程尚未替换，不能把旧目录示例作为业务必须改造的要求。
+
 本文是 ShipForge 项目配置的唯一规范入口。MVP 只允许通过 TUI 创建和修改配置；AI Agent 调用、AI Agent 直接编辑和自动化接口全部冻结，不设计入口、协议或兼容层。SSH Agent 只是 SSH 密钥签名方式，不属于 AI Agent 功能。
 
 **配置版本**：当前规范为 `schemaVersion: 2`。远端服务统一使用 `service` 命令计划，systemd 是预填这套配置的内置选项；无服务的静态内容可省略 `service`。配置编辑与部署分别确认。
