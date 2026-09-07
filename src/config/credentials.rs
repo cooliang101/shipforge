@@ -30,11 +30,13 @@ pub fn default_credential_registry_path() -> Result<PathBuf, CredentialRegistryE
 pub enum SshCredential {
     Agent { fingerprint: String },
     IdentityFile { path: PathBuf },
+    Password { protected: super::ProtectedPassword },
 }
 
 impl fmt::Debug for SshCredential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Password { .. } => formatter.write_str("Password([REDACTED])"),
             Self::Agent { fingerprint } => formatter
                 .debug_struct("Agent")
                 .field("fingerprint", fingerprint)
@@ -50,6 +52,7 @@ impl fmt::Debug for SshCredential {
 impl SshCredential {
     fn validate(&self) -> Result<(), CredentialRegistryError> {
         match self {
+            Self::Password { .. } => {}
             Self::Agent { fingerprint } => {
                 if fingerprint.is_empty() || fingerprint.chars().any(char::is_control) {
                     return Err(CredentialRegistryError::Invalid(
@@ -189,6 +192,11 @@ impl CredentialRegistry {
         self.credentials
             .iter()
             .map(|(handle, credential)| match credential {
+                SshCredential::Password { .. } => CredentialSummary {
+                    handle: handle.clone(),
+                    label: "Password · protected for this Windows user".into(),
+                    available: cfg!(windows),
+                },
                 SshCredential::Agent { fingerprint } => CredentialSummary {
                     handle: handle.clone(),
                     label: format!("SSH Agent · {fingerprint}"),

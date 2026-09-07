@@ -14,6 +14,8 @@ Configurable remote Service Commands and the systemd preset now share one execut
 
 ## Run locally
 
+SSH connections support password, private-key and SSH Agent authentication. In either connection form, press `F5` for masked password entry, then confirm the host-key fingerprint before authentication. Passwords are saved with Windows current-user DPAPI protection in the local credential registry, never in project YAML or logs. See [password configuration](docs/configuration-guide.md#ssh-密码登录).
+
 Use an interactive Windows terminal with ConPTY support and the existing Rust/MinGW toolchain. The verified setup is Rust 1.96.1 with target `x86_64-pc-windows-gnu`; no additional local toolchain is installed. `Cargo.toml` retains its Rust 1.88 declaration, but that minimum has not been independently tested. Earlier [Linux client tests](docs/validation/linux-client.md) are historical evidence, not an MVP support commitment.
 
 ```sh

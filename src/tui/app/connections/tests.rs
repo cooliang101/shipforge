@@ -143,6 +143,53 @@ fn screen_text(app: &App) -> String {
         .join(" ")
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn password_connection_masks_input_and_reopens_saved_encrypted_credential() {
+    let (directory, mut app, gateway) = fixture();
+    form(&mut app).await;
+    press(&mut app, KeyCode::F(5));
+    let password = "only-test 密码 q$' space";
+    for character in password.chars() {
+        press(&mut app, KeyCode::Char(character));
+    }
+    assert!(screen_text(&app).contains("********"));
+    assert!(!screen_text(&app).contains(password));
+    assert!(!format!("{:?}", app.screen).contains(password));
+    press(&mut app, KeyCode::Enter);
+    wait(&mut app).await;
+    assert_eq!(gateway.auths.load(Ordering::Relaxed), 0);
+    assert!(!directory.path().join("credentials.yaml").exists());
+    press(&mut app, KeyCode::Char('y'));
+    wait(&mut app).await;
+    assert_eq!(gateway.auths.load(Ordering::Relaxed), 1);
+    let path = directory.path().join("credentials.yaml");
+    assert!(!std::fs::read_to_string(&path).unwrap().contains(password));
+    let registry = CredentialRegistry::load(&path).unwrap();
+    let handle = registry
+        .summaries()
+        .into_iter()
+        .find(|item| item.label.starts_with("Password"))
+        .unwrap()
+        .handle;
+    let SshCredential::Password { protected } = registry.resolve(&handle).unwrap() else {
+        panic!("password expected")
+    };
+    assert_eq!(protected.unlock().unwrap().as_str(), password);
+    press(&mut app, KeyCode::Char('e'));
+    wait(&mut app).await;
+    assert!(screen_text(&app).contains("protected for this Windows user"));
+    press(&mut app, KeyCode::F(5));
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Delete);
+    press(&mut app, KeyCode::Enter);
+    wait(&mut app).await;
+    assert!(app.message.as_deref().unwrap().contains("password"));
+    press(&mut app, KeyCode::Esc);
+    wait(&mut app).await;
+    assert_eq!(CredentialRegistry::load(&path).unwrap(), registry);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_create_edit_verify_and_delete_use_explicit_confirmation_and_saved_revisions() {
     let (directory, mut app, gateway) = fixture();

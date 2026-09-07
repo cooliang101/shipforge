@@ -28,9 +28,11 @@ tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "pro
 tokio-util = "0.7.19"
 toml = "1.1.5"
 uuid = { version = "1.26.0", features = ["serde", "v7"] }
+zeroize = "1.9.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1.11"
+windows-dpapi = "0.2.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

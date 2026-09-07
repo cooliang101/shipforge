@@ -578,7 +578,7 @@ failed deployment → compensation → restored | manual intervention required
 8. 用户可查看历史版本、发布时间、Git 提交和发布结果。
 9. 用户可为一个或多个 Component 选择历史健康 Release 完成回滚。
 10. 本地和远程发布记录在应用重启后仍然可查询；当前 TUI 会话不会同时启动两个 Deployment，远端状态与计划不一致时停止执行并提示重新检查。
-11. SSH 密钥、密码和 Token 不以明文形式写入项目配置或普通日志。
+11. SSH 支持私钥、SSH Agent 与标准密码认证；密码通过 TUI 遮蔽输入并以 Windows 当前用户 DPAPI 密文保存在用户级凭据注册表。SSH 密钥、密码和 Token 不以明文形式写入项目配置或普通日志；密码认证不能绕过 Host Key 校验，不包含 keyboard-interactive/MFA。
 12. 每个 Component 的当前 Release、上一个健康 Release 及运行中操作引用的 Release 不会被自动清理。
 
 ## 13. 开发阶段建议

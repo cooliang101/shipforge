@@ -433,7 +433,7 @@ fn append_bounded(target: &mut Vec<u8>, source: &[u8], truncated: &mut bool) {
 ///
 /// No command or subsystem channel is opened. `IdentityFile` authentication
 /// supports unencrypted modern keys; encrypted key passphrases are outside the
-/// password-free MVP and should be loaded through SSH Agent instead.
+/// MVP key-file loader and should be loaded through SSH Agent instead.
 ///
 /// # Errors
 ///
@@ -584,6 +584,21 @@ async fn authenticate(
     timeout: Duration,
 ) -> Result<bool, SshConnectionError> {
     match credential {
+        SshCredential::Password { protected } => {
+            let password = protected
+                .unlock()
+                .map_err(|message| SshConnectionError::Protocol(message.into()))?;
+            connection_phase(deadline, timeout, USER_AUTHENTICATION_PHASE, async {
+                handle
+                    .authenticate_password(destination.user.clone(), password.as_str())
+                    .await
+                    .map(|result| result.success())
+                    .map_err(|_| {
+                        SshConnectionError::Protocol("SSH password authentication failed".into())
+                    })
+            })
+            .await
+        }
         SshCredential::IdentityFile { path } => {
             let key = load_identity_file(path, deadline, timeout).await?;
             connection_phase(deadline, timeout, USER_AUTHENTICATION_PHASE, async {

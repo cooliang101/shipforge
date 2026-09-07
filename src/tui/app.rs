@@ -137,6 +137,7 @@ pub(super) enum SshField {
 
 #[derive(Clone, Debug)]
 pub(super) enum CredentialChoice {
+    Password(crate::config::PasswordInput),
     Saved {
         handle: CredentialHandle,
         label: String,
@@ -154,6 +155,7 @@ pub(super) enum CredentialChoice {
 impl CredentialChoice {
     pub fn label(&self) -> &str {
         match self {
+            Self::Password(input) => input.label(),
             Self::Saved { label, .. }
             | Self::Agent { label, .. }
             | Self::IdentityFile { label, .. } => label,
@@ -162,6 +164,7 @@ impl CredentialChoice {
 
     fn identity(&self) -> String {
         match self {
+            Self::Password(_) => "password-input".into(),
             Self::Saved { handle, .. } => handle.expose_reference().into(),
             Self::Agent { fingerprint, .. } => format!("agent:{fingerprint}"),
             Self::IdentityFile { path, .. } => format!("file:{}", path.display()),
@@ -961,6 +964,8 @@ impl App {
 
         if key.modifiers.is_empty()
             && key.code == KeyCode::Char('q')
+            && !matches!(&self.screen, Screen::NewSshDestination(draft)
+                if draft.field == SshField::Credential && matches!(draft.selected_credential(), Some(CredentialChoice::Password(_))))
             && (matches!(self.screen, Screen::Projects | Screen::Overview { .. })
                 || self.interactive_work_active())
         {
@@ -1547,6 +1552,16 @@ impl App {
     }
 
     fn handle_new_ssh_destination(&mut self, key: KeyCode, draft: &NewSshDestinationState) {
+        if let Screen::NewSshDestination(current) = &mut self.screen
+            && password_key(
+                key,
+                &mut current.credentials,
+                &mut current.credential_cursor,
+                &mut current.field,
+            )
+        {
+            return;
+        }
         match key {
             KeyCode::F(3) => self.open_key_browser(draft),
             KeyCode::Tab => {
@@ -1786,6 +1801,9 @@ impl App {
             .selected_credential()
             .ok_or_else(|| "Select an SSH identity".to_owned())?
         {
+            CredentialChoice::Password(input) => input.protect()
+                .map(|protected| SshCredential::Password { protected })
+                .map_err(str::to_owned),
             CredentialChoice::Saved { handle, .. } => {
                 CredentialRegistry::load(&self.credential_registry_path)
                     .map_err(|_| "SSH identities could not be loaded. Check Connections and local file permissions before retrying.".to_owned())?
@@ -1822,6 +1840,14 @@ impl App {
             })?;
         let mut credentials = original_credentials.clone();
         let (credential, created_credential) = match choice {
+            CredentialChoice::Password(input) => (
+                credentials
+                    .create(SshCredential::Password {
+                        protected: input.protect().map_err(str::to_owned)?,
+                    })
+                    .map_err(|_| "The password could not be saved".to_owned())?,
+                true,
+            ),
             CredentialChoice::Saved { handle, .. } => {
                 if credentials.resolve(handle).is_none() {
                     return Err("The selected SSH identity no longer exists".into());
@@ -2070,6 +2096,42 @@ fn editable_field(draft: &mut NewSshDestinationState) -> Option<&mut String> {
         SshField::Port => Some(&mut draft.port),
         SshField::Credential => None,
     }
+}
+
+fn password_key(
+    key: KeyCode,
+    credentials: &mut Vec<CredentialChoice>,
+    cursor: &mut usize,
+    field: &mut SshField,
+) -> bool {
+    if key == KeyCode::F(5) {
+        if let Some(index) = credentials
+            .iter()
+            .position(|item| matches!(item, CredentialChoice::Password(_)))
+        {
+            *cursor = index;
+        } else {
+            credentials.push(CredentialChoice::Password(
+                crate::config::PasswordInput::default(),
+            ));
+            *cursor = credentials.len() - 1;
+        }
+        *field = SshField::Credential;
+        return true;
+    }
+    if *field != SshField::Credential {
+        return false;
+    }
+    let Some(CredentialChoice::Password(input)) = credentials.get_mut(*cursor) else {
+        return false;
+    };
+    match key {
+        KeyCode::Char(character) if !character.is_control() => input.push(character),
+        KeyCode::Backspace => input.pop(),
+        KeyCode::Delete => input.clear(),
+        _ => return false,
+    }
+    true
 }
 
 fn deduplicate_credentials(credentials: &mut Vec<CredentialChoice>) {
@@ -3361,6 +3423,47 @@ mod tests {
             Some(SetupRootState::WritableDirectory)
         );
         assert_eq!(selection.systemd_units, vec!["web.service"]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setup_password_is_masked_and_saved_only_after_successful_confirmed_authentication() {
+        for mode in [FakeSetupMode::Success, FakeSetupMode::AuthenticationFailure] {
+            let succeeds = matches!(mode, FakeSetupMode::Success);
+            let (directory, mut app, draft, _) = app_with_fake_setup(mode);
+            app.screen = Screen::NewSshDestination(draft);
+            app.handle_key(key(KeyCode::F(5)));
+            let password = "setup-only 密码 q$'";
+            for character in password.chars() {
+                app.handle_key(key(KeyCode::Char(character)));
+            }
+            assert!(!format!("{:?}", app.screen).contains(password));
+            let Screen::NewSshDestination(draft) = &app.screen else {
+                panic!("input remains in form")
+            };
+            let resolved = app.resolve_draft_credential(draft).unwrap();
+            let SshCredential::Password { protected } = resolved else {
+                panic!("password expected")
+            };
+            assert_eq!(protected.unlock().unwrap().as_str(), password);
+            app.handle_key(key(KeyCode::Enter));
+            allow_background_task_to_run(&mut app).await;
+            assert!(!directory.path().join("credentials.yaml").exists());
+            app.handle_key(key(KeyCode::Char('y')));
+            allow_background_task_to_run(&mut app).await;
+            let path = directory.path().join("credentials.yaml");
+            assert_eq!(path.exists(), succeeds);
+            if succeeds {
+                assert!(!std::fs::read_to_string(&path).unwrap().contains(password));
+                let registry = CredentialRegistry::load(&path).unwrap();
+                let summary = registry.summaries().pop().unwrap();
+                let Some(SshCredential::Password { protected }) = registry.resolve(&summary.handle)
+                else {
+                    panic!("saved password expected")
+                };
+                assert_eq!(protected.unlock().unwrap().as_str(), password);
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

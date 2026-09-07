@@ -265,7 +265,7 @@ fn form_text(form: &ConnectionForm) -> String {
         );
     }
     if form.credentials.is_empty() {
-        body.push_str("No identity found. F3: browse a local private-key file.\n");
+        body.push_str("No identity found. F3: private key; F5: password.\n");
     }
     if form.hosts.is_empty() {
         body.push_str("No suggested hosts. Type a hostname in the Host field.\n");
@@ -273,7 +273,7 @@ fn form_text(form: &ConnectionForm) -> String {
         body.push_str("Host field: F4 searches suggested hosts; F2 cycles them.\n");
     }
     body.push_str(
-        "Enter captures the host-key fingerprint only. Review it before plain y saves.\n",
+        "F5: enter/change password (hidden); Backspace: erase last; Delete: clear.\nPassword is saved encrypted for this Windows user after authentication.\nEnter captures the host-key fingerprint only. Review it before plain y saves.\n",
     );
     for notice in &form.notices {
         let _ = writeln!(body, "\n{}", safe_text(notice));

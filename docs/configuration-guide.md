@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `shipforge.yaml` | Component、Environment 部署意图，以及 `_shipforge` 系统维护区 | TUI |
 | 用户级 Destination 注册表 | 系统生成的 ID、连接类型、端点、修订及凭据引用 | TUI 连接管理页 |
-| 用户级凭据注册表 | SSH Agent 指纹或私钥路径；项目文件只引用句柄 | TUI Key 选择器 |
+| 用户级凭据注册表 | SSH Agent 指纹、私钥路径或 Windows 当前用户 DPAPI 保护的密码密文；项目文件只引用句柄 | TUI 身份选择器 |
 
 `shipforge.yaml` 必须位于项目根目录，不得包含密码、Token、私钥正文或个人 SSH Key 路径。`_shipforge` 保存 Project/Environment ID，以及每个 Environment/Component 的 generation 和固化 root；不得绕过 TUI 手工修改。
 
@@ -20,7 +20,7 @@
 
 1. 让用户选择项目目录；若已有 `shipforge.yaml`，立即加载并校验。
 2. 从 `package.json` 的 build script、`Cargo.toml` 和 `go.mod` 推断 Component、构建命令与构建输出路径，供用户勾选或修正；Dockerfile 只提示镜像构建不在 MVP 范围，其他构建方式可手动配置。无候选或发现失败不要求先修改项目文件以通过发现。
-3. 展示已有 Destination 和 SSH config 中的 Host；新建连接时优先让用户选择 SSH Agent、`IdentityFile` 或发现的 Key。
+3. 展示已有 Destination 和 SSH config 中的 Host；新建连接时可选择 SSH Agent、`IdentityFile`、发现的 Key，或按 `F5` 输入密码。
 4. 首次连接前展示 Host Key 指纹；确认并认证成功后保存本机连接。用户可只读浏览目录、探测 systemd 候选，也可选择默认 root 或手动覆盖；探测结果不表示部署预检或健康已通过。
 5. 用户为每个 Component 选择 Destination、独立 root 和可选服务；同一 Destination 可被任意 Project 的多个 Component 复用，不共用组件部署设置。
 6. 展示规范化 YAML，确认后原子写入项目根目录的 `shipforge.yaml`；部署预检和执行另行确认。
@@ -28,6 +28,14 @@
 除主机地址、特殊部署目录等无法可靠发现的值外，应使用选择、确认和默认值完成设置。Project/Environment/Destination/Deployment ID 和 Release 版本均由系统生成，用户无需命名连接。取消不保存未确认草稿；已经明确确认并保存的连接保留，不随项目向导取消而删除。写入结果不确定时要求重新加载，不宣称没有保存，也不盲目回退独立注册表。
 
 MVP 中用户只选择 SSH 连接，不选择 Driver。TUI 根据连接记录自动使用内置 `linux-ssh` 实现；Driver 名称、能力标识符和 SFTP 参数不进入项目配置。
+
+### SSH 密码登录
+
+首次设置和连接管理表单均可按 `F5` 选择密码并直接输入；界面固定显示遮蔽标记，Backspace 删除最后一个字符，Delete 清空。密码为 1～1024 个 UTF-8 字节，支持空格与标点。回车获取 Host Key，明确确认指纹后才发送密码认证；错误密码、取消或认证失败不保存连接。编辑已有连接时可复用已保存密码，或按 `F5` 输入新密码并重新确认。
+
+密码在本机使用 Windows DPAPI 的当前用户范围加密，只有密文随用户级 `credentials.yaml` 原子保存。读取注册表不解密；SSH 握手通过已确认的 Host Key 校验后才解密并进行密码认证。项目 YAML、计划、历史和普通日志不包含密码。草稿和程序持有的解密缓冲区在释放时清零；不承诺 SSH 库、操作系统或进程内所有副本均清零。该机制不防御已经能以当前 Windows 用户身份运行的程序。
+
+保存的密码不能当作可移植凭据：换 Windows 用户或机器、密文损坏或无法解密时，需要在连接编辑器中重新输入。没有明文回退，也不自动尝试其他认证方式。支持标准 SSH password 认证，不包含 keyboard-interactive/MFA 或修改服务器密码。私钥口令仍通过 SSH Agent 处理。
 
 ## TUI 配置规则
 

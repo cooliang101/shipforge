@@ -34,6 +34,8 @@ Use `ratatui` with the `crossterm` backend and buffered, off-screen rendering. K
 
 Follow `docs/configuration-guide.md`. Configuration is TUI-managed: do not add Agent editing, alternate YAML forms, locks, or user-facing Driver fields. Preserve `_shipforge`; `artifact` is build output and `Release` is the sole versioned `tar.gz` product. Never store secrets in `shipforge.yaml`; validate Host Keys and keep argv separate from Shell text. Follow `docs/architecture.md` for history, evidence, retention, and unknown-result rules.
 
+SSH passwords use masked TUI input and Windows current-user DPAPI ciphertext in the user credential registry. Never serialize plaintext drafts or bypass Host Key verification before sending credentials. Standard password authentication does not imply keyboard-interactive/MFA support.
+
 Remote service commands use canonical schema 2; systemd is a preset over the shared executor. Keep commands per Environment/Component, not in shared SSH connections or local builds. Freeze recovery settings; never reconstruct missing historical commands or issue competing compensation after an unknown service outcome.
 
 ## Commit & Pull Request Guidelines

@@ -819,7 +819,7 @@ fn page_help(app: &App) -> &'static str {
                 "←→ Component · ↑↓ connection · Space assign · e target · a SSH · n review · Esc back"
             }
             Screen::NewSshDestination(_) => {
-                "Tab field   ↑/↓ identity   F3 browse key   F2 next host   Enter probe   Esc cancel"
+                "Tab field   ↑/↓ identity   F3 key   F5 password   Enter probe   Esc cancel"
             }
             Screen::HostKeyPending { .. } => "Fetching Host Key…   Esc cancel",
             Screen::HostKeyConfirm { .. } => "y trust fingerprint and authenticate   n/Esc reject",
@@ -1432,7 +1432,7 @@ fn render_new_ssh_destination(
     ];
     if draft.credentials.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No identities are available in this form. Press F3 to choose a key file.",
+            "No identities are available in this form. Press F3 to choose a key file; F5 for password.",
             Style::default().fg(Color::Yellow),
         )));
     } else {
@@ -1456,6 +1456,12 @@ fn render_new_ssh_destination(
             draft.connections.len()
         )));
     }
+    lines.push(Line::from(
+        "F5: password (hidden); Backspace: erase last; Delete: clear.",
+    ));
+    lines.push(Line::from(
+        "Password is encrypted for this Windows user after authentication.",
+    ));
     let focused_row = match draft.field {
         app::SshField::Host => 2,
         app::SshField::User => 3,

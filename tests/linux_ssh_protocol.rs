@@ -36,6 +36,9 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "support/deployment_service.rs"]
 mod deployment_service;
+#[cfg(windows)]
+#[path = "support/password_protocol.rs"]
+mod password_protocol;
 #[path = "support/preflight_protocol.rs"]
 mod preflight_protocol;
 #[path = "support/remote_directory_protocol.rs"]
@@ -59,6 +62,7 @@ struct ProtocolServer {
 
 #[derive(Debug, Default)]
 struct TransferState {
+    password_attempts: usize,
     files: HashMap<String, Vec<u8>>,
     directories: HashSet<String>,
     links: HashMap<String, String>,
@@ -130,6 +134,24 @@ async fn protocol_handlers_isolate_channels_and_share_fixture_facts() {
 
 impl server::Handler for ProtocolServer {
     type Error = russh::Error;
+
+    async fn auth_password(
+        &mut self,
+        user: &str,
+        password: &str,
+    ) -> Result<server::Auth, Self::Error> {
+        self.transfer.lock().await.password_attempts += 1;
+        if user == "slow" {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(
+            if user == "deploy" && password == "fixture 密码 q$' value" {
+                server::Auth::Accept
+            } else {
+                server::Auth::reject()
+            },
+        )
+    }
 
     async fn auth_publickey(
         &mut self,

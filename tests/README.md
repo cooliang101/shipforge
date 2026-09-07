@@ -2,6 +2,8 @@
 
 ## Windows-only local release gates
 
+The Windows default suite includes SSH password DPAPI persistence, masked TUI setup/edit/save/cancel, and a password-authenticated loopback SSH/SFTP Release lifecycle. Its fixture verifies host-key rejection before any password is sent, wrong-password rejection, registry reload, cancellation and timeout. See [SSH-PWD-01](../docs/validation/ssh-password.md). These fixtures never use the user's saved server credentials.
+
 MVP acceptance uses Windows x64 GNU with the existing Rust/MinGW toolchain (verified: Rust 1.96.1). Linux is the deployment target; WSL/Docker below only hosts disposable servers. Linux/macOS clients and a separate minimum-Rust matrix are outside MVP acceptance. No tests run on GitHub, including after pushes.
 
 From the repository root, run each command locally and stop on any nonzero exit code. `--offline` reuses cached dependencies; it does not install a toolchain.

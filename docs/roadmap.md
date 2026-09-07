@@ -118,6 +118,8 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ## M4：服务命令补齐与发布加固
 
+`SSH-PWD-01` 已于 2026-09-07 完成局部验收：根据实际部署需求补齐 Windows 标准 SSH 密码登录。首次设置和连接编辑共用 F5 遮蔽输入，凭据注册表仅保存 Windows 当前用户 DPAPI 密文，Host Key 验证后才发送密码。1,031 项测试、严格 Clippy、依赖审计、发布构建和实际 exe 的两项 ConPTY 复验通过；证据见 [密码登录验证](validation/ssh-password.md)。该能力不包含 keyboard-interactive/MFA，也不代替 QA-02 安全审查。
+
 `QA-01` 已按 Windows-only 范围通过本机验收：既有 Rust 1.96.1 + MinGW 的全量测试、格式/严格 Clippy、GNU release 构建、准确二进制 ConPTY smoke、隔离性能门禁和 Windows runner 安全回归通过；真实 OpenSSH 认证、Host Key 轮换拒绝、SFTP 和命令取消沿用源码提交 `0b59f8f` 的已验证证据，执行代码未改动。GitHub 测试工作流已移除；Linux/macOS 客户端和最低 Rust 版本矩阵不再是本轮验收要求。该结论只覆盖 Windows x64 GNU 的已测条件，不宣称早期 SSH 超时已定位修复或整个 MVP 已完成。证据、兼容性边界及后续任务见 [QA-01 记录](validation/qa-01.md)。后续服务路径改动及受影响的 Windows/SSH/systemd 复验由下述 `SVC-01` 记录覆盖，不直接沿用旧结果。
 
 ### SVC-01：远端服务命令基础与 systemd 预设

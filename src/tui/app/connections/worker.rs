@@ -280,6 +280,11 @@ fn draft(form: &ConnectionForm) -> Result<SshConnectionDraft, String> {
         .get(form.credential_cursor)
         .ok_or_else(|| "Select an SSH identity; F3 opens the private-key browser.".to_owned())?;
     let credential = match choice {
+        CredentialChoice::Password(input) => {
+            ConnectionCredentialDraft::New(SshCredential::Password {
+                protected: input.protect().map_err(str::to_owned)?,
+            })
+        }
         CredentialChoice::Saved { handle, .. } => ConnectionCredentialDraft::Saved(handle.clone()),
         CredentialChoice::Agent { fingerprint, .. } => {
             ConnectionCredentialDraft::New(SshCredential::Agent {

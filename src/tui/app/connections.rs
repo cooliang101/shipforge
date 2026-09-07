@@ -295,6 +295,16 @@ impl App {
         mut form: Arc<ConnectionForm>,
     ) {
         let edit = Arc::make_mut(&mut form);
+        if super::password_key(
+            key,
+            &mut edit.credentials,
+            &mut edit.credential_cursor,
+            &mut edit.field,
+        ) {
+            screen.page = ConnectionsPage::Form(form);
+            self.screen = Screen::Connections(screen);
+            return;
+        }
         let request = match key {
             KeyCode::Esc => Some(ConnectionsRequest::List),
             KeyCode::Tab => {

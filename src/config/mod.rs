@@ -3,6 +3,7 @@
 mod credentials;
 mod destinations;
 mod model;
+mod password;
 mod reinitialize;
 mod service;
 mod setup;
@@ -29,6 +30,8 @@ pub use model::{
     ResolvedArtifact, ResolvedArtifactKind, TargetConfig,
 };
 use model::{ManagedEnvironment, RawEnvironment, RawProjectConfig};
+pub(crate) use password::PasswordInput;
+pub use password::ProtectedPassword;
 pub(crate) use reinitialize::reinitialize_setup;
 pub use service::{ServiceAction, ServiceCheck, ServiceConfig};
 pub use setup::{
