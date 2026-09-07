@@ -503,7 +503,7 @@ impl ManualComponentScreen {
         let mut lines = vec![
             Line::from(format!(
                 "Project directory: {}",
-                safe_text(&self.origin.root.display().to_string())
+                safe_text(&crate::tui::presentation::path_label(&self.origin.root))
             )),
             Line::from("Manual fallback. No files are written and no commands are run."),
             Line::from(""),
@@ -543,7 +543,7 @@ impl ManualComponentScreen {
     fn preview_lines(&self, candidate: &ComponentCandidate) -> Vec<Line<'static>> {
         let mut text = format!(
             "ADD COMPONENT TO SETUP DRAFT ONLY\nProject directory: {}\nName: {}\nWorking directory: {}\nArtifact: {}\n\n",
-            safe_text(&self.origin.root.display().to_string()),
+            safe_text(&crate::tui::presentation::path_label(&self.origin.root)),
             candidate.name,
             safe_text(&self.working_directory),
             safe_text(&self.artifact)

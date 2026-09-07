@@ -856,7 +856,7 @@ fn render_screen(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
             let mut content = format!(
                 "Project: {}\nRoot: {}\nComponents: {}\nEnvironments: {}\n\n{}",
                 safe_text(&config.project),
-                safe_text(&root.display().to_string()),
+                safe_text(&crate::tui::presentation::path_label(root)),
                 config.components.len(),
                 config.environments.len(),
                 app.overview_targets(config)
@@ -936,7 +936,7 @@ fn render_project_browser(
 ) {
     let mut lines = vec![Line::from(format!(
         "Current: {}",
-        browser.directory.display()
+        crate::tui::presentation::path_label(&browser.directory)
     ))];
     if browser.children.is_empty() {
         lines.push(Line::from("  No child directories"));
@@ -945,7 +945,7 @@ fn render_project_browser(
             selected_line(
                 index == browser.selected,
                 &path.file_name().map_or_else(
-                    || path.display().to_string(),
+                    || crate::tui::presentation::path_label(path),
                     |name| name.to_string_lossy().into(),
                 ),
             )
@@ -1205,8 +1205,8 @@ mod service_preview_tests {
 fn build_preview(build: &crate::config::ComponentConfig) -> String {
     let mut content = format!(
         "  Working directory: {}\n  Artifact (relative to working directory): {}\n",
-        build.working_directory.display(),
-        build.artifact.path.display()
+        crate::tui::presentation::path_label(&build.working_directory),
+        crate::tui::presentation::path_label(&build.artifact.path)
     );
     for command in &build.build {
         if command.shell {
@@ -1395,7 +1395,7 @@ fn render_key_browser(
 ) {
     let mut lines = vec![Line::from(format!(
         "Directory: {}",
-        browser.directory.display()
+        crate::tui::presentation::path_label(&browser.directory)
     ))];
     if browser.entries.is_empty() {
         lines.push(Line::from("  No files or directories"));
@@ -1407,7 +1407,7 @@ fn render_key_browser(
                 ""
             };
             let name = path.file_name().map_or_else(
-                || path.display().to_string(),
+                || crate::tui::presentation::path_label(path),
                 |name| name.to_string_lossy().into_owned(),
             );
             selected_line(index == browser.selected, &format!("{name}{suffix}"))
@@ -1588,7 +1588,7 @@ fn render_destination_setup(
         .collect::<Vec<_>>();
     let mut lines = vec![Line::from(format!(
         "Root: {}",
-        setup.components.root.display()
+        crate::tui::presentation::path_label(&setup.components.root)
     ))];
     if let Some(component) = components.get(setup.component_cursor) {
         let assigned = setup
@@ -1645,7 +1645,10 @@ fn render_component_setup(
     area: ratatui::layout::Rect,
     setup: &app::ComponentSetupState,
 ) {
-    let mut lines = vec![Line::from(format!("Root: {}", setup.root.display()))];
+    let mut lines = vec![Line::from(format!(
+        "Root: {}",
+        crate::tui::presentation::path_label(&setup.root)
+    ))];
     if setup.report.components.is_empty() {
         lines.push(Line::from("No deployable Components were inferred. Press a to add one manually, or Esc to choose another project."));
     }
@@ -1659,8 +1662,8 @@ fn render_component_setup(
             "{checked} {}  {:?}  artifact={}  source={}",
             candidate.name,
             candidate.confidence,
-            candidate.setup.artifact.path.display(),
-            candidate.source.display()
+            crate::tui::presentation::path_label(&candidate.setup.artifact.path),
+            crate::tui::presentation::path_label(&candidate.source)
         );
         lines.push(selected_line(index == setup.cursor, &text));
     }
@@ -1713,7 +1716,11 @@ fn render_projects(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App
         };
         lines.push(selected_line(
             index == app.selected_recent,
-            &format!("{}{}", status.project.root.display(), suffix),
+            &format!(
+                "{}{}",
+                crate::tui::presentation::path_label(&status.project.root),
+                suffix
+            ),
         ));
     }
     lines.push(selected_line(
@@ -1906,5 +1913,42 @@ mod tests {
         assert!(!super::event_loop_exit_ready(&app));
         app.shutdown();
         assert!(super::event_loop_exit_ready(&app));
+    }
+}
+
+#[cfg(test)]
+mod project_path_display_tests {
+    #[test]
+    fn project_list_displays_normalized_path_without_changing_its_selection_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = super::App::new(
+            directory.path().join("projects.yaml"),
+            directory.path().join("destinations.yaml"),
+            directory.path(),
+        )
+        .unwrap();
+        let root = std::path::PathBuf::from(r"\\?\D:\project\aiagent");
+        app.recent = vec![crate::projects::ProjectStatus {
+            project: crate::projects::RegisteredProject {
+                root: root.clone(),
+                last_opened_unix_ms: 0,
+            },
+            available: true,
+        }];
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| super::render_projects(frame, frame.area(), &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("D:/project/aiagent"));
+        assert!(!text.contains(r"\\?\"));
+        assert_eq!(app.recent[0].project.root, root);
     }
 }

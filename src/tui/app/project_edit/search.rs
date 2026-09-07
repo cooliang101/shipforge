@@ -77,7 +77,7 @@ impl ProjectEditScreen {
                             "{} · {:?} · {}",
                             candidate.name,
                             candidate.confidence,
-                            safe_text(&candidate.source.display().to_string())
+                            safe_text(&crate::tui::presentation::path_label(&candidate.source))
                         )
                     })
                     .collect(),

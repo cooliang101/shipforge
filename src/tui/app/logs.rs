@@ -287,7 +287,7 @@ impl LogWorkspace {
                 self.mode = Mode::Browse;
                 self.status = format!(
                     "Published: {}. {}",
-                    outcome.path().display(),
+                    crate::tui::presentation::path_label(outcome.path()),
                     outcome.warning().unwrap_or("Export complete.")
                 );
             }

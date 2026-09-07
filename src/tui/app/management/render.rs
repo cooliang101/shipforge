@@ -372,7 +372,7 @@ impl ManagementScreen {
                 "Historical Environment · read-only",
                 format!(
                     "Project directory: {}\nEnvironment: {}\n\n[h] Local deployment history and logs\n[p] Saved inspection reports\n\nRead-only local evidence; no remote connections or rollback.\nEnvironment identity, not its name, determines this scope.\nOld configuration is not reconstructed. Esc returns to the previous page.",
-                    safe_text(&self.scope.root.display().to_string()),
+                    safe_text(&crate::tui::presentation::path_label(&self.scope.root)),
                     self.scope
                         .historical_environment
                         .as_ref()
@@ -384,7 +384,7 @@ impl ManagementScreen {
                 "Manage",
                 format!(
                     "Project directory: {}\n\n[h] Local deployment history and logs\n[i] Inspect selected Components / remote Releases\n[p] Saved inspection reports\n[a] Historical Environment IDs (including removed Environments)\n\nOpening history never connects to a server.\nInspection is read-only on the server; it saves a separate local report.\nInventory is not an environment preflight or a health check.\nIt does not prove service health or historical success.",
-                    safe_text(&self.scope.root.display().to_string())
+                    safe_text(&crate::tui::presentation::path_label(&self.scope.root))
                 ),
                 None,
             ),

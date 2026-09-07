@@ -81,7 +81,7 @@ impl App {
                             index,
                             format!(
                                 "{}{}",
-                                status.project.root.display(),
+                                crate::tui::presentation::path_label(&status.project.root),
                                 if status.available {
                                     ""
                                 } else {
@@ -105,7 +105,7 @@ impl App {
                     .children
                     .iter()
                     .enumerate()
-                    .map(|(index, path)| (index, path.display().to_string()))
+                    .map(|(index, path)| (index, crate::tui::presentation::path_label(path)))
                     .collect(),
                 browser.selected,
                 "No child directories. Esc returns; use Backspace for parent or s to select this root.",
@@ -116,7 +116,7 @@ impl App {
                     .entries
                     .iter()
                     .enumerate()
-                    .map(|(index, path)| (index, path.display().to_string()))
+                    .map(|(index, path)| (index, crate::tui::presentation::path_label(path)))
                     .collect(),
                 browser.selected,
                 "No entries. Esc returns; use Backspace for the parent directory.",
@@ -210,7 +210,9 @@ impl App {
                                     "[ ]"
                                 },
                                 candidate.name,
-                                candidate.setup.artifact.path.display()
+                                crate::tui::presentation::path_label(
+                                    &candidate.setup.artifact.path
+                                )
                             ),
                         )
                     })

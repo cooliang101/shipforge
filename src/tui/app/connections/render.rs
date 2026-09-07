@@ -180,7 +180,7 @@ impl ConnectionsScreen {
             } => {
                 let mut body = format!(
                     "Directory: {}\nSelect a private key; file contents are never displayed.\n\n",
-                    safe_text(&directory.path.display().to_string())
+                    safe_text(&crate::tui::presentation::path_label(&directory.path))
                 );
                 if directory.entries.is_empty() {
                     body.push_str("No visible files or directories here.\nBackspace opens the parent directory; Esc returns to the form.\n");
@@ -208,7 +208,7 @@ impl ConnectionsScreen {
                 " Remove Project from recents ",
                 format!(
                     "Project: {}\n\nThis only unregisters the recent-Project entry.\nThe directory, shipforge.yaml, connection registry, remote deployments, and local history are NOT deleted.\n\nSelect this directory again later to register it again.\nPress c to confirm.\n",
-                    safe_text(&preview.root().display().to_string())
+                    safe_text(&crate::tui::presentation::path_label(preview.root()))
                 ),
                 None,
             ),
@@ -328,7 +328,7 @@ fn removal_text(preview: &crate::application::DestinationRemovalPreview) -> Stri
         let _ = writeln!(
             body,
             "Referenced by Project: {}",
-            safe_text(&root.display().to_string())
+            safe_text(&crate::tui::presentation::path_label(root))
         );
     }
     if let Some(history) = preview.history_references() {

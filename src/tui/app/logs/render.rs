@@ -397,7 +397,7 @@ fn render_export_directory(
         .iter()
         .map(|path| {
             path.file_name().map_or_else(
-                || path.display().to_string(),
+                || crate::tui::presentation::path_label(path),
                 |name| name.to_string_lossy().into_owned(),
             )
         })
@@ -413,7 +413,7 @@ fn render_export_directory(
     } else {
         format!(
             "Directory: {}\nAutomatic filename: {name}\nEnter enters directory; Backspace parent; s selects; Esc cancels.",
-            safe_text(&browser.directory.display().to_string())
+            safe_text(&crate::tui::presentation::path_label(&browser.directory))
         )
     };
     frame.render_widget(Paragraph::new(text), inner[0]);
@@ -451,7 +451,7 @@ fn render_export_preview(
     } else {
         format!(
             "Path: {}\n{range} · n/b chunk · ↑↓/PgUp/PgDn scroll\nUnmodified c confirms; Esc discards. No overwrite.\nF1 full path/details; Windows inherits directory permissions.",
-            safe_text(&preview.path().display().to_string())
+            safe_text(&crate::tui::presentation::path_label(preview.path()))
         )
     };
     frame.render_widget(Paragraph::new(header), parts[0]);

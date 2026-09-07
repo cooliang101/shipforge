@@ -22,6 +22,20 @@ pub(super) fn safe_text(value: &str) -> String {
     text
 }
 
+/// Formats local paths for display only; never use this label for file access or identity.
+pub(super) fn path_label(path: &std::path::Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let visible = if let Some(unc) = normalized.strip_prefix("//?/UNC/") {
+        format!("//{unc}")
+    } else {
+        normalized
+            .strip_prefix("//?/")
+            .unwrap_or(&normalized)
+            .to_owned()
+    };
+    safe_text(&visible)
+}
+
 /// Keeps the existing ASCII-insensitive `prod` substring warning heuristic.
 /// This is a visual hint, not a classification or authorization rule.
 pub(super) fn is_production(name: &str) -> bool {
@@ -394,5 +408,32 @@ mod tests {
             step_label("custom.capability.local-build"),
             "custom.capability.local-build"
         );
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::path_label;
+    use std::path::Path;
+
+    #[test]
+    fn local_path_labels_hide_windows_namespace_and_use_forward_slashes() {
+        for (original, expected) in [
+            (r"\\?\D:\project\aiagent", "D:/project/aiagent"),
+            (r"D:\project\aiagent", "D:/project/aiagent"),
+            (r"\\?\D:\", "D:/"),
+            (r"\\?\UNC\server\share\project", "//server/share/project"),
+            (r"\\server\share\project", "//server/share/project"),
+            ("D:/project/aiagent", "D:/project/aiagent"),
+            ("/srv/app", "/srv/app"),
+        ] {
+            let path = Path::new(original);
+            assert_eq!(path_label(path), expected);
+            assert_eq!(
+                path.as_os_str(),
+                original,
+                "display must preserve the stored path"
+            );
+        }
     }
 }
