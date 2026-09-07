@@ -33,6 +33,7 @@ fn start(store: &HistoryStore) -> (DeploymentId, ReleaseRef) {
         .record_component_snapshots(
             &deployment,
             &[DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: release.clone(),
                 target: Some(release.clone()),
                 expected_current: None,

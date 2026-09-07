@@ -245,6 +245,7 @@ mod tests {
 
     fn malicious_error() -> DriverError {
         DriverError {
+            recovery_blocked: false,
             stage: format!("\u{1b}[31m{SECRET}"),
             target: SECRET.into(),
             message: format!("-----BEGIN PRIVATE KEY-----\n{SECRET}"),

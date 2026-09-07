@@ -216,14 +216,14 @@ impl Fixture {
                     name("backend"),
                     ComponentTargetSettings {
                         root: Some("/srv/original-api".into()),
-                        systemd: Some("original-api.service".into()),
+                        service: Some("original-api.service".into()),
                     },
                 ),
                 (
                     name("worker"),
                     ComponentTargetSettings {
                         root: Some("/srv/original-worker".into()),
-                        systemd: Some("original-worker.service".into()),
+                        service: Some("original-worker.service".into()),
                     },
                 ),
             ]),

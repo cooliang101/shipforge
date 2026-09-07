@@ -110,6 +110,7 @@ impl DeploymentDriver for FakeDriver {
         self.capabilities
             .require(request.required_capabilities.iter().copied())
             .map_err(|rejection| DriverError {
+                recovery_blocked: false,
                 stage: "plan".into(),
                 target: context.component.to_string(),
                 message: format!("missing capabilities: {:?}", rejection.missing),

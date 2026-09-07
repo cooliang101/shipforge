@@ -448,6 +448,7 @@ fn publish(
                 effective_capabilities: driver.static_capabilities(),
             };
             DeploymentComponentSnapshot {
+                target_snapshot: None,
                 target: Some(release.clone()),
                 release,
                 expected_current: driver.0.lock().unwrap().current.get(&component).cloned(),

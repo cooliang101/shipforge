@@ -56,7 +56,13 @@ async fn editor_target_choices_remain_draft_until_all_forms_and_exact_yaml_are_c
         panic!("target");
     };
     assert_eq!(form.target.root.as_deref(), Some("/srv/edited-worker"));
-    assert_eq!(form.target.systemd.as_deref(), Some("tasks.service"));
+    assert_eq!(
+        form.target
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
+        Some("tasks.service")
+    );
     assert_ne!(
         current.draft.unwrap().setup.environments["production"].components[&name("worker")]
             .root
@@ -85,7 +91,10 @@ async fn editor_target_choices_remain_draft_until_all_forms_and_exact_yaml_are_c
         "/srv/edited-worker"
     );
     assert_eq!(
-        production.components[&name("worker")].systemd.as_deref(),
+        production.components[&name("worker")]
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("tasks.service")
     );
     assert_eq!(
@@ -109,6 +118,71 @@ async fn editor_target_choices_remain_draft_until_all_forms_and_exact_yaml_are_c
     finished(&mut fixture.app).await;
     assert_eq!(fixture.bytes(), preview.yaml().as_bytes());
     assert!(!fixture.directory.path().join("history.sqlite3").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_project_custom_service_keyboard_edit_saves_only_confirmed_component() {
+    let mut fixture = Fixture::new().await;
+    let before = fixture.bytes();
+    target_page(&mut fixture.app, "worker");
+    press(&mut fixture.app, KeyCode::Char('b'));
+    press(&mut fixture.app, KeyCode::Char('c'));
+    for (stage, phase) in [(0, "activate"), (3, "stop")] {
+        press(&mut fixture.app, KeyCode::Home);
+        for _ in 0..stage {
+            press(&mut fixture.app, KeyCode::Down);
+        }
+        press(&mut fixture.app, KeyCode::Enter);
+        for value in ["node", "service.cjs", phase] {
+            press(&mut fixture.app, KeyCode::Char('a'));
+            for c in value.chars() {
+                press(&mut fixture.app, KeyCode::Char(c));
+            }
+            press(&mut fixture.app, KeyCode::Enter);
+        }
+        press(&mut fixture.app, KeyCode::Esc);
+        press(&mut fixture.app, KeyCode::Esc);
+    }
+    press(&mut fixture.app, KeyCode::End);
+    press(&mut fixture.app, KeyCode::Enter);
+    press(&mut fixture.app, KeyCode::Enter);
+    assert_eq!(fixture.bytes(), before);
+    for _ in 0..5 {
+        press(&mut fixture.app, KeyCode::Down);
+    }
+    press(&mut fixture.app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut fixture.app, KeyCode::Down);
+    }
+    press(&mut fixture.app, KeyCode::Enter);
+    press(&mut fixture.app, KeyCode::Esc);
+    press(&mut fixture.app, KeyCode::Char('p'));
+    finished(&mut fixture.app).await;
+    let ProjectEditPage::Preview(preview) = screen(&fixture.app).page else {
+        panic!("preview");
+    };
+    let target = &preview.config().environments["production"].components[&name("worker")];
+    assert_eq!(
+        target.service.as_ref().unwrap().start[0],
+        ["node", "service.cjs", "activate"]
+    );
+    assert_eq!(target.generation.get(), 2);
+    assert_eq!(fixture.bytes(), before);
+    press(&mut fixture.app, KeyCode::Char('c'));
+    finished(&mut fixture.app).await;
+    let config::ProjectConfigState::Loaded(saved) = config::load(fixture.directory.path()).unwrap()
+    else {
+        panic!("saved");
+    };
+    assert_eq!(&saved, preview.config());
+    assert_eq!(
+        saved.environments["production"].components[&name("backend")],
+        fixture.original.environments["production"].components[&name("backend")]
+    );
+    assert_eq!(
+        saved.environments["staging"],
+        fixture.original.environments["staging"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

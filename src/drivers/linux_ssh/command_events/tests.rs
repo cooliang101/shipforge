@@ -126,6 +126,7 @@ fn snapshot_is_the_actual_argv_not_shell_rendering_or_output_text() {
     assert_eq!(
         snapshot,
         RecordedCommand {
+            working_directory: None,
             location: CommandLocation::Remote,
             index: None,
             program: "actual-tool".into(),

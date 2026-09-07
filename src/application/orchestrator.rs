@@ -319,6 +319,7 @@ impl<'a> DeploymentOrchestrator<'a> {
             .map(|(index, planned)| {
                 let release = planned_release_ref(planned);
                 Ok(crate::history::DeploymentComponentSnapshot {
+                    target_snapshot: planned.context.target.snapshot(),
                     release: release.clone(),
                     expected_current: planned.plan.expected_current.clone(),
                     target: Some(release),
@@ -1141,14 +1142,15 @@ fn activation_failure(
     let name = &component.planned.context.component;
     match observed {
         Ok(observed) => {
-            if observed.as_ref() == Some(&receipt.release) {
+            if !error.recovery_blocked && observed.as_ref() == Some(&receipt.release) {
                 activated.push(ActivatedComponent {
                     name: name.clone(),
                     previous: component.planned.plan.expected_current.clone(),
                     observed: observed.clone(),
                 });
             }
-            if cancellation.is_cancelled()
+            if !error.recovery_blocked
+                && cancellation.is_cancelled()
                 && (observed.as_ref() == Some(&receipt.release)
                     || observed == component.planned.plan.expected_current)
             {
@@ -1203,6 +1205,7 @@ async fn observe_after_failure(
             },
         });
         Err(DriverError {
+            recovery_blocked: false,
             stage: "observe".into(),
             target: context.component.to_string(),
             message: "post-failure observation timed out".into(),
@@ -1270,6 +1273,7 @@ fn validate_compensation_receipt(
 
 fn contract_driver_error(stage: &str, component: &ComponentName, message: &str) -> DriverError {
     DriverError {
+        recovery_blocked: false,
         stage: stage.into(),
         target: component.to_string(),
         message: message.into(),

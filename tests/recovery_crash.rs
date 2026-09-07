@@ -422,6 +422,7 @@ fn initialize_history(root: &Path, scenario: &Scenario) -> HistoryStore {
         .record_component_snapshots(
             &scenario.deployment,
             &[DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: target.clone(),
                 expected_current: Some(scenario.previous.clone()),
                 target: Some(target.clone()),

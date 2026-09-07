@@ -64,6 +64,7 @@ fn source(store: &HistoryStore) -> (RecoveryReport, DeploymentComponentSnapshot)
     let mut previous = release.clone();
     previous.version = ReleaseVersion::parse("v1").unwrap();
     let snapshot = DeploymentComponentSnapshot {
+        target_snapshot: None,
         release: release.clone(),
         expected_current: Some(previous),
         target: Some(release),

@@ -43,12 +43,14 @@ impl ValidatedDestinationSettings for Settings {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independently injected faults.
 struct FakeState {
     actions: Vec<String>,
     audit_warning: Option<String>,
     current: BTreeMap<ComponentName, ReleaseRef>,
     fail_component: Option<ComponentName>,
     partial_failure: bool,
+    service_outcome_unknown: bool,
     fail_compensation: Option<ComponentName>,
     cancel_after: Option<ComponentName>,
     cancel_on_error: bool,
@@ -67,6 +69,7 @@ struct FakeDriver {
 impl FakeDriver {
     fn error(component: &ComponentName) -> DriverError {
         DriverError {
+            recovery_blocked: false,
             stage: "rollback".into(),
             target: component.to_string(),
             message: "injected failure".into(),
@@ -208,7 +211,9 @@ impl DeploymentDriver for FakeDriver {
             if state.cancel_on_error {
                 self.cancellation.cancel();
             }
-            return Err(Self::error(&context.component));
+            let mut error = Self::error(&context.component);
+            error.recovery_blocked = state.service_outcome_unknown;
+            return Err(error);
         }
         if let Some(target) = target {
             state
@@ -491,6 +496,38 @@ async fn compensation_failure_retains_manual_action() {
 }
 
 #[tokio::test]
+async fn unknown_rollback_service_result_blocks_compensation_of_that_component() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_component = Some(ComponentName::parse("api").unwrap());
+        state.partial_failure = true;
+        state.service_outcome_unknown = true;
+        state.cancel_on_error = true;
+    }
+    let report = fixture.rollback().await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert_eq!(
+        fixture.actions(),
+        [
+            "rollback:worker->not_deployed",
+            "rollback:api->v2",
+            "rollback:worker->v3"
+        ]
+    );
+    assert!(matches!(
+        report.failure,
+        Some(DeploymentFailure::Driver {
+            error: DriverError {
+                recovery_blocked: true,
+                ..
+            },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn cancellation_after_one_change_compensates_with_fresh_context() {
     let fixture = Fixture::new();
     fixture.state.lock().unwrap().cancel_after = Some(ComponentName::parse("worker").unwrap());
@@ -686,6 +723,7 @@ async fn frozen_rollback_refs_execution_order_and_evidence_survive_reopen() {
         .rev()
         .enumerate()
         .map(|(index, component)| DeploymentComponentSnapshot {
+            target_snapshot: None,
             release: component
                 .target
                 .as_ref()

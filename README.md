@@ -10,7 +10,7 @@ M1's safe deployment loop and M2's history/recovery management have passed their
 
 An early real SSH connection timeout and a separate unknown current observation remain unexplained despite passing subsequent tests; a common cause is unproven. Their evidence and diagnostics are retained for platform validation, not treated as resolved by the TUI changes.
 
-The next development package is [SVC-01: remote Service Commands and the systemd preset](docs/roadmap.md#svc-01远端服务命令基础与-systemd-预设), before QA-02 and final release gates. Custom commands are required for the MVP; systemd must become a preset over the shared execution mechanism. The current binary still supports only dedicated systemd service operations, not configurable PM2/restart commands. Remote dependency installation is excluded. Existing acceptance evidence covers the earlier scope, not this pending change.
+Configurable remote Service Commands and the systemd preset now share one executor: first start, update, restore, stop and optional read-only checks are set per Component in the TUI. PM2 can be managed by project-provided argv/scripts; the actual process must use the selected version directory. Schema 1 projects require a TUI-confirmed upgrade to schema 2 before deployment. See [configuration](docs/configuration-guide.md) and [SVC-01 validation](docs/validation/svc-01.md). Remote dependency installation is excluded; QA-02 and final release gates remain outstanding.
 
 ## Run locally
 
@@ -20,7 +20,7 @@ Use an interactive Windows terminal with ConPTY support and the existing Rust/Mi
 cargo run
 ```
 
-All user operations are inside the TUI; there are no deployment subcommands. Select a project directory, confirm discovered Components or add one manually, and select an SSH connection and key. Use `F1` for help and `F4` to search supported candidate lists. Each Component can browse/select its own remote directory and optional service. Confirm the YAML preview to save `shipforge.yaml` in the project root; saving does not deploy. Never put secrets or private-key paths in that file. The target needs standard Linux SSH/SFTP and deployment tools, plus systemd or curl when configured; it does not need a ShipForge daemon.
+All user operations are inside the TUI; there are no deployment subcommands. Select a project directory, confirm discovered Components or add one manually, and select an SSH connection and key. Use `F1` for help and `F4` to search supported candidate lists. Each Component can browse/select its own remote directory and optional service. Confirm the YAML preview to save `shipforge.yaml` in the project root; saving does not deploy. Never put secrets or private-key paths in that file. The target needs standard Linux SSH/SFTP and deployment tools, plus each configured service runtime/tool (such as Node/PM2), systemd or curl; it does not need a ShipForge daemon.
 
 During execution or from history details, `l` opens logs: `/` searches retained files, `f`/`t` filters Components/steps, `p` shows progress, and `e`/`s` previews log/summary export before confirmation. `y` requests copying recorded, redacted failed argv as diagnostic JSON; terminal clipboard permission is required and delivery is not acknowledged. While work is active, `q` opens an exit confirmation: `Esc` or `r` returns, while `c` or `Ctrl+C` cancels and waits for a safe boundary before restoring the terminal. See the [TUI guide](docs/tui-guide.md) for scope and limits.
 

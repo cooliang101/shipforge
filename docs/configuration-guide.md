@@ -2,7 +2,7 @@
 
 本文是 ShipForge 项目配置的唯一规范入口。MVP 只允许通过 TUI 创建和修改配置；AI Agent 调用、AI Agent 直接编辑和自动化接口全部冻结，不设计入口、协议或兼容层。SSH Agent 只是 SSH 密钥签名方式，不属于 AI Agent 功能。
 
-**实现状态**：下文的字段和示例描述当前可用格式，目前服务操作仅支持 `systemd`。自定义远端服务命令已列为 MVP 必需能力，下一工作包 `SVC-01` 将统一实现；不要提前向当前 YAML 写入规划字段。
+**配置版本**：当前规范为 `schemaVersion: 2`。远端服务统一使用 `service` 命令计划，systemd 是预填这套配置的内置选项；无服务的静态内容可省略 `service`。配置编辑与部署分别确认。
 
 ## 配置边界
 
@@ -37,19 +37,51 @@ MVP 中用户只选择 SSH 连接，不选择 Driver。TUI 根据连接记录自
 4. 只询问无法从仓库、SSH config、Destination 注册表或远端探测确定的信息，不猜测生产基础设施。
 5. 生成固定格式的最小配置，再通过 TUI 预览部署计划。
 
-## 下一开发：服务命令与内置预设
+## 服务命令与内置预设
 
-- 服务配置继续属于每个 Environment/Component，由 TUI 保存到项目根目录；共用 SSH 不代表共用重启命令，不移入 Destination 注册表或本地 `build`。
-- TUI 将提供“不管理服务 / 自定义命令 / systemd 预设”；systemd 选择 unit 后填充命令与检查规则，与自定义方式使用同一执行机制，不要求用户选择 Driver。
-- 覆盖首次启动、更新、恢复旧版本和恢复未部署状态时停止；可复用命令以减少填写，实际程序、参数、阶段、版本工作目录及可选检查在执行前预览。自定义命令使用 argv，不新增 Shell 字符串格式。
-- 可选只读命令检查支持无 HTTP 接口的自定义服务；systemd 预设仍保留稳定性检查，HTTP 检查保持可选。自定义配置不得隐式附加 systemd 检查。
-- `SVC-01` 同时交付唯一配置格式、现有 `systemd` 配置的 TUI 确认转换、历史依据校验与往返测试；读取和校验不自动改文件，不新增永久别名或双格式。
-- 远端依赖安装暂不包含；现有本地构建、`artifact` 和唯一 Release 规则不变。具体开发顺序与验收见 [路线图](roadmap.md#svc-01远端服务命令基础与-systemd-预设)。
+服务配置属于每个 Environment/Component；共用 SSH 不共用服务命令。目标选择页提供不管理服务、systemd unit 候选和自定义命令；按 `c` 编辑逐阶段的程序与参数。systemd 选择 unit 后自动生成下文配置，无需填写预设 ID。
+
+| `service` 字段 | 规则与工作目录 |
+| --- | --- |
+| `start` | 必填，首次部署；在新 `releases/<version>` 目录执行 |
+| `update` | 可省略或为空，复用 `start`；在新版本目录执行 |
+| `restore` | 可省略或为空，复用有效的 `update`；在恢复的旧版本目录执行 |
+| `stop` | 必填，恢复未部署状态时停止；在刚移除 current 对应的版本目录执行 |
+| `check` | 可省略；`kind: command` 加单个 `argv`，或 systemd 预设的 `kind: systemd` 加完整 `unit` |
+
+四种动作均为按顺序执行的 argv 数组列表。单动作最多 16 条命令，每条含程序最多 128 项、每项最多 4 KiB，整套命令最多 16 KiB。每个服务动作共享 120 秒上限，补偿中的服务动作也有独立 120 秒预算（不含此前目录校验和链接恢复）；有副作用命令不自动重试。命令没有已知退出结果时，该 Component 停止自动恢复并要求人工核实，观察到 current 不代表服务已完成。
+
+命令检查必须只读：在 `root/current` 执行，退出码 0 通过；最多 5 次、间隔 1 秒、单次 10 秒。systemd 检查保留 active/NRestarts 的 10 秒稳定窗口。配置了 HTTP 时也必须通过；未配置检查不代表执行了健康探测。
+
+不接收 Shell 字符串；需要流程判断时将受信任脚本放进构建输出，用 `[node, service.cjs, activate]` 或 `[sh, service.sh, activate]` 调用，不用 `sh -c`。脚本须自行管理该组件的服务、提供幂等停止/恢复，不修改 ShipForge 元数据。运行时和权限需在服务器预先配置，ShipForge 不自动安装依赖或提权。程序名/绝对程序路径在预检检查；随 Release 提供的相对脚本在实际执行时校验，预检不试运行服务。
+
+PM2 可使用自定义 argv，复杂启动/替换逻辑可交给项目脚本。不能把 `pm2 restart <name>` 的成功等同于新版本生效：它可能保留旧的程序路径。脚本必须将 PM2 的程序路径和 cwd 指向本次实际版本，停止仅处理本 Component 的唯一进程名；只读检查应验证目标进程与版本，不使用 `restart` 充当检查。无端口 Worker 同样适用。
+
+例如项目自带 `service.cjs`（负责 PM2 的 activate/stop）与只读 `check.cjs` 时，TUI 可生成以下目标片段；脚本不是 ShipForge 内置命令，必须包含在 `artifact` 中：
+
+```yaml
+service:
+  start:
+    - [node, service.cjs, activate]
+  stop:
+    - [node, service.cjs, stop]
+  check:
+    kind: command
+    argv: [node, check.cjs]
+```
+
+这里更新和恢复复用 activate；脚本应从自己的版本目录加载程序。不要在参数中填写秘密：可识别的密码/Token 参数会被拒绝，但不能保证发现任意位置的秘密。需要凭据时使用服务器既有安全配置。
+
+## 旧配置与历史
+
+schema 1 仅作为一次性读取转换入口：旧 `systemd` 在内存中转换为相同命令计划，TUI 打开配置编辑器，按 `p` 预览、`c` 确认后写入 schema 2；确认前不能部署。读取本身不改文件，等价转换保留身份、root 和 generation。schema 2 不接受旧 `systemd` 字段，也不接受字符串服务配置。
+
+新部署冻结非秘密目标命令与检查快照。历史缺少服务快照时不借当前配置补造回滚命令，需人工恢复；文件型旧历史仍按原有身份和版本证据判断。命令或检查变更增加 generation，旧 generation 不自动接管。历史 JSON 增加可选快照和命令 cwd，旧记录仍可读取；旧版本程序不能保证读取新记录，降级前保留备份。
 
 ## 当前实现的唯一配置格式
 
 ```yaml
-schemaVersion: 1
+schemaVersion: 2
 _shipforge:
   projectId: prj_01J8MALL4Y2K6M7P
   environments:
@@ -90,11 +122,25 @@ environments:
         to: dst_00000000000000000000000000000001
       backend:
         to: dst_00000000000000000000000000000002
-        systemd: mall-api.service
+        service:
+          start:
+            - [systemctl, restart, --, mall-api.service]
+          stop:
+            - [systemctl, stop, --, mall-api.service]
+          check:
+            kind: systemd
+            unit: mall-api.service
         health: http://127.0.0.1:8080/health
       worker:
         to: dst_00000000000000000000000000000002
-        systemd: mall-worker.service
+        service:
+          start:
+            - [systemctl, restart, --, mall-worker.service]
+          stop:
+            - [systemctl, stop, --, mall-worker.service]
+          check:
+            kind: systemd
+            unit: mall-worker.service
         after: [backend]
 ```
 
@@ -108,8 +154,8 @@ environments:
 - Project、Environment、Component 使用配置名称；Destination 在项目 YAML 中只使用系统 ID，TUI 自动显示 `user@host:port` 摘要。
 - 未配置 `root` 时，首次创建使用 `/srv/shipforge/<project>/<environment>/<component>`，并将结果固化到 `_shipforge.resolvedRoot`；名称变化不自动移动远端目录。
 - 同一 Destination 上不同 Component 的 root 不得相同或相互嵌套。
-- `systemd` 使用完整 `.service` unit 名，并自动增加一项必需的远端 systemd 稳定性检查。MVP 采用内置的 10 秒稳定窗口、1 秒间隔、5 次就绪尝试和单次 10 秒命令超时，不要求用户填写这些参数。
-- URL 形式的 `health` 是必需的 Destination 端 HTTP 检查；仅接受长度受限、无凭据和 fragment 的 `http://` 或 `https://` URL。检查由 Destination 上的 `curl` 发起且只接受 2xx；无外部接口的服务使用 systemd 稳定性检查。
+- systemd 预设使用完整 `.service` unit 名，填充 start/stop 和必需的 `service.check` 稳定性检查；更新与恢复默认复用 start，无需重复填写。
+- URL 形式的 `health` 是必需的 Destination 端 HTTP 检查；仅接受长度受限、无凭据和 fragment 的 `http://` 或 `https://` URL。检查由 Destination 上的 `curl` 发起且只接受 2xx；无外部接口可用只读命令或 systemd 稳定性检查。
 - `after` 只能引用同一 Environment 中已配置的 Component。它只排列本次同时选中的 Component，不会自动加入依赖项；只部署 `worker` 时，`after: [backend]` 不会部署 `backend`。未知引用、自引用和依赖环均为错误；无依赖项按名称稳定排序。
 - YAML 映射顺序不表示执行顺序；版本格式和失败回滚使用产品默认值。
 - 成功部署后默认保留每个所选 Component 最新 5 个 Release，并额外保护 current、上一健康版本及未结束/待核实操作的引用。无需填写保留数量；计划预览会提示自动清理，证据不足则保留，清理失败只警告、不回滚成功部署。
@@ -124,7 +170,7 @@ environments:
 
 - 修改 Destination 端点时使用 TUI 连接管理页，由系统增加 Destination revision。
 - 选择 SSH Key 只更新用户级凭据引用，不得把 Key 路径复制到项目配置。
-- 通过 TUI 修改某 Component 的 Destination ID 或 root 时，由系统增加该 Environment/Component 的 generation。
+- 通过 TUI 修改某 Component 的 Destination ID、root、服务命令或检查时，由系统增加该 Environment/Component 的 generation。
 - Project 或 Environment 重命名应保留稳定 ID 和已固化 root。
 - 编辑已有目标时，root 留空表示继续使用原固化 root；只有新增目标使用默认 root。要迁移部署目录必须显式填写新 root，并由系统更新 generation。
 - Component 名称就是其配置身份；重命名按删除旧 Component、增加新 Component 处理，不继承旧 Release。

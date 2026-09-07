@@ -891,7 +891,7 @@ mod tests {
         LinuxSshTarget::validate(&crate::drivers::DriverTargetInput {
             value: serde_json::json!({
                 "root": "/srv/shipforge/project/production/api",
-                "systemd": null,
+                "service": null,
                 "health": null
             }),
         })

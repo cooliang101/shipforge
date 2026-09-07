@@ -102,6 +102,7 @@ fn live_text_filter_matches_recorded_argv_without_inferring_a_command_from_outpu
     let mut event = row(1, "failed", Some(scope("backend", "build-package")));
     Arc::make_mut(&mut event.event).kind = LogEventKind::FailedCommand {
         command: RecordedCommand {
+            working_directory: None,
             location: CommandLocation::Local,
             index: Some(2),
             program: "builder".into(),
@@ -148,6 +149,7 @@ fn byte_limit_and_oversized_rows_do_not_silently_truncate_commands() {
     let mut oversized = row(201, "command failed", None);
     Arc::make_mut(&mut oversized.event).kind = LogEventKind::FailedCommand {
         command: RecordedCommand {
+            working_directory: None,
             location: CommandLocation::Local,
             index: Some(1),
             program: "builder".into(),
@@ -164,6 +166,7 @@ fn command_copy_source_is_only_the_selected_recorded_snapshot() {
     view.push(row(1, "try running old-command --secret value", None));
     assert!(view.failed_command().is_none());
     let command = RecordedCommand {
+        working_directory: None,
         location: CommandLocation::Local,
         index: Some(2),
         program: "builder".into(),
@@ -208,6 +211,7 @@ fn empty_arguments_and_excess_string_capacity_cannot_bypass_the_budget() {
     let mut oversized = row(1, "failed", None);
     Arc::make_mut(&mut oversized.event).kind = LogEventKind::FailedCommand {
         command: RecordedCommand {
+            working_directory: None,
             location: CommandLocation::Local,
             index: Some(1),
             program: "builder".into(),

@@ -35,6 +35,7 @@ fn start(store: &HistoryStore, release: &ReleaseRef) -> DeploymentId {
         .record_component_snapshots(
             &id,
             &[DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: release.clone(),
                 target: Some(release.clone()),
                 expected_current: Some(previous),
@@ -260,6 +261,7 @@ fn rollback_absence_sentinel_is_not_invented_as_a_release() {
         .record_component_snapshots(
             &id,
             &[DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: release.clone(),
                 expected_current: Some(release.clone()),
                 target: None,

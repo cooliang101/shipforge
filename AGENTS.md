@@ -34,7 +34,7 @@ Use `ratatui` with the `crossterm` backend and buffered, off-screen rendering. K
 
 Follow `docs/configuration-guide.md`. Configuration is TUI-managed: do not add Agent editing, alternate YAML forms, locks, or user-facing Driver fields. Preserve `_shipforge`; `artifact` is build output and `Release` is the sole versioned `tar.gz` product. Never store secrets in `shipforge.yaml`; validate Host Keys and keep argv separate from Shell text. Follow `docs/architecture.md` for history, evidence, retention, and unknown-result rules.
 
-Remote service commands are an MVP requirement; systemd is a preset over the shared command mechanism, not a separate execution path. Keep commands per Environment/Component, not in shared SSH connections or local builds. Follow the roadmap's next-work-package priority; planned fields are not supported until configuration, TUI, execution, and recovery tests land together.
+Remote service commands use canonical schema 2; systemd is a preset over the shared executor. Keep commands per Environment/Component, not in shared SSH connections or local builds. Freeze recovery settings; never reconstruct missing historical commands or issue competing compensation after an unknown service outcome.
 
 ## Commit & Pull Request Guidelines
 

@@ -181,6 +181,7 @@ impl DeploymentDriver for FakeDriver {
         {
             std::fs::write(path, PROJECT.replace("generation: 1", "generation: 2")).unwrap();
             return Err(DriverError {
+                recovery_blocked: false,
                 stage: "activate".into(),
                 target: context.component.to_string(),
                 message: "injected failure after activation".into(),

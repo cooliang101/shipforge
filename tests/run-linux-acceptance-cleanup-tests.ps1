@@ -125,6 +125,9 @@ $script:nativeCalls.Clear()
 Invoke-FixtureCase -Case 'fixture_case'
 Assert-Cleanup ($script:nativeCalls.Count -eq 2) 'Exactly one discovered case must execute once'
 Assert-Cleanup ($script:nativeCalls[0].Timeout -eq 600000 -and $script:nativeCalls[1].Timeout -eq 300000) 'Cargo discovery and execution must have practical independent deadlines'
+$script:nativeCalls.Clear()
+Invoke-FixtureCase -Case 'fixture_case' -ExecutionTimeoutMilliseconds 660000
+Assert-Cleanup ($script:nativeCalls.Count -eq 2 -and $script:nativeCalls[1].Timeout -eq 660000) 'Explicit lifecycle budget must cover its ten-minute inner test without removing the outer deadline'
 $script:nativeRunExit = 7
 $failedCaseRejected = $false
 try { Invoke-FixtureCase -Case 'fixture_case' } catch { $failedCaseRejected = $true }
@@ -183,7 +186,7 @@ $suiteConditions = @($caseInitialization.Parent.Statements | Where-Object {
     $_ -is [System.Management.Automation.Language.IfStatementAst] -and
         $_.Clauses[0].Item1.Extent.Text -match '^\$Suite '
 })
-Assert-Cleanup ($suiteConditions.Count -eq 5) 'Expected four acceptance routes and one diagnostic route'
+Assert-Cleanup ($suiteConditions.Count -eq 6) 'Expected four default acceptance routes, explicit service commands and one diagnostic route'
 $selection = [scriptblock]::Create((@($caseInitialization.Extent.Text) + @($suiteConditions | ForEach-Object { $_.Extent.Text })) -join "`n")
 $Suite = 'All'
 . ([scriptblock]::Create($releaseGateInitialization.Extent.Text))
@@ -200,6 +203,11 @@ $Suite = 'ConnectionStability'
 . $selection
 Assert-Cleanup ($cases.Count -eq 1 -and $cases[0] -eq 'connection_stability::real_linux_fresh_connection_drop_stability') 'Diagnostic suite must select only its exact ignored case'
 Assert-Cleanup (-not $runReleaseGate) 'ConnectionStability must not select the release gate'
+$Suite = 'ServiceCommands'
+. ([scriptblock]::Create($releaseGateInitialization.Extent.Text))
+. $selection
+Assert-Cleanup ($cases.Count -eq 1 -and $cases[0] -eq 'service_commands::real_pm2_versions_failure_recovery_and_component_isolation') 'ServiceCommands must select only the PM2 lifecycle case'
+Assert-Cleanup (-not $runReleaseGate) 'ServiceCommands must not add an SSH Agent release gate'
 $Suite = 'ReleaseGate'
 . ([scriptblock]::Create($releaseGateInitialization.Extent.Text))
 . $selection

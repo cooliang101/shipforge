@@ -12,6 +12,7 @@ pub(super) fn driver_event(events: &dyn EventSink, operation: &str) {
         scope: None,
         kind: LogEventKind::FailedCommand {
             command: RecordedCommand {
+                working_directory: None,
                 location: CommandLocation::Remote,
                 index: None,
                 program: "fixture".into(),

@@ -30,6 +30,7 @@ fn clipboard_consumes_only_the_selected_frozen_failed_command() {
     .unwrap();
     let mut workspace = LogWorkspace::new(None, temp.path().to_path_buf());
     let command = crate::telemetry::log_record::RecordedCommand {
+        working_directory: None,
         location: crate::telemetry::log_record::CommandLocation::Local,
         index: Some(2),
         program: "old-build".into(),
@@ -310,6 +311,7 @@ fn long_failed_argv_detail_is_scrollable_to_its_actual_last_argument() {
         .collect();
     args.push("TAIL_RECORDED_ARGV_NOT_CURRENT_YAML".into());
     let command = crate::telemetry::log_record::RecordedCommand {
+        working_directory: None,
         location: crate::telemetry::log_record::CommandLocation::Local,
         index: Some(2),
         program: "frozen-build".into(),

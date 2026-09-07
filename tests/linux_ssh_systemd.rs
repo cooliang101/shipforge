@@ -601,7 +601,7 @@ fn project_setup(destination: &DestinationKey, run_id: &str) -> ProjectSetup {
             TargetSetup {
                 destination: destination.clone(),
                 root: Some(format!("{}/{name}", remote_base(run_id))),
-                systemd: Some(unit_name(run_id, name)),
+                service: Some(unit_name(run_id, name).into()),
                 health: None,
                 after: Vec::new(),
             },

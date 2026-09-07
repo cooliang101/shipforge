@@ -4,6 +4,7 @@ mod credentials;
 mod destinations;
 mod model;
 mod reinitialize;
+mod service;
 mod setup;
 mod topology;
 
@@ -29,6 +30,7 @@ pub use model::{
 };
 use model::{ManagedEnvironment, RawEnvironment, RawProjectConfig};
 pub(crate) use reinitialize::reinitialize_setup;
+pub use service::{ServiceAction, ServiceCheck, ServiceConfig};
 pub use setup::{
     ComponentSetup, EnvironmentRename, EnvironmentSetup, PreparedProjectInitialization,
     PreparedProjectUpdate, ProjectSetup, ReinitializeConfirmation, TargetSetup,
@@ -52,8 +54,14 @@ pub enum ConfigError {
         path: PathBuf,
         source: serde_yaml_ng::Error,
     },
-    #[error("unsupported schemaVersion {0}; expected 1")]
+    #[error("unsupported schemaVersion {0}; expected 2 (version 1 requires confirmed conversion)")]
     SchemaVersion(u32),
+    #[error("Environment `{environment}` Component `{component}` service configuration: {message}")]
+    Service {
+        environment: String,
+        component: ComponentName,
+        message: &'static str,
+    },
     #[error("invalid {field} name `{value}`; use lowercase letters, digits, or single hyphens")]
     InvalidName { field: &'static str, value: String },
     #[error("_shipforge is missing or inconsistent: {0}")]
@@ -180,7 +188,7 @@ pub(crate) fn parse_contents(
 }
 
 fn normalize(raw: RawProjectConfig) -> Result<ProjectConfig, ConfigError> {
-    if raw.schema_version != 1 {
+    if !matches!(raw.schema_version, 1 | 2) {
         return Err(ConfigError::SchemaVersion(raw.schema_version));
     }
     validate_name("Project", &raw.project)?;
@@ -227,6 +235,7 @@ fn normalize(raw: RawProjectConfig) -> Result<ProjectConfig, ConfigError> {
                 environment,
                 managed_environment,
                 &component_names,
+                raw.schema_version,
             )?,
         );
     }
@@ -245,9 +254,29 @@ fn normalize_environment(
     environment: &RawEnvironment,
     managed: &ManagedEnvironment,
     project_components: &BTreeSet<ComponentName>,
+    schema_version: u32,
 ) -> Result<EnvironmentConfig, ConfigError> {
     let mut targets = BTreeMap::new();
     for (component_name, target) in &environment.components {
+        let service_error = |message| ConfigError::Service {
+            environment: environment_name.into(),
+            component: component_name.clone(),
+            message,
+        };
+        if (schema_version == 2 && target.systemd.is_some())
+            || (schema_version == 1 && target.service.is_some())
+        {
+            return Err(service_error(
+                "Use the canonical service format for this schema version.",
+            ));
+        }
+        let service = target
+            .service
+            .clone()
+            .or_else(|| target.systemd.clone().map(ServiceConfig::systemd));
+        if let Some(service) = &service {
+            service.validate().map_err(service_error)?;
+        }
         if !project_components.contains(component_name) {
             return Err(ConfigError::ManagedState(format!(
                 "Environment `{environment_name}` references undefined Component `{component_name}`"
@@ -291,7 +320,7 @@ fn normalize_environment(
                 destination: target.destination.clone(),
                 generation: managed_component.generation,
                 root,
-                systemd: target.systemd.clone(),
+                service,
                 health: target.health.clone(),
                 after,
             },

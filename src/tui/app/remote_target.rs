@@ -1,6 +1,7 @@
 //! Shared, draft-only target selection for first setup and the project editor.
 
 mod render;
+mod service_editor;
 #[cfg(test)]
 mod tests;
 mod worker;
@@ -27,6 +28,7 @@ enum Origin {
 #[derive(Clone, Debug)]
 enum Page {
     Services,
+    CommandEditor(service_editor::ServiceEditor),
     Directories {
         candidates: RemoteDirectoryCandidates,
         cursor: usize,
@@ -67,6 +69,7 @@ pub(in crate::tui) struct RemoteSetupSelectionState {
     pub(super) root: String,
     pub(super) root_state: Option<SetupRootState>,
     pub(super) systemd_units: Vec<String>,
+    custom_service: Option<crate::config::ServiceConfig>,
     pub(super) cursor: usize,
     notices: Vec<String>,
     page: Page,
@@ -94,7 +97,7 @@ impl RemoteSetupSelectionState {
         project: String,
         environment: String,
         root: String,
-        service: Option<String>,
+        service: Option<crate::config::ServiceConfig>,
     ) -> Self {
         Self {
             origin,
@@ -104,7 +107,13 @@ impl RemoteSetupSelectionState {
             environment,
             root,
             root_state: None,
-            systemd_units: service.into_iter().collect(),
+            systemd_units: service
+                .as_ref()
+                .and_then(crate::config::ServiceConfig::preset_unit)
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            custom_service: service.filter(|service| service.preset_unit().is_none()),
             cursor: 0,
             notices: Vec::new(),
             page: Page::Services,
@@ -113,15 +122,23 @@ impl RemoteSetupSelectionState {
     }
 
     fn with_original_service(mut self) -> Self {
-        self.cursor = usize::from(!self.systemd_units.is_empty());
+        self.cursor = if self.custom_service.is_some() {
+            self.systemd_units.len() + 1
+        } else {
+            usize::from(!self.systemd_units.is_empty())
+        };
         self
     }
 
-    fn service(&self) -> Option<String> {
+    fn service(&self) -> Option<crate::config::ServiceConfig> {
+        if self.cursor == self.systemd_units.len() + 1 {
+            return self.custom_service.clone();
+        }
         self.cursor
             .checked_sub(1)
             .and_then(|index| self.systemd_units.get(index))
             .cloned()
+            .map(crate::config::ServiceConfig::systemd)
     }
 
     fn adopt_probe(&mut self, candidates: RemoteSetupCandidates) -> bool {
@@ -131,10 +148,15 @@ impl RemoteSetupSelectionState {
             return false;
         }
         let selected = self.service();
+        let custom_selected = self.cursor == self.systemd_units.len() + 1;
         self.root_state = Some(candidates.root);
         self.systemd_units = candidates.services;
         self.notices = candidates.notices;
-        if let Some(service) = selected {
+        if custom_selected {
+            self.cursor = self.systemd_units.len() + 1;
+        } else if let Some(service) =
+            selected.and_then(|service| service.preset_unit().map(str::to_owned))
+        {
             if !self.systemd_units.contains(&service) {
                 self.systemd_units.push(service.clone());
             }
@@ -166,7 +188,7 @@ impl RemoteSetupSelectionState {
                         self.component,
                         ComponentTargetSettings {
                             root: Some(self.root),
-                            systemd: service,
+                            service,
                         },
                     );
                 }
@@ -183,6 +205,7 @@ impl RemoteSetupSelectionState {
 
     pub(in crate::tui) fn requires_plain_confirmation(&self) -> bool {
         !matches!(self.page, Page::Text { .. })
+            && !matches!(&self.page, Page::CommandEditor(editor) if editor.is_text())
     }
 
     pub(super) fn search_choices(&self) -> Option<ChoiceSet> {
@@ -195,8 +218,12 @@ impl RemoteSetupSelectionState {
                         .enumerate()
                         .map(|(i, unit)| (i + 1, unit.clone())),
                 );
+                items.push((
+                    self.systemd_units.len() + 1,
+                    "Custom remote commands".into(),
+                ));
                 (
-                    "systemd services",
+                    "service commands and presets",
                     items,
                     self.cursor,
                     "Use v to inspect services or m to enter a unit; service management is optional.",
@@ -225,7 +252,7 @@ impl RemoteSetupSelectionState {
 
     pub(super) fn focus_search_choice(&mut self, index: usize) {
         match &mut self.page {
-            Page::Services if index <= self.systemd_units.len() => self.cursor = index,
+            Page::Services if index <= self.systemd_units.len() + 1 => self.cursor = index,
             Page::Directories { candidates, cursor } if index < candidates.directories.len() => {
                 *cursor = index;
             }
@@ -271,7 +298,7 @@ impl App {
             project,
             "production".into(),
             root,
-            settings.systemd,
+            settings.service,
         );
         if let Some(candidates) = candidates
             && !screen.adopt_probe(candidates)
@@ -291,6 +318,20 @@ impl App {
         }
         let action = match screen.page.clone() {
             Page::Services => self.remote_service_key(key.code, &mut screen),
+            Page::CommandEditor(mut editor) => {
+                match editor.handle(key.code) {
+                    service_editor::EditResult::Apply(service) => {
+                        screen.custom_service = Some(service);
+                        screen.cursor = screen.systemd_units.len() + 1;
+                        screen.page = Page::Services;
+                    }
+                    service_editor::EditResult::Discard => screen.page = Page::Services,
+                    service_editor::EditResult::Editing => {
+                        screen.page = Page::CommandEditor(editor);
+                    }
+                }
+                Action::Stay
+            }
             Page::Directories { candidates, cursor } => {
                 self.remote_directory_key(key.code, &mut screen, candidates, cursor)
             }
@@ -339,6 +380,12 @@ impl App {
         match key {
             KeyCode::Esc => return Action::Back(false),
             KeyCode::Enter => {
+                if screen.cursor == screen.systemd_units.len() + 1
+                    && screen.custom_service.is_none()
+                {
+                    screen.page = Page::CommandEditor(service_editor::ServiceEditor::new(None));
+                    return Action::Stay;
+                }
                 if valid_path(&screen.root, false) {
                     return Action::Back(true);
                 }
@@ -346,13 +393,13 @@ impl App {
             }
             KeyCode::Up => screen.cursor = screen.cursor.saturating_sub(1),
             KeyCode::Down => {
-                screen.cursor = (screen.cursor + 1).min(screen.systemd_units.len());
+                screen.cursor = (screen.cursor + 1).min(screen.systemd_units.len() + 1);
             }
             KeyCode::Home => screen.cursor = 0,
-            KeyCode::End => screen.cursor = screen.systemd_units.len(),
+            KeyCode::End => screen.cursor = screen.systemd_units.len() + 1,
             KeyCode::PageUp => screen.cursor = screen.cursor.saturating_sub(10),
             KeyCode::PageDown => {
-                screen.cursor = (screen.cursor + 10).min(screen.systemd_units.len());
+                screen.cursor = (screen.cursor + 10).min(screen.systemd_units.len() + 1);
             }
             KeyCode::Char('r') => {
                 screen.page = Page::Text {
@@ -364,11 +411,20 @@ impl App {
             KeyCode::Char('m') => {
                 screen.page = Page::Text {
                     field: TextField::Service,
-                    value: screen.service().unwrap_or_default(),
+                    value: screen
+                        .service()
+                        .as_ref()
+                        .and_then(crate::config::ServiceConfig::preset_unit)
+                        .unwrap_or_default()
+                        .into(),
                     offset: 0,
                 }
             }
             KeyCode::Char('v') => return Action::Read(worker::Request::Inspect),
+            KeyCode::Char('c') => {
+                screen.page =
+                    Page::CommandEditor(service_editor::ServiceEditor::new(screen.service()));
+            }
             // Browsing starts at an existing navigation root, not a suggested deployment root.
             KeyCode::Char('b') => return Action::Read(worker::Request::Browse("/".into())),
             _ => {}

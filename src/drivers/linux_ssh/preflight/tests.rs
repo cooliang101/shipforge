@@ -89,7 +89,7 @@ fn responses() -> Vec<RemoteCommandOutput> {
 
 fn target(systemd: Option<&str>, health: Option<&str>) -> LinuxSshTarget {
     LinuxSshTarget::validate(&DriverTargetInput {
-        value: serde_json::json!({"root": "/srv/app", "systemd": systemd, "health": health}),
+        value: serde_json::json!({"root": "/srv/app", "service": systemd.map(crate::config::ServiceConfig::systemd), "health": health}),
     })
     .unwrap()
 }
@@ -105,6 +105,34 @@ async fn check(
         &CancellationToken::new(),
     )
     .await
+}
+
+#[tokio::test]
+async fn custom_service_probes_only_executable_availability_without_systemd_or_mutation() {
+    let service = crate::config::ServiceConfig {
+        start: vec![vec!["node".into(), "service.cjs".into(), "activate".into()]],
+        stop: vec![vec!["pm2".into(), "delete".into(), "api".into()]],
+        update: Vec::new(),
+        restore: Vec::new(),
+        check: Some(crate::config::ServiceCheck::Command {
+            argv: vec!["node".into(), "check.cjs".into()],
+        }),
+    };
+    let mut target = target(None, None);
+    target.service = Some(service);
+    let remote = FakeRemote::new(responses());
+    check(&remote, &target).await.unwrap();
+    {
+        let commands = remote.commands.lock().unwrap();
+        assert!(commands[0].contains("'node'") && commands[0].contains("'pm2'"));
+        assert!(!commands.iter().any(|line| line.contains("systemctl")
+            || line.contains("service.cjs")
+            || line.contains("'delete'")));
+    }
+    let mut remote = FakeRemote::new(responses());
+    remote.missing_tool = Some("node");
+    assert!(check(&remote, &target).await.is_err());
+    assert_eq!(remote.commands.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

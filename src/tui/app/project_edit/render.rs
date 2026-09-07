@@ -426,8 +426,13 @@ impl ProjectEditScreen {
             format!("Connection: {destination}"),
             format!("Remote root: {root}"),
             format!(
-                "Systemd: {}",
-                form.target.systemd.as_deref().unwrap_or("none")
+                "Service: {}",
+                form.target
+                    .service
+                    .as_ref()
+                    .map_or("none", |service| service
+                        .preset_unit()
+                        .unwrap_or("custom commands (b to configure)"))
             ),
             format!(
                 "Health URL: {}",

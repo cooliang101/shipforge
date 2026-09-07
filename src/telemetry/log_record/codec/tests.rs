@@ -100,10 +100,59 @@ fn long_multibyte_output_is_complete_scoped_and_bounded_after_splitting() {
 }
 
 #[test]
+fn command_working_directory_is_bounded_redacted_and_optional_in_legacy_records() {
+    let mut record = LogRecord {
+        version: LOG_RECORD_VERSION,
+        elapsed_ms: 1,
+        fragment: None,
+        event: event("failed"),
+    };
+    record.event.kind = LogEventKind::FailedCommand {
+        command: RecordedCommand {
+            location: CommandLocation::Remote,
+            index: None,
+            program: "node".into(),
+            args: vec!["service.cjs".into()],
+            working_directory: Some("/srv/PRIVATE/releases/v1".into()),
+        },
+    };
+    let redactor = Redactor::new(["PRIVATE".into()]);
+    let encoded = encode_log_record(&record, &redactor).unwrap();
+    assert!(!encoded.contains("PRIVATE"));
+    let decoded = decode_log_record(encoded.as_bytes(), &redactor).unwrap();
+    let LogEventKind::FailedCommand { command } = decoded.event.kind else {
+        panic!();
+    };
+    assert_eq!(
+        command.working_directory.as_deref(),
+        Some("/srv/[REDACTED]/releases/v1")
+    );
+    let LogEventKind::FailedCommand { command } = &mut record.event.kind else {
+        panic!();
+    };
+    command.working_directory = None;
+    let encoded = encode_log_record(&record, &redactor).unwrap();
+    assert!(!encoded.contains("working_directory"));
+    assert!(decode_log_record(encoded.as_bytes(), &redactor).is_ok());
+    let LogEventKind::FailedCommand { command } = &mut record.event.kind else {
+        panic!();
+    };
+    command.working_directory = Some("x".repeat(20 * 1024));
+    let encoded = encode_log_record(&record, &redactor).unwrap();
+    let safe = decode_log_record(encoded.as_bytes(), &redactor).unwrap();
+    assert!(matches!(
+        safe.event.kind,
+        LogEventKind::CommandUnavailable { .. }
+    ));
+    assert!(!encoded.contains(&"x".repeat(100)));
+}
+
+#[test]
 fn named_command_secrets_are_masked_and_oversized_snapshots_are_unavailable() {
     let mut original = event("failed");
     original.kind = LogEventKind::FailedCommand {
         command: RecordedCommand {
+            working_directory: None,
             location: super::super::CommandLocation::Local,
             index: Some(2),
             program: "tool".into(),
@@ -242,6 +291,7 @@ fn hidden_controls_in_named_flags_and_sensitive_component_identity_do_not_leak()
         crate::domain::ComponentName::parse("token").unwrap();
     original.kind = LogEventKind::FailedCommand {
         command: RecordedCommand {
+            working_directory: None,
             location: CommandLocation::Local,
             index: Some(1),
             program: "tool".into(),

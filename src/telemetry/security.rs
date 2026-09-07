@@ -113,6 +113,7 @@ pub struct CommandSpec {
     pub program: String,
     pub args: Vec<CommandArgument>,
     pub shell: bool,
+    pub working_directory: Option<String>,
 }
 
 impl CommandSpec {
@@ -152,6 +153,7 @@ impl CommandSpec {
             scope: None,
             kind: LogEventKind::FailedCommand {
                 command: RecordedCommand {
+                    working_directory: self.working_directory.clone(),
                     location,
                     index: None,
                     program: self.program.clone(),
@@ -196,7 +198,28 @@ impl CommandSpec {
             program,
             args,
             shell: false,
+            working_directory: None,
         })
+    }
+
+    /// Binds a structured remote command to a validated absolute directory.
+    ///
+    /// # Errors
+    /// Rejects noncanonical paths and control characters.
+    pub fn in_directory(mut self, directory: impl Into<String>) -> Result<Self, SecurityError> {
+        let directory = directory.into();
+        if !directory.starts_with('/')
+            || directory.len() > 4096
+            || directory.chars().any(char::is_control)
+            || directory
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(SecurityError::InvalidCommand);
+        }
+        self.working_directory = Some(directory);
+        Ok(self)
     }
 
     /// Renders a command for a POSIX remote Shell by quoting every argument.
@@ -209,11 +232,18 @@ impl CommandSpec {
         if self.shell {
             return Err(SecurityError::AlreadyShell);
         }
-        Ok(std::iter::once(self.program.as_str())
+        let rendered = std::iter::once(self.program.as_str())
             .chain(self.args.iter().map(CommandArgument::expose_for_execution))
             .map(quote_posix_argument)
             .collect::<Vec<_>>()
-            .join(" "))
+            .join(" ");
+        Ok(match &self.working_directory {
+            Some(directory) => format!(
+                "cd -- {} && exec {rendered}",
+                quote_posix_argument(directory)
+            ),
+            None => rendered,
+        })
     }
 }
 
@@ -331,6 +361,31 @@ mod tests {
             command.render_posix().unwrap(),
             "'systemctl' 'restart' 'api'\\''; rm -rf / #'"
         );
+    }
+
+    #[test]
+    fn remote_directory_is_literal_and_retained_in_safe_diagnostics() {
+        let command =
+            CommandSpec::structured("node", [CommandArgument::plain("a';echo injected.cjs")])
+                .unwrap()
+                .in_directory("/srv/a b'$(false)/releases/v1")
+                .unwrap();
+        assert_eq!(
+            command.render_posix().unwrap(),
+            "cd -- '/srv/a b'\\''$(false)/releases/v1' && exec 'node' 'a'\\'';echo injected.cjs'"
+        );
+        let snapshot = command
+            .diagnostic_snapshot(super::super::log_record::CommandLocation::Remote)
+            .unwrap();
+        assert_eq!(snapshot.working_directory, command.working_directory);
+        for path in ["relative", "/srv/../etc", "/srv//app", "/srv/app\n"] {
+            assert!(
+                CommandSpec::structured("node", [])
+                    .unwrap()
+                    .in_directory(path)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -59,14 +59,27 @@ CREATE TABLE deployment_steps (
 CREATE INDEX steps_deployment ON deployment_steps(deployment_id,id);
 ";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentComponentSnapshot {
+    /// Absent in older history; never backfilled from live configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_snapshot: Option<serde_json::Value>,
     /// Target Release, or the expected current Release when rolling back to absence.
     pub release: ReleaseRef,
     pub expected_current: Option<ReleaseRef>,
     pub target: Option<ReleaseRef>,
     pub execution_order: u32,
+}
+
+impl std::fmt::Debug for DeploymentComponentSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeploymentComponentSnapshot")
+            .field("release", &self.release)
+            .field("execution_order", &self.execution_order)
+            .field("target_snapshot_present", &self.target_snapshot.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -973,6 +986,17 @@ fn validate_snapshots(
     let mut components = BTreeSet::new();
     let mut orders = BTreeSet::new();
     for snapshot in snapshots {
+        if let Some(target) = &snapshot.target_snapshot {
+            let encoded = serde_json::to_string(target)
+                .map_err(|_| HistoryError::InvalidMetadata("invalid target snapshot"))?;
+            if encoded.len() > 64 * 1024
+                || crate::telemetry::detect_sensitive_config(&encoded).is_err()
+            {
+                return Err(HistoryError::InvalidMetadata(
+                    "unsafe or oversized target snapshot",
+                ));
+            }
+        }
         validate_ref(&snapshot.release)?;
         if snapshot.release.project_id != record.project
             || snapshot.release.environment_id != record.environment

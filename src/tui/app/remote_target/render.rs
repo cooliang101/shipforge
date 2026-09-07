@@ -24,8 +24,9 @@ impl RemoteSetupSelectionState {
     pub(in crate::tui) fn help(&self) -> &'static str {
         match &self.page {
             Page::Services => {
-                "↑↓ service · r root · b browse · v inspect · m unit · Enter apply · Esc back"
+                "Esc back · Enter apply · c commands · m unit · r root · b browse · v inspect"
             }
+            Page::CommandEditor(editor) => editor.help(),
             Page::Directories { candidates, .. }
                 if candidates.directory == "/" && candidates.directories.is_empty() =>
             {
@@ -68,6 +69,10 @@ impl RemoteSetupSelectionState {
             selected,
         } = match &self.page {
             Page::Services => self.service_content(),
+            Page::CommandEditor(editor) => {
+                editor.render(frame, area);
+                return;
+            }
             Page::Directories { candidates, cursor } => directory_content(candidates, *cursor),
             Page::Unavailable { retry_path } => Content::fixed(
                 " Remote directory unavailable ",
@@ -147,6 +152,14 @@ impl RemoteSetupSelectionState {
                 .enumerate()
                 .map(|(i, unit)| selected_line(self.cursor == i + 1, &safe_text(unit))),
         );
+        rows.push(selected_line(
+            self.cursor == self.systemd_units.len() + 1,
+            if self.custom_service.is_some() {
+                "Custom remote commands (c to edit)"
+            } else {
+                "Configure custom remote commands..."
+            },
+        ));
         if self.systemd_units.is_empty() {
             rows.push(Line::from(
                 "No service candidates loaded. Service management is optional.",

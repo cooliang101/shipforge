@@ -29,6 +29,37 @@ use super::*;
 #[derive(Default)]
 struct Events(Mutex<Vec<LogEvent>>);
 
+#[test]
+fn service_output_is_retained_with_truncation_but_internal_probe_output_is_not_logged() {
+    let events = Events::default();
+    let command = CommandSpec::structured("node", [CommandArgument::plain("service.cjs")]).unwrap();
+    let result = Ok(RemoteCommandOutput {
+        exit_status: 0,
+        stdout: b"service startup details".to_vec(),
+        stderr: b"service warning".to_vec(),
+        stdout_truncated: true,
+        stderr_truncated: false,
+    });
+    record_command_result(&events, &command, true, &[0], &result);
+    assert!(events.0.lock().unwrap().is_empty());
+    let command = command.in_directory("/srv/app/releases/v1").unwrap();
+    record_command_result(&events, &command, true, &[0], &result);
+    let records = events.0.lock().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].message, "service startup details");
+    assert!(
+        records[1]
+            .message
+            .contains("remaining output is unavailable")
+    );
+    assert_eq!(records[2].message, "service warning");
+    assert!(
+        records
+            .iter()
+            .all(|event| event.kind == LogEventKind::Output)
+    );
+}
+
 impl EventSink for Events {
     fn emit(&self, _event: DriverLog) {
         panic!("structured event expected");

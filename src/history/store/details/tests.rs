@@ -33,6 +33,7 @@ fn fixture(store: &HistoryStore) -> (DeploymentId, DeploymentComponentSnapshot) 
     (
         id,
         DeploymentComponentSnapshot {
+            target_snapshot: None,
             release: release.clone(),
             expected_current: Some(previous),
             target: Some(release),
@@ -194,6 +195,7 @@ fn rollback_to_absence_uses_current_as_frozen_identity() {
         )
         .unwrap();
     let rollback = DeploymentComponentSnapshot {
+        target_snapshot: None,
         release: snapshot.release.clone(),
         expected_current: Some(snapshot.release),
         target: None,
@@ -1134,6 +1136,7 @@ fn rollback_to_absence_result_requires_absent_attempted_release() {
         )
         .unwrap();
     let rollback = DeploymentComponentSnapshot {
+        target_snapshot: None,
         release: snapshot.release.clone(),
         expected_current: Some(snapshot.release.clone()),
         target: None,

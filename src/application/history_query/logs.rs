@@ -98,9 +98,11 @@ impl LogEntry {
                 let event = &record.event;
                 let command = match &event.kind {
                     crate::telemetry::log_record::LogEventKind::FailedCommand { command } => {
-                        command.args.iter().fold(command.program.len(), |sum, arg| {
-                            sum.saturating_add(arg.len())
-                        })
+                        command.args.iter().fold(
+                            command.program.len()
+                                + command.working_directory.as_ref().map_or(0, String::len),
+                            |sum, arg| sum.saturating_add(arg.len()),
+                        )
                     }
                     _ => 0,
                 };

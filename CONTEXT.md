@@ -61,7 +61,7 @@ A user-requested Deployment linked to an earlier Deployment that activates a sel
 _Avoid_: Undo, downgrade
 
 **Compensation**:
-Automatic recovery within a failed or cancelled Deployment that restores each changed Component to its observed pre-activation state.
+Automatic recovery within a failed or cancelled Deployment that restores known changes to their pre-activation state. An unknown service-command outcome requires manual verification, not competing recovery commands.
 _Avoid_: Rollback Deployment
 
 **Shared Content**:

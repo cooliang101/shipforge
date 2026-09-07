@@ -503,6 +503,11 @@ fn record_command_result(
     accepted_statuses: &[u32],
     result: &Result<RemoteCommandOutput, SshConnectionError>,
 ) {
+    // Only service/check commands have a version working directory. Internal
+    // probes can return sensitive protocol/configuration data and stay quiet.
+    if command.working_directory.is_some() {
+        record_service_output(events, result);
+    }
     let event = match result {
         Ok(output) if accepted_statuses.contains(&output.exit_status) => return,
         Ok(_) => super::command_events::failed(
@@ -518,6 +523,41 @@ fn record_command_result(
         ),
     };
     events.emit_record(event);
+}
+
+fn record_service_output(
+    events: &dyn EventSink,
+    result: &Result<RemoteCommandOutput, SshConnectionError>,
+) {
+    use crate::telemetry::log_record::{LogEvent, LogEventKind};
+    let Ok(output) = result else {
+        return;
+    };
+    for (stream, bytes, truncated) in [
+        ("stdout", &output.stdout, output.stdout_truncated),
+        ("stderr", &output.stderr, output.stderr_truncated),
+    ] {
+        if !bytes.is_empty() {
+            // Preserve the bounded whole stream for the application log sink's
+            // registered-secret/private-key redaction BEFORE fragmentation.
+            events.emit_record(LogEvent {
+                namespace: format!("linux-ssh.service.{stream}"),
+                message: String::from_utf8_lossy(bytes).into_owned(),
+                scope: None,
+                kind: LogEventKind::Output,
+            });
+        }
+        if truncated {
+            events.emit_record(LogEvent {
+                namespace: "linux-ssh.service.output".into(),
+                message: format!(
+                    "Service {stream} exceeded 64 KiB; remaining output is unavailable."
+                ),
+                scope: None,
+                kind: LogEventKind::Output,
+            });
+        }
+    }
 }
 
 async fn connection_phase<T>(

@@ -354,7 +354,7 @@ pub(super) struct DestinationSetupState {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ComponentTargetSettings {
     pub root: Option<String>,
-    pub systemd: Option<String>,
+    pub service: Option<crate::config::ServiceConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -2009,6 +2009,11 @@ impl App {
         self.invalidate_attention();
         match select_project(&self.registry_path, root, now_unix_ms()) {
             Ok(ProjectSelection::Existing { root, config }) => {
+                if config.schema_version != 2 {
+                    self.open_project_edit(root);
+                    self.message = Some("Configuration upgrade required. Press p in the editor to preview schema 2, then c to save. Project identities and equivalent service settings are preserved; no deployment is performed.".into());
+                    return;
+                }
                 self.show_overview(root, config);
                 self.refresh_recent();
             }
@@ -2310,10 +2315,10 @@ fn prepare_setup(
                         .target_settings
                         .get(component)
                         .and_then(|settings| settings.root.clone()),
-                    systemd: setup
+                    service: setup
                         .target_settings
                         .get(component)
-                        .and_then(|settings| settings.systemd.clone()),
+                        .and_then(|settings| settings.service.clone()),
                     health: None,
                     after: Vec::new(),
                 },
@@ -2658,6 +2663,7 @@ mod tests {
         };
         let component = ComponentName::parse("worker").unwrap();
         let error = DriverError {
+            recovery_blocked: false,
             stage: "compensate".into(),
             target: "worker".into(),
             message: "current changed externally".into(),
@@ -2984,7 +2990,7 @@ mod tests {
                 ComponentName::parse("web").unwrap(),
                 ComponentTargetSettings {
                     root: None,
-                    systemd: Some("web.service".into()),
+                    service: Some("web.service".into()),
                 },
             );
         }
@@ -2995,7 +3001,8 @@ mod tests {
         };
         assert!(prepared.preview().contains("project:"));
         assert!(prepared.preview().contains(destination_key.as_str()));
-        assert!(prepared.preview().contains("systemd: web.service"));
+        assert!(prepared.preview().contains("schemaVersion: 2"));
+        assert!(prepared.preview().contains("unit: web.service"));
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::SetupDestinations(_)));
         assert!(!directory.path().join("shipforge.yaml").exists());

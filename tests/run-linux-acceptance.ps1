@@ -1,8 +1,10 @@
 #requires -Version 7.0
 param(
     [string]$Distribution = 'Ubuntu-22.04',
-    [ValidateSet('All', 'Deployment', 'Retention', 'AutomaticRetention', 'Management', 'ConnectionStability', 'ReleaseGate')]
-    [string]$Suite = 'All'
+    [ValidateSet('All', 'Deployment', 'Retention', 'AutomaticRetention', 'Management', 'ConnectionStability', 'ReleaseGate', 'ServiceCommands')]
+    [string]$Suite = 'All',
+    [ValidateSet('https://registry.npmjs.org', 'https://registry.npmmirror.com')]
+    [string]$NpmRegistry = 'https://registry.npmjs.org'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -430,7 +432,7 @@ function Invoke-CargoCommand {
 }
 
 function Invoke-FixtureCase {
-    param([string]$Case)
+    param([string]$Case, [ValidateRange(1, 660000)][int]$ExecutionTimeoutMilliseconds = 300000)
     # Cargo exits successfully even when a misspelled filter selects zero tests.
     $arguments = @('test', '--locked', '--test', 'linux_ssh_deployment', $Case, '--', '--ignored', '--exact', '--list')
     $listed = Invoke-CargoCommand -Arguments $arguments -TimeoutMilliseconds 600000
@@ -438,7 +440,7 @@ function Invoke-FixtureCase {
         throw "Expected exactly one available disposable Linux test: $Case"
     }
     $arguments = @('test', '--locked', '--test', 'linux_ssh_deployment', $Case, '--', '--ignored', '--exact', '--nocapture')
-    [void](Invoke-CargoCommand -Arguments $arguments -TimeoutMilliseconds 300000 -PublishOutput)
+    [void](Invoke-CargoCommand -Arguments $arguments -TimeoutMilliseconds $ExecutionTimeoutMilliseconds -PublishOutput)
 }
 
 function Assert-ReleaseGateNativeBuild {
@@ -980,7 +982,10 @@ try {
     if ([string]::IsNullOrWhiteSpace($authorizedKeysLinux)) { throw 'Could not resolve the disposable authorized_keys path in WSL' }
 
     $imageBuilt = $true
-    Invoke-FixtureDocker -Arguments @('build', '--label', "shipforge.test.run=$runId", '-t', $image, $context) -TimeoutMilliseconds 300000 -PublishOutput | Out-Null
+    $fixtureDockerfile = if ($Suite -eq 'ServiceCommands') { "$context/Dockerfile.pm2" } else { "$context/Dockerfile" }
+    $buildArguments = @('build', '-f', $fixtureDockerfile, '--label', "shipforge.test.run=$runId", '-t', $image)
+    if ($Suite -eq 'ServiceCommands') { $buildArguments += @('--build-arg', "NPM_REGISTRY=$NpmRegistry") }
+    Invoke-FixtureDocker -Arguments ($buildArguments + @($context)) -TimeoutMilliseconds 300000 -PublishOutput | Out-Null
     foreach ($suffix in @('A', 'B')) {
         $container = "shipforge-m1-$runId-$($suffix.ToLowerInvariant())"
         # Track the exact name before create: a timed-out create may still finish in the daemon.
@@ -1054,7 +1059,15 @@ try {
         if ($Suite -eq 'ConnectionStability') {
             $cases += 'connection_stability::real_linux_fresh_connection_drop_stability'
         }
-        foreach ($case in $cases) { Invoke-FixtureCase -Case $case }
+        if ($Suite -eq 'ServiceCommands') {
+            $cases += 'service_commands::real_pm2_versions_failure_recovery_and_component_isolation'
+        }
+        foreach ($case in $cases) {
+            # The PM2 case covers multiple full lifecycle operations. Its own
+            # ten-minute deadline must finish before the native process guard.
+            $caseTimeout = if ($Suite -eq 'ServiceCommands') { 660000 } else { 300000 }
+            Invoke-FixtureCase -Case $case -ExecutionTimeoutMilliseconds $caseTimeout
+        }
         if ($runReleaseGate) { Invoke-ReleaseGate }
     } finally { Pop-Location }
 } catch {

@@ -41,6 +41,8 @@ pub enum CommandLocation {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
     pub location: CommandLocation,
     /// One-based build-command index when known; remote commands need no index.
     pub index: Option<u32>,
@@ -142,6 +144,7 @@ mod tests {
     #[test]
     fn debug_never_prints_command_arguments_or_message() {
         let command = RecordedCommand {
+            working_directory: None,
             location: CommandLocation::Local,
             index: Some(1),
             program: "secret-program-sentinel".into(),

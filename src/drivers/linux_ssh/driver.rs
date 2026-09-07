@@ -565,7 +565,7 @@ impl LinuxSshDriver {
                     &context.cancellation,
                 )
                 .await
-                .map_err(|source| operation_error("activate", context, source))?;
+                .map_err(|source| activation_error("activate", context, source))?;
             session
                 .verify_activation_health(
                     target,
@@ -576,7 +576,12 @@ impl LinuxSshDriver {
                     &context.cancellation,
                 )
                 .await
-                .map_err(|source| operation_error("health", context, source))?;
+                .map_err(|source| {
+                    let blocked = matches!(&source, super::HealthVerificationError::CompensationFailed { compensation, .. } if compensation.service_outcome_unknown());
+                    let mut error = operation_error("health", context, source);
+                    error.recovery_blocked = blocked;
+                    error
+                })?;
             Ok(ActivationReceipt {
                 current: Some(release.clone()),
                 healthy: true,
@@ -662,7 +667,7 @@ impl LinuxSshDriver {
                         &context.cancellation,
                     )
                     .await
-                    .map_err(|source| operation_error("rollback", context, source))?;
+                    .map_err(|source| activation_error("rollback", context, source))?;
             } else {
                 session
                     .rollback_release(
@@ -674,7 +679,7 @@ impl LinuxSshDriver {
                         &context.cancellation,
                     )
                     .await
-                    .map_err(|source| operation_error("rollback", context, source))?;
+                    .map_err(|source| activation_error("rollback", context, source))?;
             }
             if release.is_some() {
                 session
@@ -754,6 +759,7 @@ fn capabilities() -> DriverCapabilities {
 
 fn validation_error(target: &str, source: impl std::fmt::Display) -> DriverError {
     DriverError {
+        recovery_blocked: false,
         stage: "configuration".into(),
         target: target.into(),
         message: source.to_string(),
@@ -767,11 +773,26 @@ fn operation_error(
     source: impl std::fmt::Display,
 ) -> DriverError {
     DriverError {
+        recovery_blocked: false,
         stage: stage.into(),
         target: context.component.to_string(),
         message: source.to_string(),
         suggested_action: "review the connection and remote state, then run the check again".into(),
     }
+}
+
+fn activation_error(
+    stage: &str,
+    context: &ComponentExecutionContext,
+    source: super::ActivateReleaseError,
+) -> DriverError {
+    let blocked = source.service_outcome_unknown();
+    let mut error = operation_error(stage, context, source);
+    error.recovery_blocked = blocked;
+    if blocked {
+        error.suggested_action = "Service outcome is unknown. Inspect any in-flight command before manually recovering or creating a new plan; a current link alone is not service evidence.".into();
+    }
+    error
 }
 
 fn validate_prepare_request(
@@ -903,6 +924,7 @@ fn validate_release_ref(
 
 fn error(stage: &str, component: &ComponentName, message: &str) -> DriverError {
     DriverError {
+        recovery_blocked: false,
         stage: stage.into(),
         target: component.to_string(),
         message: message.into(),
@@ -962,7 +984,7 @@ mod tests {
             .validate_target(&DriverTargetInput {
                 value: serde_json::json!({
                     "root": "/srv/app",
-                    "systemd": null,
+                    "service": null,
                     "health": null
                 }),
             })

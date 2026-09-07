@@ -21,13 +21,21 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct Settings(DriverKind);
+struct Settings(DriverKind, Option<serde_json::Value>);
 impl ValidatedTargetSettings for Settings {
     fn driver_kind(&self) -> &DriverKind {
         &self.0
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        self.1.clone()
+    }
+    fn requires_recovery_snapshot(&self) -> bool {
+        self.1
+            .as_ref()
+            .is_some_and(|value| !value["service"].is_null())
     }
 }
 impl ValidatedDestinationSettings for Settings {
@@ -92,13 +100,13 @@ impl DeploymentDriver for FakeDriver {
         &self,
         _: &DriverDestinationInput,
     ) -> Result<Arc<dyn ValidatedDestinationSettings>, DriverError> {
-        Ok(Arc::new(Settings(self.kind())))
+        Ok(Arc::new(Settings(self.kind(), None)))
     }
     fn validate_target(
         &self,
-        _: &DriverTargetInput,
+        input: &DriverTargetInput,
     ) -> Result<Arc<dyn ValidatedTargetSettings>, DriverError> {
-        Ok(Arc::new(Settings(self.kind())))
+        Ok(Arc::new(Settings(self.kind(), Some(input.value.clone()))))
     }
     async fn preflight(
         &self,
@@ -429,6 +437,7 @@ impl Fixture {
             effective_capabilities: self.driver.static_capabilities(),
         };
         DeploymentComponentSnapshot {
+            target_snapshot: Some(target.driver_input().value),
             release: release.clone(),
             target: Some(release),
             expected_current: self.driver.0.lock().unwrap().current.get(name).cloned(),
@@ -499,6 +508,44 @@ fn component(name: &str) -> ComponentName {
 }
 fn version(name: &str) -> ReleaseVersion {
     ReleaseVersion::parse(name).unwrap()
+}
+
+#[tokio::test]
+async fn legacy_service_history_is_not_reconstructed_from_current_commands() {
+    for name in ["frontend", "backend"] {
+        let fixture = Fixture::new(&[name]);
+        let (_, targets) = fixture.publish("v1", true, true);
+        let (source, _) = fixture.publish("v2", true, true);
+        rusqlite::Connection::open(&fixture.history_path).unwrap().execute(
+            "UPDATE component_snapshots SET snapshot=json_remove(snapshot,'$.target_snapshot') WHERE deployment_id=?1",
+            [source.to_string()],
+        ).unwrap();
+        let result = fixture.plan(source, targets).await;
+        if name == "backend" {
+            assert!(
+                format!("{:?}", result.unwrap_err())
+                    .contains("Historical service commands are unavailable")
+            );
+            assert!(fixture.driver.0.lock().unwrap().calls.is_empty());
+        } else {
+            assert!(result.is_ok(), "file-only legacy history remains usable");
+        }
+        assert!(fixture.mutations().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn changed_frozen_commands_are_rejected_even_with_matching_generation() {
+    let fixture = Fixture::new(&["backend"]);
+    let (_, targets) = fixture.publish("v1", true, true);
+    let (source, _) = fixture.publish("v2", true, true);
+    rusqlite::Connection::open(&fixture.history_path).unwrap().execute(
+        "UPDATE component_snapshots SET snapshot=json_set(snapshot,'$.target_snapshot.service.start[0][1]','stop') WHERE deployment_id=?1",
+        [source.to_string()],
+    ).unwrap();
+    let error = fixture.plan(source, targets).await.unwrap_err();
+    assert!(format!("{error:?}").contains("differ from the frozen history"));
+    assert!(fixture.driver.0.lock().unwrap().calls.is_empty());
 }
 
 #[tokio::test]
@@ -736,6 +783,7 @@ async fn missing_capability_corrupt_package_or_unknown_current_never_mutates() {
 
 fn remote_failure(operation: &str) -> DriverError {
     DriverError {
+        recovery_blocked: false,
         stage: format!("UNREGISTERED_DRIVER_SENTINEL {operation}"),
         target: "UNREGISTERED_DRIVER_SENTINEL /private/fixture".into(),
         message: "UNREGISTERED_DRIVER_SENTINEL private credential diagnostic".into(),

@@ -32,6 +32,7 @@ impl AuditPhase<'_> {
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok())
             .ok_or_else(|| DriverError {
+                recovery_blocked: false,
                 stage: "audit".into(),
                 target: self.context.component.to_string(),
                 message: "system clock cannot timestamp the remote audit".into(),
@@ -75,6 +76,7 @@ pub(super) async fn record_prepared(
         )
         .await
         .map_err(|source| DriverError {
+            recovery_blocked: false,
             stage: "prepare.audit".into(),
             target: phase.context.component.to_string(),
             message: source.to_string(),
@@ -189,6 +191,7 @@ mod tests {
     fn audit_failure_keeps_original_operation_error_and_stage() {
         let error = with_warning(
             Err(DriverError {
+                recovery_blocked: false,
                 stage: "health".into(),
                 target: "api".into(),
                 message: "unhealthy; restored previous version".into(),

@@ -131,6 +131,9 @@ fn clock_error() -> &'static str {
 }
 
 pub(super) fn driver_error(error: &DriverError) -> String {
+    if error.recovery_blocked {
+        return "Remote service outcome is unknown. Automatic recovery of this Component was blocked. Inspect the remote process and service before retrying; the current link is not proof of service completion.".into();
+    }
     // These public string fields are not guaranteed to be redacted. Only known
     // metadata enter the control diagnostic. A syntactically valid target is
     // not proof it is one of the user's selected Components; the caller can
@@ -326,6 +329,7 @@ mod tests {
         ] {
             let text = deployment_error(DeploymentServiceError::Application(
                 ApplicationError::Driver(DriverError {
+                    recovery_blocked: false,
                     stage: stage.into(),
                     target: "api".into(),
                     message: SECRET.into(),
@@ -342,6 +346,7 @@ mod tests {
             }
         }
         let text = driver_error(&DriverError {
+            recovery_blocked: false,
             stage: format!("unknown.{SECRET}"),
             target: format!("/private/{SECRET}\n\u{202e}"),
             message: SECRET.into(),
@@ -355,6 +360,7 @@ mod tests {
     fn driver_errors_do_not_trust_syntactically_valid_raw_target_text() {
         assert!(crate::domain::ComponentName::parse(SECRET).is_ok());
         let text = driver_error(&DriverError {
+            recovery_blocked: false,
             stage: "connect".into(),
             target: SECRET.into(),
             message: SECRET.into(),

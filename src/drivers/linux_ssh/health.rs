@@ -54,6 +54,7 @@ pub struct HttpHealth {
 pub struct HealthCheckReport {
     pub systemd: Option<SystemdHealth>,
     pub http: Option<HttpHealth>,
+    pub command_attempts: Option<u32>,
 }
 
 impl AuthenticatedSession {
@@ -145,7 +146,11 @@ async fn check_with_remote<R: HealthRemote>(
     if cancellation.is_cancelled() {
         return Err(HealthCheckError::Cancelled);
     }
-    let systemd = match &target.systemd {
+    let systemd = match target
+        .service
+        .as_ref()
+        .and_then(crate::config::ServiceConfig::systemd_unit)
+    {
         Some(unit) => Some(check_systemd(remote, unit, options, cancellation).await?),
         None => None,
     };
@@ -153,7 +158,47 @@ async fn check_with_remote<R: HealthRemote>(
         Some(url) => Some(check_http(remote, url, options, cancellation).await?),
         None => None,
     };
-    Ok(HealthCheckReport { systemd, http })
+    let command_attempts = match target
+        .service
+        .as_ref()
+        .and_then(|service| service.check.as_ref())
+    {
+        Some(crate::config::ServiceCheck::Command { argv }) => {
+            let command = super::service_command(argv, &format!("{}/current", target.root))
+                .map_err(|_| {
+                    HealthCheckError::InvalidCommand("Invalid service check context".into())
+                })?;
+            let mut passed = None;
+            for attempt in 1..=options.attempts {
+                let result = execute(
+                    remote,
+                    "service health check",
+                    &command,
+                    options.command_timeout,
+                    cancellation,
+                )
+                .await;
+                match result {
+                    Ok(output) if output.exit_status == 0 => {
+                        passed = Some(attempt);
+                        break;
+                    }
+                    Err(HealthCheckError::Cancelled) => return Err(HealthCheckError::Cancelled),
+                    _ => {}
+                }
+                if attempt < options.attempts {
+                    wait(options.interval, cancellation).await?;
+                }
+            }
+            Some(passed.ok_or(HealthCheckError::ServiceProbeFailed)?)
+        }
+        _ => None,
+    };
+    Ok(HealthCheckReport {
+        systemd,
+        http,
+        command_attempts,
+    })
 }
 
 async fn check_systemd<R: HealthRemote>(
@@ -434,6 +479,8 @@ fn validate_options(options: HealthCheckOptions) -> Result<(), HealthCheckError>
 
 #[derive(Debug, Error)]
 pub enum HealthCheckError {
+    #[error("service health command did not pass within the configured attempts")]
+    ServiceProbeFailed,
     #[error("health timeout, interval, attempts, and stability window must be non-zero")]
     ZeroOption,
     #[error("health options exceed the MVP safety limits")]

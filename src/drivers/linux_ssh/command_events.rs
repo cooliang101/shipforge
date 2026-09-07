@@ -79,6 +79,12 @@ fn event_bytes(event: &LogEvent) -> usize {
             .saturating_add(command.program.capacity())
             .saturating_add(
                 command
+                    .working_directory
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(
+                command
                     .args
                     .capacity()
                     .saturating_mul(std::mem::size_of::<String>()),

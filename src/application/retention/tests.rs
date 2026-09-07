@@ -599,6 +599,7 @@ fn seed(history: &HistoryStore, package: &ReleasePackageRecord) {
         .record_component_snapshots(
             &id,
             &[DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: release.clone(),
                 target: Some(release.clone()),
                 expected_current: None,

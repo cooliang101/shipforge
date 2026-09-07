@@ -130,6 +130,7 @@ impl GuardedDriver {
             Err("Execution context differs from the confirmed plan")
         };
         result.map_err(|message| DriverError {
+            recovery_blocked: false,
             stage: stage.into(),
             target: format!(
                 "Project {} Environment {} Component {} Destination {}",

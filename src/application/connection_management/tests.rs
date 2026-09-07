@@ -171,7 +171,7 @@ impl Fixture {
                             TargetSetup {
                                 destination,
                                 root: None,
-                                systemd: None,
+                                service: None,
                                 health: None,
                                 after: Vec::new(),
                             },
@@ -704,6 +704,7 @@ async fn historical_reference_blocks_removal_after_project_unregistration() {
         .record_component_snapshots(
             &id,
             &[DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: release.clone(),
                 target: Some(release),
                 expected_current: None,

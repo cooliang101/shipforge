@@ -183,6 +183,7 @@ pub(super) fn command_snapshot(
         (command.program.clone(), command.args.clone())
     };
     RecordedCommand {
+        working_directory: None,
         location: CommandLocation::Local,
         index: index
             .checked_add(1)

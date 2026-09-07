@@ -388,7 +388,7 @@ fn setup(destination: DestinationKey) -> ProjectSetup {
                         TargetSetup {
                             destination: destination.clone(),
                             root: Some(REMOTE_ROOT.into()),
-                            systemd: None,
+                            service: None,
                             health: None,
                             after: Vec::new(),
                         },
@@ -398,7 +398,7 @@ fn setup(destination: DestinationKey) -> ProjectSetup {
                         TargetSetup {
                             destination,
                             root: None,
-                            systemd: None,
+                            service: None,
                             health: None,
                             after: Vec::new(),
                         },

@@ -14,7 +14,7 @@ use super::{
     SshConnectionError, prepare::ReleasePaths, transfer::sanitize_remote_error,
 };
 
-const COMPENSATION_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPENSATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActivationOptions {
@@ -34,14 +34,14 @@ pub struct ActivatedRemoteRelease {
     root: String,
     release: ComponentRelease,
     previous: Option<ReleaseVersion>,
-    systemd_restarted: bool,
+    service_started: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RolledBackRemoteRelease {
     from: ComponentRelease,
     current: Option<ReleaseVersion>,
-    systemd_updated: bool,
+    service_updated: bool,
 }
 
 impl RolledBackRemoteRelease {
@@ -56,8 +56,8 @@ impl RolledBackRemoteRelease {
     }
 
     #[must_use]
-    pub const fn systemd_updated(&self) -> bool {
-        self.systemd_updated
+    pub const fn service_updated(&self) -> bool {
+        self.service_updated
     }
 }
 
@@ -73,8 +73,8 @@ impl ActivatedRemoteRelease {
     }
 
     #[must_use]
-    pub const fn systemd_restarted(&self) -> bool {
-        self.systemd_restarted
+    pub const fn service_started(&self) -> bool {
+        self.service_started
     }
 }
 
@@ -103,8 +103,9 @@ impl AuthenticatedSession {
     ///
     /// The operation checks the expected `current` twice, creates the new link
     /// on the same filesystem, atomically renames it over `current`, and then
-    /// restarts the configured systemd unit. A post-switch failure restores the
-    /// previous link, or the undeployed state for a first deployment.
+    /// executes the configured service action. A known post-switch failure
+    /// restores the previous link, or the undeployed state for a first deployment.
+    /// Unknown service outcomes require manual recovery without competing commands.
     ///
     /// # Errors
     ///
@@ -247,7 +248,7 @@ async fn restore_undeployed_with_remote<R: ActivationRemote>(
         root: target.root.clone(),
         release: desired.clone(),
         previous: None,
-        systemd_restarted: false,
+        service_started: false,
     };
     restore_previous(
         remote,
@@ -290,7 +291,7 @@ async fn rollback_with_remote<R: ActivationRemote>(
         root: target.root.clone(),
         release: current.clone(),
         previous: desired.cloned(),
-        systemd_restarted: target.systemd.is_some(),
+        service_started: target.service.is_some(),
     };
     compensate(
         remote,
@@ -307,7 +308,7 @@ async fn rollback_with_remote<R: ActivationRemote>(
     Ok(RolledBackRemoteRelease {
         from: current.clone(),
         current: desired.cloned(),
-        systemd_updated: target.systemd.is_some(),
+        service_updated: target.service.is_some(),
     })
 }
 
@@ -420,7 +421,7 @@ async fn activate_with_remote<R: ActivationRemote>(
         root: target.root.clone(),
         release: prepared.release().clone(),
         previous: expected_current.cloned(),
-        systemd_restarted: target.systemd.is_some(),
+        service_started: target.service.is_some(),
     };
     finish_activation(
         remote,
@@ -554,17 +555,25 @@ async fn finish_activation<R: ActivationRemote>(
     }
 
     let completion_token = CancellationToken::new();
-    if let Some(unit) = &target.systemd {
-        let restart = run_required(
+    if let Some(service) = &target.service {
+        let commands = if activation.previous.is_some() {
+            service.update_commands()
+        } else {
+            &service.start
+        };
+        let restart = run_service_action(
             remote,
-            "restart systemd service",
-            "systemctl",
-            ["restart", "--", unit],
+            "activate service",
+            commands,
+            &format!("{}/releases/{}", target.root, activation.release.version),
             timeout,
             &completion_token,
         )
         .await;
         if let Err(error) = restart {
+            if error.service_outcome_unknown() {
+                return Err(error);
+            }
             return fail_after_switch(
                 remote,
                 target,
@@ -645,12 +654,12 @@ async fn resolve_uncertain_switch<R: ActivationRemote>(
         root: target.root.clone(),
         release: prepared.release().clone(),
         previous: expected_current.cloned(),
-        systemd_restarted: false,
+        service_started: false,
     };
     if let Err(cleanup) = remove_temporary_link(remote, temporary_link, recovery_timeout).await {
         return Err(ActivateReleaseError::CompensationFailed {
             cause: original.to_string(),
-            compensation: format!("could not neutralize the activation link: {cleanup}"),
+            compensation: format!("could not neutralize the activation link: {cleanup}").into(),
             manual_action: manual_action(target, &activation),
         });
     }
@@ -674,12 +683,13 @@ async fn resolve_uncertain_switch<R: ActivationRemote>(
             compensation: format!(
                 "could not determine ownership after switch; current is {}",
                 display_current(actual.as_ref())
-            ),
+            )
+            .into(),
             manual_action: manual_action(target, &activation),
         }),
         Err(error) => Err(ActivateReleaseError::CompensationFailed {
             cause: original.to_string(),
-            compensation: error.to_string(),
+            compensation: error.to_string().into(),
             manual_action: manual_action(target, &activation),
         }),
     }
@@ -719,7 +729,7 @@ async fn compensate<R: ActivationRemote>(
     activation: &ActivatedRemoteRelease,
     deployment: &DeploymentId,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<(), RecoveryFailure> {
     let cancellation = CancellationToken::new();
     let observed = observe_with_remote(remote, target, timeout, &cancellation)
         .await
@@ -729,7 +739,8 @@ async fn compensate<R: ActivationRemote>(
             "current drifted before compensation: expected {}, got {}",
             activation.release.version,
             display_current(observed.as_ref())
-        ));
+        )
+        .into());
     }
 
     if let Some(previous) = &activation.previous {
@@ -760,7 +771,7 @@ async fn restore_previous<R: ActivationRemote>(
     deployment: &DeploymentId,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), RecoveryFailure> {
     let paths = ReleasePaths::new(target, &activation.release, deployment);
     let previous_directory = format!("{}/{}", paths.release_parent, previous);
     validate_historical_release(
@@ -780,9 +791,7 @@ async fn restore_previous<R: ActivationRemote>(
         .await
         .map_err(|error| error.to_string())?
     {
-        return Err(format!(
-            "rollback temporary path already exists: `{temporary_link}`"
-        ));
+        return Err(format!("rollback temporary path already exists: `{temporary_link}`").into());
     }
     let link_target = format!("releases/{previous}");
     let create = run_required(
@@ -795,12 +804,16 @@ async fn restore_previous<R: ActivationRemote>(
     )
     .await;
     if let Err(error) = create {
-        return Err(cleanup_error(remote, &temporary_link, timeout, error).await);
+        return Err(cleanup_error(remote, &temporary_link, timeout, error)
+            .await
+            .into());
     }
     if let Err(error) =
         verify_current(remote, target, expected_current, timeout, cancellation).await
     {
-        return Err(cleanup_error(remote, &temporary_link, timeout, error).await);
+        return Err(cleanup_error(remote, &temporary_link, timeout, error)
+            .await
+            .into());
     }
     let current_path = format!("{}/current", target.root);
     if let Err(error) = run_required(
@@ -818,22 +831,24 @@ async fn restore_previous<R: ActivationRemote>(
     )
     .await
     {
-        return Err(cleanup_error(remote, &temporary_link, timeout, error).await);
+        return Err(cleanup_error(remote, &temporary_link, timeout, error)
+            .await
+            .into());
     }
     verify_current(remote, target, Some(previous), timeout, cancellation)
         .await
         .map_err(|error| error.to_string())?;
-    if let Some(unit) = &target.systemd {
-        run_required(
+    if let Some(service) = &target.service {
+        run_service_action(
             remote,
-            "restart restored systemd service",
-            "systemctl",
-            ["restart", "--", unit],
+            "restore service",
+            service.restore_commands(),
+            &format!("{}/releases/{previous}", target.root),
             timeout,
             cancellation,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(RecoveryFailure::from)?;
     }
     Ok(())
 }
@@ -897,7 +912,7 @@ async fn restore_not_deployed<R: ActivationRemote>(
     activation: &ActivatedRemoteRelease,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), RecoveryFailure> {
     verify_current(
         remote,
         target,
@@ -921,17 +936,17 @@ async fn restore_not_deployed<R: ActivationRemote>(
     verify_current(remote, target, None, timeout, cancellation)
         .await
         .map_err(|error| error.to_string())?;
-    if let Some(unit) = &target.systemd {
-        run_required(
+    if let Some(service) = &target.service {
+        run_service_action(
             remote,
-            "stop first-deployment systemd service",
-            "systemctl",
-            ["stop", "--", unit],
+            "stop first-deployment service",
+            &service.stop,
+            &format!("{}/releases/{}", target.root, activation.release.version),
             timeout,
             cancellation,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(RecoveryFailure::from)?;
     }
     Ok(())
 }
@@ -1292,6 +1307,43 @@ where
     }
 }
 
+async fn run_service_action<R: ActivationRemote>(
+    remote: &R,
+    stage: &'static str,
+    commands: &crate::config::ServiceAction,
+    directory: &str,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<(), ActivateReleaseError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for argv in commands {
+        if cancellation.is_cancelled() {
+            return Err(ActivateReleaseError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ActivateReleaseError::RemoteCommand {
+                stage,
+                message: "Service action timed out; verify its outcome before retrying.".into(),
+            });
+        }
+        let command = super::service_command(argv, directory).map_err(|_| {
+            ActivateReleaseError::InvalidCommand("Invalid service command context".into())
+        })?;
+        let output = remote
+            .command(&command, remaining, cancellation)
+            .await
+            .map_err(|_| ActivateReleaseError::ServiceOutcomeUnknown { stage })?;
+        if output.exit_status != 0 {
+            return Err(ActivateReleaseError::CommandFailed {
+                stage,
+                status: output.exit_status,
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn run<R, I, S>(
     remote: &R,
     stage: &'static str,
@@ -1347,6 +1399,10 @@ fn manual_action(target: &LinuxSshTarget, activation: &ActivatedRemoteRelease) -
 
 #[derive(Debug, Error)]
 pub enum ActivateReleaseError {
+    #[error(
+        "{stage} has no confirmed exit status; inspect the remote process before any retry or recovery"
+    )]
+    ServiceOutcomeUnknown { stage: &'static str },
     #[error(transparent)]
     UnsafeRemote(#[from] super::MarkerError),
     #[error("activation command timeout must be non-zero")]
@@ -1391,16 +1447,59 @@ pub enum ActivateReleaseError {
     )]
     CompensationFailed {
         cause: String,
-        compensation: String,
+        compensation: RecoveryFailure,
         manual_action: String,
     },
     #[error("activation failed ({cause}); temporary-link cleanup also failed ({cleanup})")]
     CleanupFailed { cause: String, cleanup: String },
     #[error("explicit Rollback failed ({cause}); manual action: {manual_action}")]
     ExplicitRollbackFailed {
-        cause: String,
+        cause: RecoveryFailure,
         manual_action: String,
     },
+}
+
+#[derive(Debug, Error)]
+pub enum RecoveryFailure {
+    #[error("{0}")]
+    Known(String),
+    #[error(
+        "service command has no confirmed outcome; inspect the process before further recovery"
+    )]
+    ServiceOutcomeUnknown,
+}
+
+impl From<String> for RecoveryFailure {
+    fn from(message: String) -> Self {
+        Self::Known(message)
+    }
+}
+
+impl From<ActivateReleaseError> for RecoveryFailure {
+    fn from(error: ActivateReleaseError) -> Self {
+        if error.service_outcome_unknown() {
+            Self::ServiceOutcomeUnknown
+        } else {
+            Self::Known(error.to_string())
+        }
+    }
+}
+
+impl ActivateReleaseError {
+    pub(super) fn service_outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::ServiceOutcomeUnknown { .. }
+                | Self::CompensationFailed {
+                    compensation: RecoveryFailure::ServiceOutcomeUnknown,
+                    ..
+                }
+                | Self::ExplicitRollbackFailed {
+                    cause: RecoveryFailure::ServiceOutcomeUnknown,
+                    ..
+                }
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1427,6 +1526,8 @@ mod tests {
         links: BTreeMap<String, String>,
         commands: Vec<String>,
         restart_failures: usize,
+        service_unknown: bool,
+        service_calls: Vec<(String, Vec<String>, String)>,
         cancel_after_move: Option<CancellationToken>,
         drift_on_readlink: Option<usize>,
         readlinks: usize,
@@ -1489,6 +1590,8 @@ mod tests {
                     links,
                     commands: Vec::new(),
                     restart_failures: 0,
+                    service_unknown: false,
+                    service_calls: Vec::new(),
                     cancel_after_move: None,
                     drift_on_readlink: None,
                     readlinks: 0,
@@ -1509,6 +1612,7 @@ mod tests {
 
     #[async_trait]
     impl ActivationRemote for FakeRemote {
+        #[allow(clippy::too_many_lines)] // In-memory remote command simulator.
         async fn command(
             &self,
             command: &CommandSpec,
@@ -1522,6 +1626,23 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut state = self.state.lock().unwrap();
             state.commands.push(command.render_posix().unwrap());
+            if let Some(directory) = &command.working_directory {
+                state.service_calls.push((
+                    command.program.clone(),
+                    args.clone(),
+                    directory.clone(),
+                ));
+                assert!(state.directories.contains(directory));
+                if state.service_unknown {
+                    return Err(SshConnectionError::MissingExitStatus);
+                }
+                if command.program == "pm2" {
+                    return Ok(output(0, b""));
+                }
+                if command.program == "false" {
+                    return Ok(output(1, b""));
+                }
+            }
             if command.program == "systemctl"
                 && args.first().map(String::as_str) == Some("restart")
                 && state.restart_failures > 0
@@ -1644,7 +1765,7 @@ mod tests {
         LinuxSshTarget::validate(&DriverTargetInput {
             value: serde_json::json!({
                 "root": "/srv/shipforge/project/production/api",
-                "systemd": systemd.then_some("api.service"),
+                "service": systemd.then(|| crate::config::ServiceConfig::systemd("api.service")),
                 "health": null
             }),
         })
@@ -1662,6 +1783,140 @@ mod tests {
             "a".repeat(64),
             42,
         )
+    }
+
+    fn custom_target() -> LinuxSshTarget {
+        let mut target = target(false);
+        target.service = Some(crate::config::ServiceConfig {
+            start: vec![vec!["pm2".into(), "start".into(), "ecosystem.cjs".into()]],
+            update: vec![vec![
+                "pm2".into(),
+                "startOrReload".into(),
+                "ecosystem.cjs".into(),
+            ]],
+            restore: vec![vec![
+                "pm2".into(),
+                "startOrRestart".into(),
+                "ecosystem.cjs".into(),
+            ]],
+            stop: vec![vec!["pm2".into(), "delete".into(), "api".into()]],
+            check: None,
+        });
+        target
+    }
+
+    #[tokio::test]
+    async fn custom_actions_use_distinct_lifecycles_and_actual_version_directories() {
+        for first in [true, false] {
+            let target = custom_target();
+            let deployment = DeploymentId::new();
+            let prepared = prepared(&target, &deployment);
+            let previous = (!first).then(|| ReleaseVersion::parse("v1").unwrap());
+            let remote = FakeRemote::fixture(&target, &prepared, previous.as_ref());
+            let activated = activate_with_remote(
+                &remote,
+                &target,
+                &prepared,
+                previous.as_ref(),
+                &deployment,
+                ActivationOptions::default(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            compensate(
+                &remote,
+                &target,
+                &activated,
+                &deployment,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let state = remote.state.lock().unwrap();
+            assert_eq!(state.service_calls.len(), 2);
+            assert_eq!(
+                state.service_calls[0].1[0],
+                if first { "start" } else { "startOrReload" }
+            );
+            assert!(state.service_calls[0].2.ends_with("/releases/v2"));
+            assert_eq!(
+                state.service_calls[1].1[0],
+                if first { "delete" } else { "startOrRestart" }
+            );
+            assert!(state.service_calls[1].2.ends_with(if first {
+                "/releases/v2"
+            } else {
+                "/releases/v1"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_service_outcome_never_starts_automatic_recovery() {
+        let target = custom_target();
+        let deployment = DeploymentId::new();
+        let prepared = prepared(&target, &deployment);
+        let previous = ReleaseVersion::parse("v1").unwrap();
+        let remote = FakeRemote::fixture(&target, &prepared, Some(&previous));
+        remote.state.lock().unwrap().service_unknown = true;
+        let error = activate_with_remote(
+            &remote,
+            &target,
+            &prepared,
+            Some(&previous),
+            &deployment,
+            ActivationOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.service_outcome_unknown());
+        assert_eq!(remote.current(&target).as_deref(), Some("releases/v2"));
+        assert_eq!(remote.state.lock().unwrap().service_calls.len(), 1);
+        let error = rollback_with_remote(
+            &remote,
+            &target,
+            prepared.release(),
+            Some(&previous),
+            &deployment,
+            ActivationOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.service_outcome_unknown());
+    }
+
+    #[tokio::test]
+    async fn known_custom_failure_stops_remaining_commands_and_compensates_once() {
+        let mut target = custom_target();
+        target.service.as_mut().unwrap().start = vec![
+            vec!["false".into()],
+            vec!["pm2".into(), "must-not-run".into()],
+        ];
+        let deployment = DeploymentId::new();
+        let prepared = prepared(&target, &deployment);
+        let remote = FakeRemote::fixture(&target, &prepared, None);
+        let error = activate_with_remote(
+            &remote,
+            &target,
+            &prepared,
+            None,
+            &deployment,
+            ActivationOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ActivateReleaseError::ActivationFailedAndCompensated { .. }
+        ));
+        assert_eq!(remote.current(&target), None);
+        let state = remote.state.lock().unwrap();
+        assert_eq!(state.service_calls.len(), 2);
+        assert_eq!(state.service_calls[1].1[0], "delete");
     }
 
     #[tokio::test]
@@ -1740,7 +1995,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(receipt.previous(), Some(&previous));
-        assert!(receipt.systemd_restarted());
+        assert!(receipt.service_started());
         assert_eq!(remote.current(&target).as_deref(), Some("releases/v2"));
         let commands = &remote.state.lock().unwrap().commands;
         assert!(
@@ -1751,7 +2006,7 @@ mod tests {
         assert!(
             commands
                 .iter()
-                .any(|command| { command == "'systemctl' 'restart' '--' 'api.service'" })
+                .any(|command| { command == "cd -- '/srv/shipforge/project/production/api/releases/v2' && exec 'systemctl' 'restart' '--' 'api.service'" })
         );
     }
 
@@ -1819,7 +2074,7 @@ mod tests {
             .unwrap()
             .commands
             .iter()
-            .filter(|command| command.starts_with("'systemctl' 'restart'"))
+            .filter(|command| command.ends_with("exec 'systemctl' 'restart' '--' 'api.service'"))
             .count();
         assert_eq!(restart_count, 2);
     }
@@ -1854,7 +2109,7 @@ mod tests {
                 .unwrap()
                 .commands
                 .iter()
-                .any(|command| command == "'systemctl' 'stop' '--' 'api.service'")
+                .any(|command| command == "cd -- '/srv/shipforge/project/production/api/releases/v2' && exec 'systemctl' 'stop' '--' 'api.service'")
         );
     }
 
@@ -1945,7 +2200,12 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
-        assert!(result.unwrap_err().contains("drifted before compensation"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("drifted before compensation")
+        );
         assert_eq!(
             remote.current(&target).as_deref(),
             Some("releases/operator")
@@ -2039,7 +2299,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receipt.current(), Some(&previous));
-        assert!(receipt.systemd_updated());
+        assert!(receipt.service_updated());
         assert_eq!(remote.current(&target).as_deref(), Some("releases/v1"));
     }
 

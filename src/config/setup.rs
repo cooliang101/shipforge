@@ -37,7 +37,7 @@ pub struct EnvironmentSetup {
 pub struct TargetSetup {
     pub destination: DestinationKey,
     pub root: Option<String>,
-    pub systemd: Option<String>,
+    pub service: Option<crate::config::ServiceConfig>,
     pub health: Option<String>,
     pub after: Vec<ComponentName>,
 }
@@ -320,7 +320,7 @@ impl GeneratedProject {
             .collect();
 
         Self {
-            schema_version: 1,
+            schema_version: 2,
             managed: GeneratedManagedProject {
                 project_id: ProjectId::new(),
                 environments: managed_environments,
@@ -364,7 +364,7 @@ impl GeneratedProject {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             managed: GeneratedManagedProject {
                 project_id: current.project_id.clone(),
                 environments: managed_environments,
@@ -470,7 +470,7 @@ fn target_matches_previous(
     after.dedup();
     target.destination == previous.destination
         && resolved_root == previous.root
-        && target.systemd == previous.systemd
+        && target.service == previous.service
         && target.health == previous.health
         && after == previous.after
 }
@@ -575,7 +575,7 @@ struct GeneratedTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    systemd: Option<String>,
+    service: Option<crate::config::ServiceConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -587,7 +587,7 @@ impl From<TargetSetup> for GeneratedTarget {
         Self {
             destination: target.destination,
             root: target.root,
-            systemd: target.systemd,
+            service: target.service,
             health: target.health,
             after: target.after,
         }

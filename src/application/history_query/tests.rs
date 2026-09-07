@@ -45,6 +45,7 @@ impl Fixture {
             .record_component_snapshots(
                 &id,
                 &[DeploymentComponentSnapshot {
+                    target_snapshot: None,
                     release: release.clone(),
                     expected_current: None,
                     target: Some(release.clone()),

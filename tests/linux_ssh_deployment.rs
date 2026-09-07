@@ -6,6 +6,9 @@ mod connection_stability;
 #[path = "linux_ssh_deployment/management_acceptance.rs"]
 mod management_acceptance;
 
+#[path = "linux_ssh_deployment/service_commands.rs"]
+mod service_commands;
+
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -1520,7 +1523,7 @@ fn project_setup(destinations: &[DestinationKey]) -> ProjectSetup {
             TargetSetup {
                 destination: destinations[index].clone(),
                 root: Some(format!("/srv/shipforge-acceptance/{name}")),
-                systemd: None,
+                service: None,
                 health: Some(format!("http://127.0.0.1:8080/{name}")),
                 after: if index == 1 {
                     vec![component("frontend")]

@@ -293,7 +293,13 @@ impl RollbackService {
         let snapshot = snapshot(evidence, name);
         let scope = InspectionScope::from(&snapshot.release);
         let target = &selection.config.environments[&selection.environment].components[name];
-        let context = self.context(selection, &scope, registry, cancellation);
+        let context = self.context(
+            selection,
+            &scope,
+            snapshot.target_snapshot.as_ref(),
+            registry,
+            cancellation,
+        );
         let destination = registry
             .resolve_revision(&scope.destination, scope.destination_revision)
             .map_or_else(
@@ -319,6 +325,7 @@ impl RollbackService {
         &self,
         selection: &DeploymentSelection,
         scope: &InspectionScope,
+        frozen_target: Option<&serde_json::Value>,
         registry: &DestinationRegistry,
         cancellation: &CancellationToken,
     ) -> Result<PlannedContext, RollbackServiceError> {
@@ -369,6 +376,26 @@ impl RollbackService {
         let target_settings = driver
             .validate_target(&target.driver_input())
             .map_err(|_| component_error(name, "Component target settings are invalid"))?;
+        if let Some(frozen) = frozen_target {
+            let historical = driver
+                .validate_target(&crate::drivers::DriverTargetInput {
+                    value: frozen.clone(),
+                })
+                .map_err(|_| {
+                    component_error(name, "Historical target command snapshot is invalid")
+                })?;
+            if historical.snapshot() != target_settings.snapshot() {
+                return Err(component_error(
+                    name,
+                    "Saved target commands differ from the frozen history; no remote mutation is allowed",
+                ));
+            }
+        } else if target_settings.requires_recovery_snapshot() {
+            return Err(component_error(
+                name,
+                "Historical service commands are unavailable; inspect and recover the service manually",
+            ));
+        }
         Ok(PlannedContext {
             driver,
             context: ComponentExecutionContext {
@@ -447,7 +474,13 @@ impl RollbackService {
                 ));
             }
             let scope = InspectionScope::from(&snapshot(&plan.evidence, name).release);
-            let context = self.context(&plan.selection, &scope, &registry, cancellation)?;
+            let context = self.context(
+                &plan.selection,
+                &scope,
+                snapshot(&plan.evidence, name).target_snapshot.as_ref(),
+                &registry,
+                cancellation,
+            )?;
             let current = check_remote(
                 &context,
                 chosen.as_ref(),

@@ -79,7 +79,6 @@ pub(in crate::tui::app) enum TextField {
     Artifact,
     EnvironmentName,
     Root,
-    Systemd,
     Health,
     Program(usize),
     Argument(usize, usize),
@@ -98,7 +97,6 @@ impl TextField {
             Self::Root => {
                 "Remote root (empty = retain existing root; generate default only for a new target)"
             }
-            Self::Systemd => "Systemd unit (empty = no service)",
             Self::Health => "Health URL (empty = no HTTP check; never enter credentials)",
             Self::Program(_) => "Executable program (one argv item, not a shell command)",
             Self::Argument(_, _) => {
@@ -203,9 +201,6 @@ impl App {
             }
             (TextField::Root, ProjectEditPage::Target { form, .. }) => {
                 form.target.root = optional(edit.value);
-            }
-            (TextField::Systemd, ProjectEditPage::Target { form, .. }) => {
-                form.target.systemd = optional(edit.value);
             }
             (TextField::Health, ProjectEditPage::Target { form, .. }) => {
                 form.target.health = optional(edit.value);
@@ -327,7 +322,7 @@ impl App {
                         TargetSetup {
                             destination: destination.key.clone(),
                             root: None,
-                            systemd: None,
+                            service: None,
                             health: None,
                             after: Vec::new(),
                         },
@@ -497,11 +492,8 @@ fn target_key(
             form.target.root.clone().unwrap_or_default(),
             ProjectEditPage::Target { form, cursor },
         ),
-        2 => text_page(
-            TextField::Systemd,
-            form.target.systemd.clone().unwrap_or_default(),
-            ProjectEditPage::Target { form, cursor },
-        ),
+        // App routes service editing to the shared remote-target editor.
+        2 => ProjectEditPage::Target { form, cursor },
         3 => text_page(
             TextField::Health,
             form.target.health.clone().unwrap_or_default(),

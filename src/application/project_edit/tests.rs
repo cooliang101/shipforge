@@ -34,7 +34,7 @@ impl Fixture {
                         TargetSetup {
                             destination: destination.clone(),
                             root: None,
-                            systemd: None,
+                            service: None,
                             health: None,
                             after: Vec::new(),
                         },
@@ -159,6 +159,69 @@ async fn added_environment_identity_is_generated_once_in_the_confirmed_preview()
     let yaml = preview.yaml().to_owned();
     assert_eq!(fixture.save(preview).await, expected);
     assert_eq!(fs::read_to_string(fixture.path()).unwrap(), yaml);
+}
+
+#[tokio::test]
+async fn legacy_systemd_conversion_is_previewed_without_identity_or_generation_changes() {
+    let fixture = Fixture::new();
+    let mut yaml: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(fixture.path()).unwrap()).unwrap();
+    yaml["schemaVersion"] = 1.into();
+    yaml["environments"]["production"]["components"]["backend"]["systemd"] = "api.service".into();
+    let old = serde_yaml_ng::to_string(&yaml).unwrap();
+    fs::write(fixture.path(), &old).unwrap();
+    let draft = fixture.draft().await;
+    let preview = fixture.preview(draft).await;
+    assert_eq!(fs::read_to_string(fixture.path()).unwrap(), old);
+    assert_eq!(preview.config().schema_version, 2);
+    assert_eq!(preview.config().project_id, fixture.original.project_id);
+    assert_eq!(
+        preview.config().environments["production"].id,
+        fixture.original.environments["production"].id
+    );
+    let target = &preview.config().environments["production"].components[&name("backend")];
+    assert_eq!(target.generation, ComponentGeneration::INITIAL);
+    assert_eq!(
+        target.service.as_ref().unwrap().preset_unit(),
+        Some("api.service")
+    );
+    assert!(!preview.yaml().contains("systemd: api.service"));
+    let expected = preview.config().clone();
+    assert_eq!(fixture.save(preview).await, expected);
+    assert_eq!(
+        config::load(fixture.directory.path()).unwrap(),
+        config::ProjectConfigState::Loaded(expected)
+    );
+}
+
+#[tokio::test]
+async fn custom_service_changes_are_frozen_and_increment_generation() {
+    let fixture = Fixture::new();
+    let mut draft = fixture.draft().await;
+    let target = draft
+        .setup
+        .environments
+        .get_mut("production")
+        .unwrap()
+        .components
+        .get_mut(&name("backend"))
+        .unwrap();
+    let mut service = crate::config::ServiceConfig::systemd("api.service");
+    service.start = vec![vec![
+        "pm2".into(),
+        "start".into(),
+        "ecosystem.config.cjs".into(),
+    ]];
+    service.stop = vec![vec!["pm2".into(), "delete".into(), "api".into()]];
+    service.check = None;
+    target.service = Some(service.clone());
+    let before = fs::read(fixture.path()).unwrap();
+    let preview = fixture.preview(draft).await;
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    let config = fixture.save(preview).await;
+    let target = &config.environments["production"].components[&name("backend")];
+    assert_eq!(target.generation.get(), 2);
+    assert_eq!(target.service, Some(service));
 }
 
 #[tokio::test]

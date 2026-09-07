@@ -381,7 +381,7 @@ fn setup_from_config(config: &ProjectConfig) -> ProjectSetup {
                                     TargetSetup {
                                         destination: target.destination.clone(),
                                         root: Some(target.root.clone()),
-                                        systemd: target.systemd.clone(),
+                                        service: target.service.clone(),
                                         health: target.health.clone(),
                                         after: target.after.clone(),
                                     },
@@ -439,15 +439,20 @@ pub(super) fn bound_setup(
         for (name, target) in &environment.components {
             add_text(name.as_str(), &mut bytes)?;
             add_text(target.destination.as_str(), &mut bytes)?;
-            for text in [
-                target.root.as_deref(),
-                target.systemd.as_deref(),
-                target.health.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
+            for text in [target.root.as_deref(), target.health.as_deref()]
+                .into_iter()
+                .flatten()
             {
                 add_text(text, &mut bytes)?;
+            }
+            if let Some(service) = &target.service {
+                service.validate().map_err(|_| ProjectEditError::Limit)?;
+                let encoded =
+                    serde_json::to_string(service).map_err(|_| ProjectEditError::Limit)?;
+                bytes += encoded.len();
+                if bytes > MAX_FILE_BYTES {
+                    return Err(ProjectEditError::Limit);
+                }
             }
             if target.after.len() > MAX_COMPONENTS {
                 return Err(ProjectEditError::Limit);

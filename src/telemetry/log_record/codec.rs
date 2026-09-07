@@ -309,17 +309,20 @@ fn sanitize_command(
     {
         return Err(LogCodecError::Invalid);
     }
-    let bytes = command
-        .args
-        .iter()
-        .fold(command.program.len(), |sum, argument| {
-            sum.saturating_add(argument.len())
-        });
+    let bytes = command.args.iter().fold(
+        command.program.len() + command.working_directory.as_ref().map_or(0, String::len),
+        |sum, argument| sum.saturating_add(argument.len()),
+    );
     if bytes > MAX_COMMAND_BYTES {
         return Err(LogCodecError::Limit);
     }
     let mut safe = command.clone();
     safe.program = sanitize_log_text(&safe.program, redactor, MAX_COMMAND_BYTES)?;
+    safe.working_directory = safe
+        .working_directory
+        .as_ref()
+        .map(|directory| sanitize_log_text(directory, redactor, MAX_COMMAND_BYTES))
+        .transpose()?;
     let mut hide_next = false;
     for argument in &mut safe.args {
         // Controls can conceal a sensitive flag name, so classify its safe spelling.
@@ -345,9 +348,10 @@ fn sanitize_command(
             && !original.chars().any(char::is_whitespace)
             && sensitive_name(&original);
     }
-    let bytes = safe.args.iter().fold(safe.program.len(), |sum, argument| {
-        sum.saturating_add(argument.len())
-    });
+    let bytes = safe.args.iter().fold(
+        safe.program.len() + safe.working_directory.as_ref().map_or(0, String::len),
+        |sum, argument| sum.saturating_add(argument.len()),
+    );
     if bytes > MAX_COMMAND_BYTES || safe.program.is_empty() {
         return Err(LogCodecError::Limit);
     }

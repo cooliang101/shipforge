@@ -1101,14 +1101,25 @@ fn render_deployment_review(
             .get(&plan.selection.environment)
             .and_then(|environment| environment.components.get(&entry.component))
         {
-            let _ = writeln!(
-                content,
-                "  Service: {}",
-                target.systemd.as_deref().unwrap_or("none; files only")
-            );
-            let health = match (target.systemd.is_some(), target.health.is_some()) {
-                (true, true) => "systemd stability and remote HTTP/HTTPS",
-                (true, false) => "systemd stability",
+            let label = target
+                .service
+                .as_ref()
+                .map_or("none; files only", |service| {
+                    service.preset_unit().unwrap_or("custom commands")
+                });
+            let _ = writeln!(content, "  Service: {label}");
+            if let Some(service) = &target.service {
+                content.push_str(&service_preview(service, &target.root));
+            }
+            let health = match (
+                target
+                    .service
+                    .as_ref()
+                    .is_some_and(|service| service.check.is_some()),
+                target.health.is_some(),
+            ) {
+                (true, true) => "configured service check and remote HTTP/HTTPS",
+                (true, false) => "configured service check",
                 (false, true) => "remote HTTP/HTTPS",
                 (false, false) => "none configured; application health will not be verified",
             };
@@ -1131,6 +1142,52 @@ fn render_deployment_review(
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn service_preview(service: &crate::config::ServiceConfig, root: &str) -> String {
+    let root = safe_text(root);
+    let mut content =
+        format!("  Service directory: {root}/releases/<selected or restored version>\n");
+    for (stage, commands) in [
+        ("First start", &service.start),
+        ("Update", service.update_commands()),
+        ("Restore", service.restore_commands()),
+        ("Stop when undeployed", &service.stop),
+    ] {
+        for argv in commands {
+            let _ = writeln!(content, "  {stage}: {argv:?}");
+        }
+    }
+    match &service.check {
+        Some(crate::config::ServiceCheck::Command { argv }) => {
+            let _ = writeln!(
+                content,
+                "  Read-only check in {root}/current: {argv:?}; exit 0 required, at most 5 attempts"
+            );
+        }
+        Some(crate::config::ServiceCheck::Systemd { unit }) => {
+            let _ = writeln!(
+                content,
+                "  Systemd check: {unit}; active and stable NRestarts for 10 seconds"
+            );
+        }
+        None => content.push_str("  No service health check configured\n"),
+    }
+    content
+}
+
+#[cfg(test)]
+mod service_preview_tests {
+    #[test]
+    fn preview_sanitizes_directory_text_and_shows_effective_lifecycle_commands() {
+        let service = crate::config::ServiceConfig::systemd("api.service");
+        let preview = super::service_preview(&service, "/srv/a\u{202e}\u{1b}[2J");
+        assert!(!preview.contains('\u{202e}') && !preview.contains('\u{1b}'));
+        for stage in ["First start", "Update", "Restore", "Stop when undeployed"] {
+            assert!(preview.contains(stage));
+        }
+        assert_eq!(preview.matches("\"restart\"").count(), 3);
+    }
 }
 
 fn build_preview(build: &crate::config::ComponentConfig) -> String {

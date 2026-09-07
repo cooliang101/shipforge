@@ -43,6 +43,7 @@ impl ValidatedDestinationSettings for Settings {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independently injected faults.
 struct FakeState {
     actions: Vec<String>,
     audit_warning: Option<String>,
@@ -50,6 +51,7 @@ struct FakeState {
     fail_activate: Option<ComponentName>,
     fail_activate_after_switch: Option<ComponentName>,
     cancel_activation_error: bool,
+    service_outcome_unknown: bool,
     fail_rollback: Option<ComponentName>,
     fail_rollback_after_switch: Option<ComponentName>,
     fail_current: Option<ComponentName>,
@@ -94,6 +96,7 @@ impl FakeDriver {
 
     fn error(stage: &str, component: &ComponentName) -> DriverError {
         DriverError {
+            recovery_blocked: false,
             stage: stage.into(),
             target: component.to_string(),
             message: "injected failure".into(),
@@ -237,7 +240,9 @@ impl DeploymentDriver for FakeDriver {
             if self.state.lock().unwrap().cancel_activation_error {
                 self.cancellation.cancel();
             }
-            return Err(Self::error("activate", &context.component));
+            let mut error = Self::error("activate", &context.component);
+            error.recovery_blocked = self.state.lock().unwrap().service_outcome_unknown;
+            return Err(error);
         }
         if self.state.lock().unwrap().cancel_after_activate.as_ref() == Some(&context.component) {
             self.cancellation.cancel();
@@ -538,6 +543,45 @@ async fn history_reopens_frozen_component_packages_receipts_and_timed_steps() {
             assert!(step.started_at_ms.unwrap() <= step.completed_at_ms.unwrap());
         }
     }
+}
+
+#[tokio::test]
+async fn unknown_service_outcome_is_not_overridden_by_link_observation_or_cancellation() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_activate_after_switch = Some(ComponentName::parse("backend").unwrap());
+        state.service_outcome_unknown = true;
+        state.cancel_activation_error = true;
+    }
+    let report = fixture.deploy(&["frontend", "backend", "worker"]).await;
+    assert_eq!(report.deployment.state, DeploymentState::Failed);
+    assert!(matches!(
+        report.failure,
+        Some(DeploymentFailure::Driver {
+            error: DriverError {
+                recovery_blocked: true,
+                ..
+            },
+            ..
+        })
+    ));
+    assert!(
+        !fixture
+            .actions()
+            .iter()
+            .any(|action| action == "rollback:backend")
+    );
+    assert!(
+        fixture
+            .actions()
+            .iter()
+            .any(|action| action == "rollback:frontend")
+    );
+    assert_eq!(
+        report.deployment.components[&ComponentName::parse("backend").unwrap()].outcome,
+        ComponentOutcome::Failed
+    );
 }
 
 #[tokio::test]

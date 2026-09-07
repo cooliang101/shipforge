@@ -190,6 +190,7 @@ fn every_display_field_and_complete_failed_command_passes_codec_redaction() {
         scope: Some(scope("api", "step.SECRET_VALUE")),
         kind: LogEventKind::FailedCommand {
             command: RecordedCommand {
+                working_directory: None,
                 location: CommandLocation::Local,
                 index: Some(1),
                 program: "program".into(),
@@ -217,6 +218,7 @@ fn oversized_command_is_explicitly_unavailable_not_a_truncated_runnable_copy() {
         scope: Some(scope("api", "build-package")),
         kind: LogEventKind::FailedCommand {
             command: RecordedCommand {
+                working_directory: None,
                 location: CommandLocation::Local,
                 index: Some(2),
                 program: "program".into(),

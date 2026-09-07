@@ -264,6 +264,10 @@ fn record_matches(record: &LogRecord, filter: &LogFilter) -> bool {
             LogEventKind::FailedCommand { command } => {
                 contains_text(&command.program, &filter.text)
                     || command
+                        .working_directory
+                        .as_ref()
+                        .is_some_and(|directory| contains_text(directory, &filter.text))
+                    || command
                         .args
                         .iter()
                         .any(|argument| contains_text(argument, &filter.text))

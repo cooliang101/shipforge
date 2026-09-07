@@ -71,13 +71,35 @@ fn setup() -> ProjectSetup {
                         destination: DestinationKey::parse("dst_00000000000000000000000000000001")
                             .unwrap(),
                         root: None,
-                        systemd: Some("mall-api.service".into()),
+                        service: Some("mall-api.service".into()),
                         health: None,
                         after: Vec::new(),
                     },
                 )]),
             },
         )]),
+    }
+}
+
+#[test]
+fn service_schema_boundary_rejects_legacy_keys_and_explicit_null_forms() {
+    for (schema, field) in [
+        (2, "systemd: api.service"),
+        (2, "systemd: null"),
+        (2, "service: null"),
+        (1, "service: null"),
+        (1, "service: {start: [[node]], stop: [[node]]}"),
+    ] {
+        let yaml = VALID
+            .replace("schemaVersion: 1", &format!("schemaVersion: {schema}"))
+            .replace(
+                "        after: [backend]",
+                &format!("        {field}\n        after: [backend]"),
+            );
+        assert!(
+            load_text(&yaml).is_err(),
+            "schema {schema} must reject {field}"
+        );
     }
 }
 

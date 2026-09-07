@@ -121,6 +121,7 @@ impl DeploymentDriver for FakeDriver {
             .cloned()
             .unwrap_or_else(|| Ok(empty_inventory(None)))
             .map_err(|message| DriverError {
+                recovery_blocked: false,
                 stage: "inventory".into(),
                 target: "private.example.test".into(),
                 message,
@@ -327,6 +328,7 @@ impl Fixture {
                 let mut expected = release.clone();
                 expected.version = version(previous.unwrap_or("unused"));
                 DeploymentComponentSnapshot {
+                    target_snapshot: None,
                     release: release.clone(),
                     target: Some(release),
                     expected_current: previous.map(|_| expected),

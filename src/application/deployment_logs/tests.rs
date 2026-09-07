@@ -99,6 +99,7 @@ async fn event_writer_redacts_named_command_secrets_and_rejects_invalid_metadata
         scope: None,
         kind: LogEventKind::FailedCommand {
             command: RecordedCommand {
+                working_directory: None,
                 location: CommandLocation::Local,
                 index: Some(1),
                 program: "tool".into(),

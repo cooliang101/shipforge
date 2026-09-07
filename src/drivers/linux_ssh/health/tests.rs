@@ -66,7 +66,7 @@ fn target(systemd: Option<&str>, health: Option<&str>) -> LinuxSshTarget {
     LinuxSshTarget::validate(&DriverTargetInput {
         value: serde_json::json!({
             "root": "/srv/app",
-            "systemd": systemd,
+            "service": systemd.map(crate::config::ServiceConfig::systemd),
             "health": health,
         }),
     })
@@ -80,6 +80,39 @@ fn options() -> HealthCheckOptions {
         attempts: 3,
         stable_for: Duration::from_millis(1),
     }
+}
+
+#[tokio::test]
+async fn custom_check_retries_in_current_directory_without_systemd() {
+    let mut target = target(None, None);
+    let mut service = crate::config::ServiceConfig::systemd("api.service");
+    service.check = Some(crate::config::ServiceCheck::Command {
+        argv: vec!["node".into(), "check.cjs".into()],
+    });
+    target.service = Some(service);
+    let remote = FakeRemote::new([Ok(output(1, "not ready")), Ok(output(0, "ready"))]);
+    let report = check_with_remote(&remote, &target, options(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.command_attempts, Some(2));
+    assert!(report.systemd.is_none() && report.http.is_none());
+    assert_eq!(
+        remote.commands(),
+        vec!["cd -- '/srv/app/current' && exec 'node' 'check.cjs'"; 2]
+    );
+    let remote = FakeRemote::new([Err(SshConnectionError::Cancelled)]);
+    assert!(matches!(
+        check_with_remote(&remote, &target, options(), &CancellationToken::new()).await,
+        Err(HealthCheckError::Cancelled)
+    ));
+    assert_eq!(remote.commands().len(), 1);
+    let remote = FakeRemote::new((0..3).map(|_| Ok(output(1, "private-output"))));
+    let error = check_with_remote(&remote, &target, options(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, HealthCheckError::ServiceProbeFailed));
+    assert!(!error.to_string().contains("private-output"));
+    assert_eq!(remote.commands().len(), 3);
 }
 
 #[tokio::test]

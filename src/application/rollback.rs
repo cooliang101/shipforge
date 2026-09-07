@@ -290,6 +290,7 @@ impl<'a> RollbackOrchestrator<'a> {
             .map(|(index, name)| {
                 let component = &components[name];
                 Ok(DeploymentComponentSnapshot {
+                    target_snapshot: component.context.target.snapshot(),
                     release: component
                         .target
                         .as_ref()
@@ -1041,6 +1042,7 @@ async fn failed_rollback(
     let name = &component.context.component;
     let was_error = result.is_err();
     let error = result.err().unwrap_or_else(|| DriverError {
+        recovery_blocked: false,
         stage: "rollback".into(),
         target: name.to_string(),
         message: "Driver Rollback receipt is unhealthy or differs from the requested target".into(),
@@ -1051,10 +1053,11 @@ async fn failed_rollback(
         Ok(observed) => {
             // Only a successful observation can prove that the target, including
             // not_deployed, was reached. An I/O error must never stand in for None.
-            if observed == &component.target {
+            if !error.recovery_blocked && observed == &component.target {
                 applied.push(AppliedRollback::new(component));
             }
-            if was_error
+            if !error.recovery_blocked
+                && was_error
                 && cancellation.is_cancelled()
                 && (observed == &component.target
                     || observed.as_ref() == Some(&component.expected_current))
@@ -1115,6 +1118,7 @@ async fn observe_after_failure(
             },
         });
         Err(DriverError {
+            recovery_blocked: false,
             stage: "observe".into(),
             target: context.component.to_string(),
             message: "post-failure Rollback observation timed out".into(),
@@ -1172,6 +1176,7 @@ fn failure_observed(
 
 fn contract_error(component: &ComponentName, message: &str) -> DriverError {
     DriverError {
+        recovery_blocked: false,
         stage: "compensate".into(),
         target: component.to_string(),
         message: message.into(),

@@ -826,6 +826,7 @@ mod tests {
             record,
             metadata: None,
             snapshots: vec![DeploymentComponentSnapshot {
+                target_snapshot: None,
                 release: release.clone(),
                 expected_current: Some(release),
                 target: None,
@@ -1166,6 +1167,7 @@ mod tests {
         let mut deployment = Deployment::new();
         deployment.state = DeploymentState::Failed;
         let error = DriverError {
+            recovery_blocked: false,
             stage: "linux-ssh.health".into(),
             target: "private-error-target".into(),
             message: "private-error-message".into(),

@@ -28,13 +28,18 @@ impl LogRow {
         match &self.event.kind {
             LogEventKind::FailedCommand { command } => {
                 command.args.len() <= MAX_COMMAND_ARGUMENTS
-                    && command.program.len().saturating_add(
-                        command
-                            .args
-                            .iter()
-                            .map(String::len)
-                            .fold(0usize, usize::saturating_add),
-                    ) <= MAX_COMMAND_BYTES
+                    && command
+                        .program
+                        .len()
+                        .saturating_add(command.working_directory.as_ref().map_or(0, String::len))
+                        .saturating_add(
+                            command
+                                .args
+                                .iter()
+                                .map(String::len)
+                                .fold(0usize, usize::saturating_add),
+                        )
+                        <= MAX_COMMAND_BYTES
             }
             _ => true,
         }
@@ -48,7 +53,9 @@ impl LogRow {
             .map_or(0, |scope| scope.component.as_str().len() + scope.step.len());
         let command = match &self.event.kind {
             LogEventKind::FailedCommand { command } => {
-                command.program.len() + command.args.iter().map(String::len).sum::<usize>()
+                command.program.len()
+                    + command.working_directory.as_ref().map_or(0, String::len)
+                    + command.args.iter().map(String::len).sum::<usize>()
             }
             _ => 0,
         };
@@ -62,6 +69,10 @@ impl LogRow {
         let command = match &self.event.kind {
             LogEventKind::FailedCommand { command } => {
                 command.program.capacity()
+                    + command
+                        .working_directory
+                        .as_ref()
+                        .map_or(0, String::capacity)
                     + command.args.capacity() * size_of::<String>()
                     + command.args.iter().map(String::capacity).sum::<usize>()
             }
@@ -275,6 +286,10 @@ impl LogView {
             || match &row.event.kind {
                 LogEventKind::FailedCommand { command } => {
                     contains(&command.program)
+                        || command
+                            .working_directory
+                            .as_ref()
+                            .is_some_and(|directory| contains(directory))
                         || command.args.iter().any(|argument| contains(argument))
                 }
                 _ => false,

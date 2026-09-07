@@ -152,7 +152,10 @@ impl App {
             }
             return;
         }
-        if key == KeyCode::Char('b') && matches!(screen.page, ProjectEditPage::Target { .. }) {
+        if (key == KeyCode::Char('b') && matches!(screen.page, ProjectEditPage::Target { .. }))
+            || (key == KeyCode::Enter
+                && matches!(screen.page, ProjectEditPage::Target { cursor: 2, .. }))
+        {
             if let Some(target) =
                 super::remote_target::RemoteSetupSelectionState::from_editor(screen.clone())
             {

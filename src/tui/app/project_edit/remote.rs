@@ -14,7 +14,7 @@ impl ProjectEditScreen {
         String,
         String,
         String,
-        Option<String>,
+        Option<crate::config::ServiceConfig>,
     )> {
         let ProjectEditPage::Target { form, .. } = &self.page else {
             return None;
@@ -55,18 +55,18 @@ impl ProjectEditScreen {
             draft.setup.project.clone(),
             form.environment.name.clone(),
             root,
-            form.target.systemd.clone(),
+            form.target.service.clone(),
         ))
     }
 
     pub(in crate::tui::app) fn apply_remote_target(
         &mut self,
         root: String,
-        service: Option<String>,
+        service: Option<crate::config::ServiceConfig>,
     ) {
         if let ProjectEditPage::Target { form, .. } = &mut self.page {
             form.target.root = Some(root);
-            form.target.systemd = service;
+            form.target.service = service;
             // The enclosing form still needs its existing Apply action; YAML save is separate.
         }
     }

@@ -320,7 +320,7 @@ mod tests {
                             )
                             .unwrap(),
                             root: None,
-                            systemd: Some("demo.service".into()),
+                            service: Some("demo.service".into()),
                             health: None,
                             after: Vec::new(),
                         },

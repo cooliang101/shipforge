@@ -44,6 +44,7 @@ impl ManagementGateway for FailingEventGateway {
                 }),
                 kind: LogEventKind::FailedCommand {
                     command: RecordedCommand {
+                        working_directory: None,
                         location: CommandLocation::Remote,
                         index: None,
                         program: "recorded-rollback-tool".into(),

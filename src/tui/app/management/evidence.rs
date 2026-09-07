@@ -718,6 +718,7 @@ mod tests {
             .environment_id
             .clone_from(&details.record.environment);
         details.snapshots.push(DeploymentComponentSnapshot {
+            target_snapshot: None,
             release: release.clone(),
             expected_current: Some(release.clone()),
             target: None,

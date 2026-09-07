@@ -61,7 +61,7 @@ impl Fixture {
                             TargetSetup {
                                 destination,
                                 root: None,
-                                systemd: Some("demo.service".into()),
+                                service: Some("demo.service".into()),
                                 health: Some("http://127.0.0.1:8080/health".into()),
                                 after: Vec::new(),
                             },
@@ -238,7 +238,7 @@ async fn malformed_human_intent_and_sensitive_or_ambiguous_managed_state_are_rej
         fixture.edit(|yaml| {
             yaml["_shipforge"]["projectId"] = "broken".into();
             match case {
-                0 => yaml["schemaVersion"] = 2.into(),
+                0 => yaml["schemaVersion"] = 99.into(),
                 1 => yaml["components"]["backend"]["build"] = "secret-sentinel".into(),
                 2 => yaml["components"]["backend"]["artifact"] = "../secret-sentinel".into(),
                 3 => yaml["secret-sentinel"] = "must-not-echo".into(),

@@ -48,3 +48,20 @@ pub use target::{LinuxSshTarget, LinuxSshTargetError};
 pub use transfer::{
     RemotePath, RemotePathError, UploadError, UploadOptions, UploadProgress, UploadReceipt,
 };
+/// Shared command construction for service presets, custom actions and checks.
+pub(super) fn service_command(
+    argv: &[String],
+    directory: &str,
+) -> Result<crate::telemetry::CommandSpec, crate::telemetry::SecurityError> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or(crate::telemetry::SecurityError::InvalidCommand)?;
+    crate::telemetry::CommandSpec::structured(
+        program,
+        arguments
+            .iter()
+            .cloned()
+            .map(crate::telemetry::CommandArgument::plain),
+    )?
+    .in_directory(directory)
+}

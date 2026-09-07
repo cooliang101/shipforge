@@ -80,6 +80,9 @@ impl DeploymentService {
         destinations: &DestinationRegistry,
         cancellation: &CancellationToken,
     ) -> Result<DeploymentPlan, DeploymentServiceError> {
+        if selection.config.schema_version != 2 {
+            return Err(DeploymentServiceError::InvalidSelection("Open the project editor, preview and confirm the service configuration upgrade before deployment.".into()));
+        }
         if selection.components.is_empty() {
             return Err(DeploymentServiceError::InvalidSelection(
                 "select at least one Component".into(),
@@ -1066,6 +1069,7 @@ mod version_tests {
                 compensation_failures.insert(
                     name.clone(),
                     crate::drivers::DriverError {
+                        recovery_blocked: false,
                         stage: "compensate".into(),
                         target: name.to_string(),
                         message: "state unknown".into(),

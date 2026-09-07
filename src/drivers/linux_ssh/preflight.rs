@@ -92,8 +92,31 @@ async fn check_with_remote<R: PreflightRemote>(
     cancellation: &CancellationToken,
 ) -> Result<Vec<String>, PreflightError> {
     let mut tools = TOOLS.to_vec();
-    if target.systemd.is_some() {
-        tools.push("systemctl");
+    if let Some(service) = &target.service {
+        for commands in [
+            &service.start,
+            &service.update,
+            &service.restore,
+            &service.stop,
+        ] {
+            for argv in commands {
+                if let Some(program) = argv.first() {
+                    // Relative scripts belong to the Release, not the login cwd.
+                    if !program.contains('/') || program.starts_with('/') {
+                        tools.push(program.as_str());
+                    }
+                }
+            }
+        }
+        if let Some(crate::config::ServiceCheck::Command { argv }) = &service.check
+            && let Some(program) = argv.first()
+            && (!program.contains('/') || program.starts_with('/'))
+        {
+            tools.push(program.as_str());
+        }
+        if service.systemd_unit().is_some() {
+            tools.push("systemctl");
+        }
     }
     if target.health.is_some() {
         tools.push("curl");
@@ -253,7 +276,11 @@ async fn check_optional_tools<R: PreflightRemote>(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<(), PreflightError> {
-    if let Some(unit) = &target.systemd {
+    if let Some(unit) = target
+        .service
+        .as_ref()
+        .and_then(crate::config::ServiceConfig::systemd_unit)
+    {
         let output = run(
             remote,
             "configured systemd service",

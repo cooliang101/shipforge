@@ -461,7 +461,7 @@ fn help_escape_does_not_cancel_planning_but_control_c_does() {
                     crate::config::TargetSetup {
                         destination,
                         root: None,
-                        systemd: None,
+                        service: None,
                         health: None,
                         after: Vec::new(),
                     },

@@ -368,7 +368,7 @@ impl ManualComponentScreen {
                         TargetSetup {
                             destination: DestinationKey::new(),
                             root: None,
-                            systemd: None,
+                            service: None,
                             health: None,
                             after: Vec::new(),
                         },

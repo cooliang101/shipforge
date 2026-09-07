@@ -65,7 +65,7 @@ impl Fixture {
         let backend = TargetSetup {
             destination: destination.clone(),
             root: None,
-            systemd: None,
+            service: None,
             health: None,
             after: Vec::new(),
         };
@@ -996,7 +996,7 @@ async fn environment_component_subset_and_saved_destination_are_selected_without
     };
     assert_eq!(form.target.destination, destinations[1].key);
     form.target.root = Some("/srv/changed-worker".into());
-    form.target.systemd = Some("worker.service".into());
+    form.target.service = Some("worker.service".into());
     form.target.health = None;
     set_page(
         &mut fixture.app,
@@ -1019,7 +1019,13 @@ async fn environment_component_subset_and_saved_destination_are_selected_without
     let target = &preview.config().environments["production"].components[&name("worker")];
     assert_eq!(target.destination, destinations[1].key);
     assert_eq!(target.root, "/srv/changed-worker");
-    assert_eq!(target.systemd.as_deref(), Some("worker.service"));
+    assert_eq!(
+        target
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
+        Some("worker.service")
+    );
     assert!(
         target.generation
             > fixture.original.environments["production"].components[&name("worker")].generation

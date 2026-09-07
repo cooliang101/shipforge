@@ -49,7 +49,7 @@ pub struct TargetConfig {
     pub destination: DestinationKey,
     pub generation: ComponentGeneration,
     pub root: String,
-    pub systemd: Option<String>,
+    pub service: Option<crate::config::ServiceConfig>,
     pub health: Option<String>,
     pub after: Vec<ComponentName>,
 }
@@ -60,7 +60,7 @@ impl TargetConfig {
         crate::drivers::DriverTargetInput {
             value: serde_json::json!({
                 "root": self.root,
-                "systemd": self.systemd,
+                "service": self.service,
                 "health": self.health,
             }),
         }
@@ -251,8 +251,22 @@ pub(super) struct RawTarget {
     #[serde(rename = "to")]
     pub destination: DestinationKey,
     pub root: Option<String>,
+    #[serde(default, deserialize_with = "present_value")]
+    pub service: Option<crate::config::ServiceConfig>,
+    // Read-only schema-v1 conversion input; never emitted by the writer.
+    #[serde(default, deserialize_with = "present_value")]
     pub systemd: Option<String>,
     pub health: Option<String>,
     #[serde(default)]
     pub after: Vec<ComponentName>,
+}
+
+// Omitted optional fields are allowed, but explicit null must not hide a key
+// belonging to another schema version from the conversion boundary.
+fn present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }

@@ -12,7 +12,7 @@ const MAX_HEALTH_URL_BYTES: usize = 2048;
 pub struct LinuxSshTarget {
     driver: DriverKind,
     pub root: String,
-    pub systemd: Option<String>,
+    pub service: Option<crate::config::ServiceConfig>,
     pub health: Option<String>,
 }
 
@@ -22,7 +22,7 @@ impl fmt::Debug for LinuxSshTarget {
             .debug_struct("LinuxSshTarget")
             .field("driver", &self.driver)
             .field("root", &self.root)
-            .field("systemd", &self.systemd)
+            .field("service", &self.service)
             .field("health", &self.health.as_ref().map(|_| "[REDACTED URL]"))
             .finish()
     }
@@ -41,13 +41,11 @@ impl LinuxSshTarget {
         if !valid_root(&raw.root) {
             return Err(LinuxSshTargetError::Root(raw.root));
         }
-        if let Some(systemd) = &raw.systemd
-            && (!systemd.ends_with(".service")
-                || !systemd.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@' | b':')
-                }))
-        {
-            return Err(LinuxSshTargetError::Systemd(systemd.clone()));
+        let service = raw.service;
+        if let Some(service) = &service {
+            service
+                .validate()
+                .map_err(|_| LinuxSshTargetError::Service)?;
         }
         if let Some(health) = &raw.health
             && !valid_health_url(health)
@@ -57,7 +55,7 @@ impl LinuxSshTarget {
         Ok(Self {
             driver: DriverKind::linux_ssh(),
             root: raw.root,
-            systemd: raw.systemd,
+            service,
             health: raw.health,
         })
     }
@@ -120,6 +118,12 @@ impl ValidatedTargetSettings for LinuxSshTarget {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"root": self.root, "service": self.service, "health": self.health}))
+    }
+    fn requires_recovery_snapshot(&self) -> bool {
+        self.service.is_some()
+    }
 }
 
 fn valid_root(root: &str) -> bool {
@@ -138,20 +142,20 @@ fn valid_root(root: &str) -> bool {
 #[serde(deny_unknown_fields)]
 struct RawLinuxSshTarget {
     root: String,
-    systemd: Option<String>,
+    service: Option<crate::config::ServiceConfig>,
     health: Option<String>,
 }
 
 #[derive(Debug, Error)]
 pub enum LinuxSshTargetError {
+    #[error("invalid or ambiguous remote service command configuration")]
+    Service,
     #[error("invalid linux-ssh target fields: {0}")]
     Shape(serde_json::Error),
     #[error(
         "linux-ssh root must be a normalized absolute POSIX path of at most {MAX_REMOTE_ROOT_BYTES} bytes: `{0}`"
     )]
     Root(String),
-    #[error("systemd unit must be a complete .service name without whitespace: `{0}`")]
-    Systemd(String),
     #[error("health must be a bounded HTTP or HTTPS URL without credentials or fragments")]
     Health,
 }
@@ -165,7 +169,7 @@ mod tests {
         let target = LinuxSshTarget::validate(&DriverTargetInput {
             value: serde_json::json!({
                 "root": "/srv/shipforge/mall/production/api",
-                "systemd": "mall-api.service",
+                "service": crate::config::ServiceConfig::systemd("mall-api.service"),
                 "health": "http://127.0.0.1:8080/health"
             }),
         })
@@ -182,7 +186,7 @@ mod tests {
             LinuxSshTarget::validate(&DriverTargetInput {
                 value: serde_json::json!({
                     "root": "/srv/app/../other",
-                    "systemd": null,
+                    "service": null,
                     "health": null
                 }),
             }),
@@ -192,27 +196,27 @@ mod tests {
             LinuxSshTarget::validate(&DriverTargetInput {
                 value: serde_json::json!({
                     "root": "/srv/app",
-                    "systemd": "api",
+                    "service": crate::config::ServiceConfig::systemd("api"),
                     "health": null
                 }),
             }),
-            Err(LinuxSshTargetError::Systemd(_))
+            Err(LinuxSshTargetError::Service)
         ));
         assert!(matches!(
             LinuxSshTarget::validate(&DriverTargetInput {
                 value: serde_json::json!({
                     "root": "/srv/app",
-                    "systemd": "api;restart.service",
+                    "service": crate::config::ServiceConfig::systemd("api;restart.service"),
                     "health": null
                 }),
             }),
-            Err(LinuxSshTargetError::Systemd(_))
+            Err(LinuxSshTargetError::Service)
         ));
         assert!(matches!(
             LinuxSshTarget::validate(&DriverTargetInput {
                 value: serde_json::json!({
                     "root": format!("/{}", "a".repeat(MAX_REMOTE_ROOT_BYTES)),
-                    "systemd": null,
+                    "service": null,
                     "health": null
                 }),
             }),
@@ -234,7 +238,7 @@ mod tests {
                 LinuxSshTarget::validate(&DriverTargetInput {
                     value: serde_json::json!({
                         "root": "/srv/app",
-                        "systemd": null,
+                        "service": null,
                         "health": health,
                     }),
                 }),

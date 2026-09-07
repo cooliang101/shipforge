@@ -1467,7 +1467,7 @@ fn protocol_target() -> LinuxSshTarget {
     LinuxSshTarget::validate(&DriverTargetInput {
         value: serde_json::json!({
             "root": "/srv/shipforge/protocol/production/api",
-            "systemd": null,
+            "service": null,
             "health": "http://127.0.0.1:8080/health"
         }),
     })
@@ -1796,7 +1796,7 @@ async fn validate_production_driver(
         .validate_target(&DriverTargetInput {
             value: serde_json::json!({
                 "root": "/srv/shipforge/protocol/production/api",
-                "systemd": null,
+                "service": null,
                 "health": "http://127.0.0.1:8080/health"
             }),
         })

@@ -1,5 +1,5 @@
 # Example only. The TUI generates and maintains this section.
-schemaVersion: 1
+schemaVersion: 2
 _shipforge:
   projectId: prj_01J8MALL4Y2K6M7P
   environments:
@@ -40,9 +40,23 @@ environments:
         to: dst_00000000000000000000000000000001
       backend:
         to: dst_00000000000000000000000000000002
-        systemd: mall-api.service
+        service:
+          start:
+            - [systemctl, restart, --, mall-api.service]
+          stop:
+            - [systemctl, stop, --, mall-api.service]
+          check:
+            kind: systemd
+            unit: mall-api.service
         health: http://127.0.0.1:8080/health
       worker:
         to: dst_00000000000000000000000000000002
-        systemd: mall-worker.service
+        service:
+          start:
+            - [systemctl, restart, --, mall-worker.service]
+          stop:
+            - [systemctl, stop, --, mall-worker.service]
+          check:
+            kind: systemd
+            unit: mall-worker.service
         after: [backend]

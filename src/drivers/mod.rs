@@ -188,6 +188,15 @@ impl From<EndpointFingerprint> for String {
 pub trait ValidatedTargetSettings: Any + fmt::Debug + Send + Sync {
     fn driver_kind(&self) -> &DriverKind;
     fn as_any(&self) -> &dyn Any;
+    /// Non-secret, canonical input retained for historical recovery. None means
+    /// unavailable, never permission to reconstruct commands from current YAML.
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Whether legacy history without a target snapshot cannot authorize recovery.
+    fn requires_recovery_snapshot(&self) -> bool {
+        false
+    }
 }
 
 pub trait ValidatedDestinationSettings: Any + fmt::Debug + Send + Sync {
@@ -421,6 +430,9 @@ pub trait EventSink: Send + Sync {
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("{stage} failed for {target}: {message}; suggested action: {suggested_action}")]
 pub struct DriverError {
+    /// An in-flight service operation may still have effects. A version
+    /// observation alone cannot authorize automatic compensation of this target.
+    pub recovery_blocked: bool,
     pub stage: String,
     pub target: String,
     pub message: String,
@@ -430,6 +442,7 @@ pub struct DriverError {
 impl DriverError {
     fn configuration(target: &str, message: &str) -> Self {
         Self {
+            recovery_blocked: false,
             stage: "configuration".into(),
             target: target.into(),
             message: message.into(),
@@ -490,6 +503,7 @@ pub trait DeploymentDriver: fmt::Debug + Send + Sync {
         context: &ComponentExecutionContext,
     ) -> Result<ComponentInventory, DriverError> {
         Err(DriverError {
+            recovery_blocked: false,
             stage: "inventory".into(),
             target: context.component.to_string(),
             message: "Driver does not support Release inventory".into(),

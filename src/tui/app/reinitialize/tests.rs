@@ -61,7 +61,7 @@ impl Fixture {
                             TargetSetup {
                                 destination,
                                 root: None,
-                                systemd: None,
+                                service: None,
                                 health: None,
                                 after: Vec::new(),
                             },
@@ -577,7 +577,10 @@ async fn more_than_u16_lines_of_valid_yaml_remain_reviewable_and_save_without_tr
         components.insert(name.clone().into(), component);
         let mut target = target.clone();
         if index == 4 {
-            target["systemd"] = "last-evidence.service".into();
+            target["service"] = serde_yaml_ng::to_value(crate::config::ServiceConfig::systemd(
+                "last-evidence.service",
+            ))
+            .unwrap();
         }
         targets.insert(name.into(), target);
     }

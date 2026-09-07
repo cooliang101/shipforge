@@ -42,7 +42,11 @@ async fn cancelled_real_worker_remains_tracked_until_cleanup_and_rejects_late_su
     assert!(fixture.selection().search_choices().is_none());
     assert_eq!(fixture.selection().root, "/srv/original-api");
     assert_eq!(
-        fixture.selection().service().as_deref(),
+        fixture
+            .selection()
+            .service()
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("original-api.service")
     );
     fixture.assert_read_only();
@@ -176,7 +180,11 @@ async fn f4_focus_preserves_real_indices_without_opening_directories_or_applying
     }
     fixture.app.handle_key(key(KeyCode::Enter));
     assert_eq!(
-        fixture.selection().service().as_deref(),
+        fixture
+            .selection()
+            .service()
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("worker.service")
     );
     assert_eq!(fixture.gateway.calls.load(Ordering::SeqCst), 3);
@@ -201,7 +209,10 @@ async fn f4_focus_preserves_real_indices_without_opening_directories_or_applying
         panic!("expected setup");
     };
     assert_eq!(
-        setup.target_settings[&name("backend")].systemd.as_deref(),
+        setup.target_settings[&name("backend")]
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("original-api.service")
     );
     fixture.assert_read_only();
@@ -242,7 +253,10 @@ async fn two_components_keep_independent_roots_and_services_until_plain_yaml_con
         Some("/srv/api")
     );
     assert_eq!(
-        setup.target_settings[&name("backend")].systemd.as_deref(),
+        setup.target_settings[&name("backend")]
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("api.service")
     );
     assert_eq!(
@@ -250,7 +264,10 @@ async fn two_components_keep_independent_roots_and_services_until_plain_yaml_con
         Some("/srv/worker")
     );
     assert_eq!(
-        setup.target_settings[&name("worker")].systemd.as_deref(),
+        setup.target_settings[&name("worker")]
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("worker.service")
     );
     fixture.app.handle_key(key(KeyCode::Char('n')));
@@ -334,6 +351,68 @@ fn long_lists_keep_actual_selected_directory_root_and_observation_visible() {
         }
         assert!(rendered(&screen, 100, 10).contains("No child directories"));
     }
+}
+
+#[test]
+fn custom_commands_are_draft_only_until_yaml_confirmation_and_survive_reload() {
+    let mut fixture = Fixture::new();
+    fixture.open();
+    fixture.app.handle_key(key(KeyCode::End));
+    fixture.app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(fixture.selection().page, Page::CommandEditor(_)));
+    fixture.app.handle_key(key(KeyCode::Esc));
+    fixture.assert_read_only();
+    fixture.app.handle_key(key(KeyCode::Enter));
+    for (moves, argv) in [
+        (0, ["pm2", "start", "ecosystem config.cjs"]),
+        (3, ["pm2", "delete", "api"]),
+    ] {
+        for _ in 0..moves {
+            fixture.app.handle_key(key(KeyCode::Down));
+        }
+        fixture.app.handle_key(key(KeyCode::Enter));
+        fixture.app.handle_key(key(KeyCode::Char('a')));
+        type_text(&mut fixture.app, argv[0]);
+        fixture.app.handle_key(key(KeyCode::Enter));
+        for arg in &argv[1..] {
+            fixture.app.handle_key(key(KeyCode::Char('a')));
+            type_text(&mut fixture.app, arg);
+            fixture.app.handle_key(key(KeyCode::Enter));
+        }
+        fixture.app.handle_key(key(KeyCode::Esc));
+        fixture.app.handle_key(key(KeyCode::Esc));
+    }
+    fixture.app.handle_key(key(KeyCode::End));
+    fixture
+        .app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    assert!(matches!(fixture.selection().page, Page::CommandEditor(_)));
+    fixture.app.handle_key(key(KeyCode::Enter));
+    let expected = fixture.selection().service().unwrap();
+    assert_eq!(expected.start[0], ["pm2", "start", "ecosystem config.cjs"]);
+    fixture.app.handle_key(key(KeyCode::Enter));
+    fixture.assert_read_only();
+    fixture.app.handle_key(key(KeyCode::Char('n')));
+    assert!(matches!(fixture.app.screen, Screen::SetupReview { .. }));
+    fixture.assert_read_only();
+    fixture.app.handle_key(key(KeyCode::Char('c')));
+    let crate::config::ProjectConfigState::Loaded(saved) =
+        crate::config::load(&fixture.project).unwrap()
+    else {
+        panic!("saved config");
+    };
+    assert_eq!(saved.schema_version, 2);
+    let targets = &saved.environments["production"].components;
+    assert_eq!(targets[&name("backend")].service, Some(expected));
+    assert_eq!(
+        targets[&name("worker")]
+            .service
+            .as_ref()
+            .unwrap()
+            .preset_unit(),
+        Some("original-worker.service")
+    );
+    assert_eq!(fixture.gateway.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -432,7 +511,10 @@ fn newly_saved_connection_drops_only_replaced_components_old_target_choices() {
         Some("/srv/original-worker")
     );
     assert_eq!(
-        setup.target_settings[&name("worker")].systemd.as_deref(),
+        setup.target_settings[&name("worker")]
+            .service
+            .as_ref()
+            .and_then(crate::config::ServiceConfig::preset_unit),
         Some("original-worker.service")
     );
     fixture.app.open_initial_remote_target(

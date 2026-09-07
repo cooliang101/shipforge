@@ -34,13 +34,22 @@ pub(crate) fn reinitialize_setup(
     // fields. A malformed build, destination, schema or extra field cannot be
     // accepted merely because its system-maintained identity was also damaged.
     let raw: RawProjectConfig = serde_yaml_ng::from_value(value).map_err(yaml_error)?;
-    if raw.schema_version != 1 {
+    if !matches!(raw.schema_version, 1 | 2) {
         return Err(ConfigError::SchemaVersion(raw.schema_version));
     }
     let mut environments = BTreeMap::new();
     for (environment, configured) in raw.environments {
         let mut components = BTreeMap::new();
         for (name, target) in configured.components {
+            if (raw.schema_version == 2 && target.systemd.is_some())
+                || (raw.schema_version == 1 && target.service.is_some())
+            {
+                return Err(ConfigError::Service {
+                    environment: environment.clone(),
+                    component: name.clone(),
+                    message: "Service fields do not match the schema version.",
+                });
+            }
             let retained = retained_root(
                 managed.as_ref(),
                 &environment,
@@ -52,7 +61,9 @@ pub(crate) fn reinitialize_setup(
                 TargetSetup {
                     destination: target.destination,
                     root: target.root.or_else(|| retained.map(str::to_owned)),
-                    systemd: target.systemd,
+                    service: target
+                        .service
+                        .or_else(|| target.systemd.map(super::ServiceConfig::systemd)),
                     health: target.health,
                     after: target.after,
                 },

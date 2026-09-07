@@ -5,11 +5,11 @@
 - 产品名称：ShipForge
 - 产品类型：本地运行的前后端应用发布部署助手
 - 目标形态：交互式终端界面（TUI）
-- 当前阶段：MVP 实施 / M1、M2、M3 与 QA-01 已按原范围验收；下一开发优先完成 SVC-01 自定义远端服务命令与 systemd 预设，再继续发布加固。完整 MVP 尚未完成，早期 SSH 超时仍未定位（证据见路线图）
-- 文档版本：v0.17
+- 当前阶段：MVP 实施 / M1、M2、M3 与 QA-01 已按原范围验收；SVC-01 已完成验收，下一工作包为 QA-02 发布加固。完整 MVP 尚未完成，早期 SSH 超时仍未定位（证据见路线图）
+- 文档版本：v0.18
 - 更新日期：2026-09-07
 
-本文的自定义服务命令需求已确定，尚未实现；当前可执行程序及配置示例仍使用既有 `systemd` 字段。`SVC-01` 必须同时完成配置、执行、TUI 和验收，不能把需求更新视为功能交付。
+服务命令采用 schema 2 的统一 `service` 配置；systemd 由 TUI 生成同一命令计划。schema 1 只支持经 TUI 预览确认的转换，确认前不允许部署，不保留永久双格式。具体行为见配置指南。
 
 ## 2. 产品背景
 
@@ -146,10 +146,10 @@ MVP 仅支持以下范围：
 - 本地构建只使用“程序 + 参数数组”，不接受 Shell 字符串；项目需提供适用于当前本地平台的命令。
 - 用户无需填写 Unix 权限。单文件 `artifact` 按 `0755` 打包；目录按 `0755`、普通文件按 `0644` 打包，在 Unix 构建机上仅保留源文件“是否可执行”这一位语义。MVP 不提供任意权限映射。
 
-当前实现的固定格式如下；自定义服务命令的新规范由下一工作包 `SVC-01` 统一实现后更新示例，不得提前写入当前程序不支持的字段。完整规则见 `docs/configuration-guide.md`：
+当前实现的固定格式如下，完整字段、默认值及旧配置转换规则见 `docs/configuration-guide.md`：
 
 ```yaml
-schemaVersion: 1
+schemaVersion: 2
 
 _shipforge:
   projectId: prj_01J8MALL4Y2K6M7P
@@ -193,11 +193,25 @@ environments:
         to: dst_00000000000000000000000000000001
       backend:
         to: dst_00000000000000000000000000000002
-        systemd: mall-api.service
+        service:
+          start:
+            - [systemctl, restart, --, mall-api.service]
+          stop:
+            - [systemctl, stop, --, mall-api.service]
+          check:
+            kind: systemd
+            unit: mall-api.service
         health: http://127.0.0.1:8080/health
       worker:
         to: dst_00000000000000000000000000000002
-        systemd: mall-worker.service
+        service:
+          start:
+            - [systemctl, restart, --, mall-worker.service]
+          stop:
+            - [systemctl, stop, --, mall-worker.service]
+          check:
+            kind: systemd
+            unit: mall-worker.service
         after: [backend]
 ```
 
@@ -275,7 +289,7 @@ Destination 通过 TUI 连接管理页写入用户级注册表，系统自动生
 - 每一步都必须记录开始时间、结束时间、状态和输出。
 - 任务被中断后，系统应能识别残留临时目录和未完成的发布状态。
 - 原子性边界是单个 Component 的 `current` 切换；服务重启、健康检查和多个 Component 均不宣称原子。
-- Component 服务失败时，Driver 必须恢复该 Component 原 `current`；若原来没有版本，则移除新链接并停止本次启动的服务。未成功恢复时标记需人工介入。
+- Component 服务命令已知失败时，Driver 恢复其原 current；首次部署则移除新链接并执行停止。命令超时、断线等导致退出结果未知时，不再对该 Component 发起竞争性的自动恢复命令，明确要求人工核实；其他已成功 Component 仍可独立补偿。
 - 所有选中 Release 准备成功后，在本次所选 Component 形成的子图中按 `after` 拓扑顺序激活；未选择的依赖项不会自动加入。无依赖项采用稳定排序。任一失败时，对本次已激活 Component 按实际顺序逆序补偿，并持久化逐 Component 结果。
 
 ### 7.7 健康检查与自动恢复
@@ -283,13 +297,13 @@ Destination 通过 TUI 连接管理页写入用户级注册表，系统自动生
 - MVP 健康检查属于一个 Component，只对本次选择并激活的 Component 执行。
 - 可选 `health` URL 由 Destination 端执行 HTTP/HTTPS 检查，因此可检查仅监听回环地址或内网地址的服务。
 - `systemd` 检查在服务达到 active 后记录 `NRestarts` 等基线，并要求 Unit 在 `stableFor` 时间内保持 active 且基线不增加。
-- Component 声明 `systemd` 时自动加入必需的 systemd 检查；同时声明 URL `health` 时再加入必需的 Destination 端 HTTP 检查，两项必须全部通过。
+- Component 的 `service.check.kind: systemd` 自动加入必需稳定性检查；同时声明 URL `health` 时再加入必需的 Destination 端 HTTP 检查，两项必须全部通过。
 - 不对外提供端口的服务可以使用只读命令检查，退出码 0 表示该次检查通过，非零、超时或未知均不通过；systemd 预设继续使用 active/NRestarts 稳定窗口，不退化为一次命令成功。
-- 自定义服务不会自动附加 systemd 检查；可选 HTTP 与命令检查按显式配置执行，未配置的检查不得显示为已验证。当前 `systemd` 字段的转换和检查规则兼容性由 `SVC-01` 验收，不形成永久双格式。
+- 自定义服务不会自动附加 systemd 检查；可选 HTTP 与命令检查按显式配置执行，未配置的检查不得显示为已验证。原 `systemd` 只在 schema 1 确认转换时接受。
 - 所有检查支持超时、间隔和重试次数；配置为必需的检查全部通过后，该 Component 才视为健康。
 - 一个 Component 的激活和必需健康检查通过后，该 Release 才可记为该 Component 的健康版本。
 - 未受本次 Deployment 影响的 Component 保持原状态，不进入本次结果。
-- 激活、重启或健康检查失败时，若已启用自动回滚，应恢复激活前记录的 Component `current`；原值不存在时恢复为未部署状态。
+- 激活、服务命令已知失败或健康检查失败时，恢复激活前记录的 Component current；原值不存在时恢复未部署并停止服务。结果未知时保留事实与人工指引，不盲目恢复。
 - 激活前必须记录每个所选 Component 的原 `current` 目标或“不存在”。
 - 若自动回滚也失败，必须输出明确的人工恢复指引和相关路径。
 
@@ -598,7 +612,7 @@ failed deployment → compensation → restored | manual intervention required
 
 ### 第三阶段：TUI 交互与发布加固
 
-- 下一开发优先完成 `SVC-01`：统一远端服务命令、systemd 预设、配置转换、TUI 与 PM2/恢复验收，再继续 `QA-02` 等发布门禁；
+- `SVC-01` 已完成统一远端服务命令、systemd 预设、配置转换、TUI 与 PM2/恢复验收；后续继续 `QA-02` 等发布门禁；
 - 统一项目、环境、组件和 Destination 的导航与呈现；
 - 完善可搜索选择、部署确认、实时步骤和有界日志；
 - 完善发布历史、回滚和恢复体验；
