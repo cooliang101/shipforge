@@ -154,6 +154,9 @@ async fn password_connection_masks_input_and_reopens_saved_encrypted_credential(
         press(&mut app, KeyCode::Char(character));
     }
     assert!(screen_text(&app).contains("********"));
+    assert!(!screen_text(&app).contains("SSH identity"));
+    assert!(!screen_text(&app).contains("SSH Agent"));
+    assert!(!screen_text(&app).contains("No suggested hosts"));
     assert!(!screen_text(&app).contains(password));
     assert!(!format!("{:?}", app.screen).contains(password));
     press(&mut app, KeyCode::Enter);
@@ -188,6 +191,37 @@ async fn password_connection_masks_input_and_reopens_saved_encrypted_credential(
     press(&mut app, KeyCode::Esc);
     wait(&mut app).await;
     assert_eq!(CredentialRegistry::load(&path).unwrap(), registry);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn password_form_keeps_focused_field_visible_in_small_terminal_without_discovery_noise() {
+    let (_directory, mut app, _) = fixture();
+    form(&mut app).await;
+    press(&mut app, KeyCode::F(5));
+    press(&mut app, KeyCode::Char('x'));
+    let Screen::Connections(screen) = &app.screen else {
+        panic!("form expected")
+    };
+    for (width, height) in [(80, 6), (80, 10), (120, 24)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            text.contains("> Password: ********"),
+            "focused password at {width}x{height}"
+        );
+        assert!(!text.contains("SSH Agent"));
+        assert!(!text.contains("SSH identity"));
+        assert_eq!(text.matches('>').count(), 1);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -27,3 +27,9 @@ New tests cover DPAPI encryption/reload, corrupted ciphertext, Unicode and punct
 Release SHA-256: `79ae08b2bc01341e1ef5f8d72631c3d56a1f3c6586b9095649b91eab83ea5f26`.
 
 The requested aiagent deployment is separate from these isolated regression tests. This record does not claim successful authentication or deployment to the user's server. Final MVP gates QA-02, QA-03, REL-03 and ACC-01 remain outstanding.
+
+## Password form layout follow-up
+
+Password mode now uses one shared compact renderer in setup and connection editing: Host, User, Port and a single masked Password field. Agent discovery and candidate-host notices are suppressed in this mode, while the next Host Key step stays explicit. Focused fields scroll into view without wrapping long values. A regression checks 80×6, 80×10 and 120×24 rendering, a single focus marker, absence of discovery noise and masked content.
+
+Full tests passed with 1,032 cases (1,000 library plus the same integration totals), strict Clippy and formatting passed, release build passed and both exact-binary ConPTY smokes passed. Updated release SHA-256: `a1abd5b4f3d50840bca7880b666ef30b9e75227c80f44c78c28c14a3cf49ab0f`.

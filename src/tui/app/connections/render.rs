@@ -58,6 +58,14 @@ impl ConnectionsScreen {
 
     pub(in crate::tui) fn help(&self) -> &'static str {
         match &self.page {
+            ConnectionsPage::Form(form)
+                if matches!(
+                    form.credentials.get(form.credential_cursor),
+                    Some(super::CredentialChoice::Password(_))
+                ) =>
+            {
+                "Tab field   Backspace erase   Delete clear   F3 key   Enter next   Esc cancel"
+            }
             ConnectionsPage::Unavailable => "Esc projects   f retry reading saved connections",
             ConnectionsPage::List { items, .. } if items.is_empty() => {
                 "Esc projects   a add SSH connection   f refresh"
@@ -105,6 +113,15 @@ impl ConnectionsScreen {
     }
 
     pub(in crate::tui) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        if let ConnectionsPage::Form(form) = &self.page
+            && let Some(super::CredentialChoice::Password(input)) =
+                form.credentials.get(form.credential_cursor)
+        {
+            crate::tui::render_password_connection(
+                frame, area, &form.host, &form.user, &form.port, form.field, input,
+            );
+            return;
+        }
         let (title, body, cursor) = self.content();
         let scroll = cursor.map_or(self.scroll, |cursor| {
             let visible = usize::from(area.height.saturating_sub(4)).max(1);

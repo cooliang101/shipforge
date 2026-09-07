@@ -818,6 +818,14 @@ fn page_help(app: &App) -> &'static str {
             Screen::SetupDestinations(_) => {
                 "←→ Component · ↑↓ connection · Space assign · e target · a SSH · n review · Esc back"
             }
+            Screen::NewSshDestination(draft)
+                if matches!(
+                    draft.credentials.get(draft.credential_cursor),
+                    Some(app::CredentialChoice::Password(_))
+                ) =>
+            {
+                "Tab field   Backspace erase   Delete clear   F3 key   Enter next   Esc cancel"
+            }
             Screen::NewSshDestination(_) => {
                 "Tab field   ↑/↓ identity   F3 key   F5 password   Enter probe   Esc cancel"
             }
@@ -1421,6 +1429,20 @@ fn render_new_ssh_destination(
     area: ratatui::layout::Rect,
     draft: &app::NewSshDestinationState,
 ) {
+    if let Some(app::CredentialChoice::Password(input)) =
+        draft.credentials.get(draft.credential_cursor)
+    {
+        render_password_connection(
+            frame,
+            area,
+            &draft.host,
+            &draft.user,
+            &draft.port,
+            draft.field,
+            input,
+        );
+        return;
+    }
     let mut lines = vec![
         Line::from("Values are discovered when possible; edit only what is missing."),
         Line::from(""),
@@ -1477,6 +1499,46 @@ fn render_new_ssh_destination(
                     .borders(Borders::ALL),
             )
             .scroll((choice_scroll(focused_row, area.height), 0)),
+        area,
+    );
+}
+
+fn render_password_connection(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    host: &str,
+    user: &str,
+    port: &str,
+    field: app::SshField,
+    input: &crate::config::PasswordInput,
+) {
+    let lines = vec![
+        form_line("Host", host, field == app::SshField::Host),
+        form_line("User", user, field == app::SshField::User),
+        form_line("Port", port, field == app::SshField::Port),
+        Line::from(""),
+        form_line(
+            "Password",
+            input.masked_value(),
+            field == app::SshField::Credential,
+        ),
+        Line::from(""),
+        Line::from("Enter: review host key before connecting"),
+    ];
+    let focus = match field {
+        app::SshField::Host => 0,
+        app::SshField::User => 1,
+        app::SshField::Port => 2,
+        app::SshField::Credential => 4,
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" SSH connection · Password ")
+                    .borders(Borders::ALL),
+            )
+            .scroll((choice_scroll(focus, area.height), 0)),
         area,
     );
 }

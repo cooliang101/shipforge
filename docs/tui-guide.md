@@ -55,6 +55,8 @@ Project/Environment 改名保留 ID 和固化 root。Component 换名需显式�
 
 仍被已登记项目或历史记录引用的连接不能移除；引用无法完整检查时也不移除。连接移除不会删除凭据文件或远端数据。凭据配置异常时检查用户级连接/身份，不把密钥写进项目 YAML。
 
+密码模式以独立的紧凑表单显示 Host、User、Port 和 Password，底部只保留输入、清空、继续和取消操作；SSH Agent 与候选主机的发现提示不出现在密码输入区。首次设置与连接编辑使用相同布局。
+
 ## 选择部署目录与服务
 
 服务选择包含不管理服务、systemd 预设和自定义命令；配置只属于当前 Environment/Component，不属于 SSH 连接。systemd 候选自动填充 start/stop 与稳定性检查，按 `c` 可查看或修改统一命令计划。自定义服务不隐式运行 systemd。

@@ -116,6 +116,14 @@ impl PasswordInput {
         }
     }
 
+    pub(crate) fn masked_value(&self) -> &'static str {
+        if self.0.is_empty() {
+            "Enter password"
+        } else {
+            "********"
+        }
+    }
+
     pub(crate) fn protect(&self) -> Result<ProtectedPassword, &'static str> {
         ProtectedPassword::protect(&self.0)
     }
