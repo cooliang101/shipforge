@@ -55,6 +55,8 @@ Project/Environment 改名保留 ID 和固化 root。Component 换名需显式�
 
 ## 选择部署目录与服务
 
+当前界面的服务选择仅支持 systemd。下一工作包 `SVC-01` 将增加自定义远端服务命令，并把 systemd 改为同一机制上的内置预设；这还不是当前可用操作，以下按键仍描述现有实现。配置位置继续是当前 Environment/Component，不是 SSH 连接管理。范围与验收见 [路线图](roadmap.md#svc-01远端服务命令基础与-systemd-预设)。
+
 首次设置的连接分配页按 `e`，或项目编辑器的目标表单按 `b`，打开当前 Component 的远端目标选择：
 
 | 按键 | 操作 |

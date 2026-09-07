@@ -44,6 +44,14 @@ _Avoid_: Bundle, binary
 The driver-specific operation that makes a Component Release current and activates its service.
 _Avoid_: Publish, install
 
+**Service Command**:
+A Component-specific instruction for starting, updating, restoring, or stopping its service in an Environment. It is separate from local build instructions and reusable Destination connection settings.
+_Avoid_: Build command, Deployment Driver
+
+**Service Preset**:
+A reusable starting point for a Component's Service Commands and health rules, such as systemd. A preset does not define a separate kind of Destination or Deployment.
+_Avoid_: Driver, server type
+
 **Environment Observation**:
 The current observed Release, or absence of one, for each configured Component in an Environment.
 _Avoid_: Release, local deployment intent

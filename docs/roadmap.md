@@ -2,6 +2,8 @@
 
 ## 目标与节奏
 
+**下一开发工作包：`SVC-01` 远端服务命令基础与 systemd 预设（必做，待实现）。** 2026-09-07 调整：自定义远端服务命令属于 MVP 基础能力，systemd 是这套能力上的内置预设，不再是唯一服务管理方式。先完成 `SVC-01`，再继续 `QA-02 → QA-03 → REL-03 → ACC-01`；不得跳过该包直接进入最终验收。当前程序仍只有专用 systemd 路径，已有 M1～M3、QA-01 记录不代表新增能力已实现或已验收。
+
 本路线图覆盖 `docs/requirements.md` 的 MVP：本地 Rust 单文件程序以 Ratatui TUI 作为唯一用户入口，通过统一 Deployment Driver SPI 发布，首个且唯一交付的 Driver 是 `linux-ssh`。MVP 包含稳定身份与 Component generation、可复用 Destination、统一的带版本号 `tar.gz` Component Release、多 Component 编排及补偿回滚；无头 CLI、CI 和 AI Agent 调用不进入 MVP，不预留适配器、配置、协议或工作包。客户端只支持 Windows x64 GNU，验收使用现有 Rust + MinGW 在本机完成；GitHub 只同步仓库提交，不运行测试。以 1 名全职开发者估算，基线为 10 周，合理范围为 8～12 周。
 
 当前状态：核心架构已收敛，M0 主体及 M1 的 `HIS-00`、`BLD-01`、`ART-01`、`SSH-02`、`REL-01`、`REL-02`、`ORC-01`、`HLT-00` 已实施。工程骨架、核心领域模型、配置加载/初始化及 generation 更新、Destination 与最近 Project 注册表、Driver SPI、应用层规划器与安全边界已有代码和测试。本地构建已覆盖 Git 预检、结构化子进程、双流排空、输出上限、超时和进程树取消；单一路径 `artifact` 会自动识别文件或目录，并由通用归档层确定性地生成一次带 manifest、大小和 SHA-256 的不可变 `tar.gz` Release。Driver `prepare` 契约只能接收核心创建且字段封装的 `ReleasePackage`。`linux-ssh` 使用 64 KiB SFTP 流式上传、单次进度、最多五次有限重试、远端 SHA-256、硬链接 no-clobber 归档、Deployment 专属暂存解压和 no-clobber 版本目录提交；随后严格观察规范 `current`，校验准备凭证与 Deployment、真实目录类型及同文件系统条件，以临时软链接加原子重命名逐 Component 激活。切换前漂移会停止且只清理本次临时链接；切换后取消或 systemd 重启失败会用独立超时恢复原版本，首次部署则移除新链接并停止服务；补偿前再次观察，拒绝覆盖外部漂移。驱动无关编排器会先持久化副作用意图并完成所有选中 Component 的 Prepare，再按所选子图拓扑顺序 Activate；失败或取消后观察失败点，将确认生效的 Component 按实际顺序逆序补偿，并把逐 Component 结果和人工恢复错误写入 SQLite。`HLT-00` 已实现 Destination 端 HTTP/HTTPS、systemd 稳定窗口和健康失败补偿。TUI 已支持最近列表、键盘目录浏览、有效 Project 直接打开、Component 发现与勾选、逐 Component 分配 Destination、滚动预览及确认写入；首次设置也已接入简单 SSH config 候选、SSH Agent/IdentityFile/文件选择、后台 Host Key 获取、显式指纹确认、严格 Host Key 下的身份认证和 Destination 自动分配。认证后会通过受限、限长、可取消的只读远端命令探测默认目录状态和 systemd unit，并在 TUI 中选择可选服务。SSH 设置通过应用服务隔离 transport 类型；root、systemd 和 Host Key 等概念明确属于 `linux-ssh`，不提升为通用 Driver 契约。真实 loopback SSH/SFTP 协议测试已覆盖握手、Host Key、公钥认证、exec、部分写入失败后的清理重试、进度、冲突、上传中取消、远端 SHA-256 成功与不匹配、完整 Release Prepare、原子激活、最终观察、远端 HTTP 健康检查、失败补偿及远端探测；外部 OpenSSH 认证、传输/命令取消、Host Key 轮换及 Windows 本机发布门禁见 `QA-01` 验收记录。SSH 高级配置、Shared Content 和 AI Agent 控制均已移出 MVP。工作包状态应在项目跟踪系统维护，本文只定义顺序、范围和门禁。
@@ -31,7 +33,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 | M1 安全部署闭环 | 第 3～6 周 | TUI 驱动的构建、Release 上传、Component 激活及补偿恢复 | 故障不会留下未记录的远端状态 |
 | M2 历史与恢复 | 第 7～8 周 | TUI 查询、观测、对账、中断恢复、保留策略 | 重启及本地数据库丢失场景可解释 |
 | M3 TUI 加固 | 第 9 周 | 完整、一致且高性能的交互体验 | 所有操作均可在 TUI 完成且终端可恢复 |
-| M4 发布加固 | 第 10 周，最多延伸至第 12 周 | 可分发 MVP | 12 项 MVP 验收标准全部通过 |
+| M4 服务命令与发布加固 | 原基线第 10～12 周，新增 SVC-01 后重新评估 | 自定义服务命令、systemd 预设与可分发 MVP | SVC-01 及更新后的 12 项 MVP 验收标准全部通过 |
 
 ## M0：工程与领域模型
 
@@ -114,15 +116,38 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 完成门槛：全部 MVP 操作只能通过应用服务进入领域层；切换页面不取消 Deployment；安全退出等待恢复边界；正常退出、错误和 panic 均恢复 raw mode、光标及 alternate screen。该门槛及 TUI-01 至 TUI-06 的工作包验收均已通过，M3 完成。
 
-## M4：发布加固
+## M4：服务命令补齐与发布加固
 
-`QA-01` 已按 Windows-only 范围通过本机验收：既有 Rust 1.96.1 + MinGW 的全量测试、格式/严格 Clippy、GNU release 构建、准确二进制 ConPTY smoke、隔离性能门禁和 Windows runner 安全回归通过；真实 OpenSSH 认证、Host Key 轮换拒绝、SFTP 和命令取消沿用源码提交 `0b59f8f` 的已验证证据，执行代码未改动。GitHub 测试工作流已移除；Linux/macOS 客户端和最低 Rust 版本矩阵不再是本轮验收要求。该结论只覆盖 Windows x64 GNU 的已测条件，不宣称早期 SSH 超时已定位修复或整个 MVP 已完成。证据、兼容性边界及后续任务见 [QA-01 记录](validation/qa-01.md)。下一工作包为 `QA-02`。
+`QA-01` 已按 Windows-only 范围通过本机验收：既有 Rust 1.96.1 + MinGW 的全量测试、格式/严格 Clippy、GNU release 构建、准确二进制 ConPTY smoke、隔离性能门禁和 Windows runner 安全回归通过；真实 OpenSSH 认证、Host Key 轮换拒绝、SFTP 和命令取消沿用源码提交 `0b59f8f` 的已验证证据，执行代码未改动。GitHub 测试工作流已移除；Linux/macOS 客户端和最低 Rust 版本矩阵不再是本轮验收要求。该结论只覆盖 Windows x64 GNU 的已测条件，不宣称早期 SSH 超时已定位修复或整个 MVP 已完成。证据、兼容性边界及后续任务见 [QA-01 记录](validation/qa-01.md)。下一工作包改为 `SVC-01`；服务路径修改后须重跑受影响的 Windows/SSH/systemd 门禁，不能直接沿用旧结果。
+
+### SVC-01：远端服务命令基础与 systemd 预设
+
+状态：**已确定、未实现，下一开发必须优先完成**。目标是复用已有 SSH 命令执行能力，将专用 systemd 服务路径改为统一服务命令计划；自定义命令是基础，systemd 只提供预填命令和检查规则，不新增 PM2 Driver 或第二套执行流程。
+
+实施顺序：
+
+1. **配置与契约**：定义逐 Environment/Component 的服务命令配置，覆盖首次启动、更新、恢复旧版本、恢复未部署状态时停止，以及可选的只读命令健康检查。允许启动/更新/恢复复用命令，TUI 默认值减少重复填写；执行前必须明确所需恢复动作，不能缺失时猜测。命令使用程序与参数数组，工作目录绑定本次实际操作的版本；不放进共享 Destination 或本地 `build`。
+2. **统一执行与 systemd 预设**：先接入通用远端服务命令执行，再将 systemd 启动/重启、停止和稳定性检查转换为同一执行计划。复用现有 SSH 用户、Host Key、参数转义、超时、取消、日志、持久化意图和补偿边界；保留 systemd 的 active/NRestarts 稳定性语义。自定义方式不得隐式要求 systemd，也不得自动安装运行时、提升权限或启动常驻助手。
+3. **TUI 与保存**：首次设置和项目编辑统一提供“不管理服务 / 自定义命令 / systemd 预设”。展示实际命令、执行阶段、工作目录和检查规则，经 YAML 预览确认后保存到项目根目录；再次打开直接复用。systemd 选择 unit 后自动生成配置；不要求用户填写 Driver 或预设 ID。
+4. **发布与恢复**：准备阶段不运行服务命令；切换新版本后执行启动/更新，恢复旧版本后执行对应恢复命令，恢复未部署状态时停止本次服务。PM2 必须使用目标版本的程序路径，不能仅凭 `current` 改变或重启命令退出成功认定已运行新代码。命令失败、超时、取消或结果未知停止前进；不能盲目重试有副作用命令，也不能把版本观察当作服务成功。
+5. **规范与历史**：先落实唯一规范化配置及契约测试，再同步示例。现有 `systemd` 配置须有经过测试、TUI 预览确认的转换路径，不自动改文件、不增加永久别名或双格式；命令/检查设置纳入计划快照和目标变更校验。历史记录不得由当前配置补造命令，缺少恢复依据时明确拒绝并给出人工指引。
+
+验收门槛：
+
+- Windows TUI 可创建、编辑、取消、预览、保存并重新加载自定义服务配置；同一 SSH 的两个 Component 执行各自命令，只选一个时另一个完全不动。
+- 单元、协议和隔离真实 Linux 测试覆盖自定义/PM2 首次启动与更新、非零退出、超时/取消、健康失败、显式回滚、失败补偿及首次部署失败后的停止；核实进程使用目标版本目录，既有 systemd 稳定性与回滚门禁无回归。
+- 可选命令检查按退出码判断并有界重试；systemd 预设保留稳定窗口，HTTP 检查保留，配置的必需检查均须通过；未配置检查不得显示为已执行检查。脱敏、命令注入、配置漂移、未知结果和持久化失败有回归测试。
+- 完成代码审查、本机格式/Clippy/全量测试、受影响真实 SSH 门禁及文档同步后单独提交；测试只使用一次性环境，不连接生产、不添加 GitHub 测试。
+
+明确不包含：远端依赖安装、数据库迁移、共享持久目录编排、PM2 专用 Driver/自动发现或新的 Shell 字符串配置。项目的本地构建和唯一 Release 打包规则保持不变。具体配置字段在该包内统一落实；当前使用指南与 YAML 示例仍描述现有实现，不可把规划字段写入当前配置。
+
+### 后续发布门禁
 
 - `QA-01`：使用现有 Rust + MinGW 完成 Windows x64 GNU 本机编译、全量测试、ConPTY smoke、性能和真实 OpenSSH 门禁；不要求 Linux/macOS 客户端或 GitHub CI。复核 TUI-MGT-01 早期未定位 SSH 连接超时，在阶段化诊断证据基础上给出支持条件与发行结论，不把单次复跑通过当作根因修复。
-- `QA-02`：对路径穿越、Shell 注入、Host Key、凭据、日志和归档权限做安全审查。
+- `QA-02`：在 `SVC-01` 完成后，对路径穿越、Shell 注入、Host Key、凭据、日志和归档权限做安全审查，并覆盖自定义远端命令与内置预设的共同执行边界。
 - `QA-03`：验证 Driver SPI 契约、Project/Environment ID、Destination ID/revision、Component generation、配置兼容、远端元数据前向兼容和安装升级。
 - `REL-03`：使用 `cargo build --release` 在本机固定生成 `target/release/shipforge.exe` 和 SHA-256，编写安装、升级、回滚和排障文档；不添加 `--target` 或另设平台/版本输出树，不在 GitHub 构建或自动发布。
-- `ACC-01`：逐项执行需求文档的 12 条验收标准并保存证据。
+- `ACC-01`：逐项执行需求文档的 12 条验收标准并保存证据；服务操作同时覆盖自定义命令/PM2 场景与 systemd 预设，不以旧 systemd 验收替代。
 
 ## 质量门禁
 
@@ -142,7 +167,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 - Driver 的所有操作都接收 `ComponentExecutionContext`；通用部分只含稳定身份和端点指纹，凭据与 Driver 目标设置通过已校验的不透明句柄传递。应用层不读取 Linux 字段。Component Release Receipt 固化非秘密的 Destination ID/revision 与 Component generation；项目中的 Destination ID 或目标设置变化启动新 generation。
 - `artifact` 永远只表示一个文件或目录构建输出路径；`Release` 永远表示由该输出生成的唯一 `<version>.tar.gz` 压缩包。通用归档层只打包一次，所有 Driver 消费同一格式且不得重复打包。
 - 每个 Component 独立保存带版本号的 Release 压缩包并拥有自己的 `current`；Component 的真实依赖使用 `after` 表达并拓扑排序，失败时执行补偿回滚，不承诺跨 Component 原子性。
-- 每个 Environment/Component 独立配置 Destination、root、可选 systemd 和可选 Destination 端 HTTP/HTTPS 检查。
+- 每个 Environment/Component 独立配置 Destination、root、可选服务命令和健康检查；服务命令是基础，systemd 是内置预设。`SVC-01` 实现前，当前程序仍只接受既有 systemd 配置；该限制不是最终 MVP 范围。
 - Prepare 只允许可记录、可重试或清理的暂存写入，不得切换版本或修改服务及业务状态；MVP Activation 只切换版本、激活所选服务并执行健康检查，不编排数据库迁移或共享持久内容。
 - Git 脏工作区默认警告并确认；禁止策略留作环境配置。
 - 本地 SQLite 保存执行意图和历史；实际状态由 Driver 观察。`linux-ssh` 的远端文件系统描述远端事实，JSONL 仅作审计和灾难恢复辅助。
@@ -152,7 +177,7 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ## 已延期能力
 
-Shared Content、SSH `ProxyJump`/`Include`/`Match`、TCP 与日志关键字健康检查均不进入 MVP。客户端只支持 Windows x64 GNU；Linux/macOS 客户端和三平台测试矩阵不再列为 MVP 门禁，既有实现及历史实测不表示支持承诺。目标服务器仍为 Linux。
+Shared Content、远端依赖安装、SSH `ProxyJump`/`Include`/`Match`、TCP 与日志关键字健康检查均不进入 MVP。自定义远端服务命令及其可选命令检查不属于延期项，必须由 `SVC-01` 完成。客户端只支持 Windows x64 GNU；Linux/macOS 客户端和三平台测试矩阵不再列为 MVP 门禁，既有实现及历史实测不表示支持承诺。目标服务器仍为 Linux。
 
 ## MVP 验收追踪
 
@@ -163,9 +188,9 @@ Shared Content、SSH `ProxyJump`/`Include`/`Match`、TCP 与日志关键字健�
 | TUI 首次设置、选择 Component 并发起部署 | `TUI-SETUP-01`、`TUI-DEP-01`、`TUI-01` |
 | 构建、压缩、权限与 SHA-256 | `BLD-01`、`ART-01` |
 | `linux-ssh`、SFTP 与 Component Release 压缩包 | `SSH-02`、`REL-01` |
-| Component Release 与 Component 级原子文件系统切换 | `REL-01`、`REL-02` |
+| Component Release、原子文件系统切换、自定义服务命令与 systemd 预设 | `REL-01`、`REL-02`、`SVC-01` |
 | 多 Component 编排与补偿回滚 | `ORC-01`、`RBK-00` |
-| Component 级本机/远端健康检查与自动恢复 | `HLT-00`、`REL-02`、`RBK-00` |
+| Component 级远端健康检查、命令检查与自动恢复 | `HLT-00`、`REL-02`、`RBK-00`、`SVC-01` |
 | 单会话任务约束、目标版本校验与远端状态变化拒绝 | `RUN-01`、`DST-01`、`REC-01` |
 | 历史、手动回滚与重启持久化 | `HIS-00`、`HIS-01`、`REC-01`、`TUI-MGT-01` |
 | 密钥和日志安全 | `SSH-01`、`SEC-01` |

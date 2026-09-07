@@ -10,6 +10,8 @@ M1's safe deployment loop and M2's history/recovery management have passed their
 
 An early real SSH connection timeout and a separate unknown current observation remain unexplained despite passing subsequent tests; a common cause is unproven. Their evidence and diagnostics are retained for platform validation, not treated as resolved by the TUI changes.
 
+The next development package is [SVC-01: remote Service Commands and the systemd preset](docs/roadmap.md#svc-01远端服务命令基础与-systemd-预设), before QA-02 and final release gates. Custom commands are required for the MVP; systemd must become a preset over the shared execution mechanism. The current binary still supports only dedicated systemd service operations, not configurable PM2/restart commands. Remote dependency installation is excluded. Existing acceptance evidence covers the earlier scope, not this pending change.
+
 ## Run locally
 
 Use an interactive Windows terminal with ConPTY support and the existing Rust/MinGW toolchain. The verified setup is Rust 1.96.1 with target `x86_64-pc-windows-gnu`; no additional local toolchain is installed. `Cargo.toml` retains its Rust 1.88 declaration, but that minimum has not been independently tested. Earlier [Linux client tests](docs/validation/linux-client.md) are historical evidence, not an MVP support commitment.

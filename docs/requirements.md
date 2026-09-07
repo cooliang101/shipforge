@@ -5,9 +5,11 @@
 - 产品名称：ShipForge
 - 产品类型：本地运行的前后端应用发布部署助手
 - 目标形态：交互式终端界面（TUI）
-- 当前阶段：MVP 实施 / M1、M2、M3 已验收；M4 发布加固及完整 MVP 尚未完成。早期未定位 SSH 超时作为 QA-01 发行风险保留（证据见路线图）
-- 文档版本：v0.16
-- 更新日期：2026-09-05
+- 当前阶段：MVP 实施 / M1、M2、M3 与 QA-01 已按原范围验收；下一开发优先完成 SVC-01 自定义远端服务命令与 systemd 预设，再继续发布加固。完整 MVP 尚未完成，早期 SSH 超时仍未定位（证据见路线图）
+- 文档版本：v0.17
+- 更新日期：2026-09-07
+
+本文的自定义服务命令需求已确定，尚未实现；当前可执行程序及配置示例仍使用既有 `systemd` 字段。`SVC-01` 必须同时完成配置、执行、TUI 和验收，不能把需求更新视为功能交付。
 
 ## 2. 产品背景
 
@@ -36,6 +38,7 @@ MVP 阶段暂不建设完整 CI/CD 平台，不包含：
 - Docker 镜像构建与镜像仓库管理；
 - 团队账号、审批和复杂权限体系；
 - 数据库迁移编排；
+- 远端依赖安装编排；
 - 云厂商资源编排；
 - 目标服务器常驻 Agent；
 - 无头 CLI、脚本和 CI/CD 调用接口；
@@ -56,7 +59,7 @@ MVP 阶段暂不建设完整 CI/CD 平台，不包含：
 ### 4.2 典型场景
 
 1. 将本地前端构建输出部署到 Nginx 静态目录。
-2. 构建后端二进制或应用包，上传后通过 systemd 重启服务。
+2. 构建后端二进制或应用包，上传后执行自定义远端服务命令（如 PM2），或选择 systemd 内置预设。
 3. 同时发布同一项目的前端和后端组件。
 4. 查看某次失败发布的本地构建及远程执行日志。
 5. 从当前线上版本回滚到某个历史稳定版本。
@@ -72,9 +75,9 @@ MVP 仅支持以下范围：
 - 服务器数量：每个 `linux-ssh` Destination 对应一台服务器；一个 Component 不支持同时部署到多台服务器；
 - 并发模型：当前 TUI 会话同一时间只允许一个活动 Deployment；多个 ShipForge 进程同时部署不受支持，也不实现协调机制；
 - 驱动方式：内置 `linux-ssh` 驱动，传输使用 SFTP，Release 格式为 `tar.gz`；
-- 服务管理：可选 systemd unit；
+- 服务管理：可选自定义远端服务命令，systemd 作为同一机制上的内置预设；不是仅支持 systemd；
 - 发布策略：每个 Component 一个带版本号和 SHA-256 的 `tar.gz` Release，解压后通过该 Component 的 `current` 软链接原子切换；
-- 健康检查：Destination 端 HTTP/HTTPS 和 systemd 稳定性检查；
+- 健康检查：Destination 端 HTTP/HTTPS、可选只读命令检查和 systemd 预设稳定性检查；
 - 版本管理：每个 Component 默认保留最新 5 个 Release，并额外保护当前版本、上一个健康版本和未结束/待核实操作引用；
 - 操作方式：Ratatui TUI；启动可执行文件后，所有用户操作均在界面内完成。
 
@@ -87,7 +90,7 @@ MVP 仅支持以下范围：
 3. 配置不存在时，该目录视为新 Project。系统扫描项目清单和构建脚本，展示推断的 Component、构建命令及构建输出路径，用户通过勾选和修改确认；没有候选或发现失败时可以手动添加，随后生成全新的稳定 ID。
 4. 系统展示已有 Destination 和 SSH config Host；用户选择现有项，或新建 SSH 连接并从 SSH Agent、`IdentityFile`、标准 Key 候选或文件选择器中选择身份。
 5. 私钥内容及个人 Key 路径只进入用户级凭据引用，不写入项目文件。首次连接必须展示并确认 SSH Host Key 指纹。
-6. 连接成功后，用户选择 Environment、要部署的 Component、各 Component 使用的 Destination、部署目录及可选 systemd unit；系统优先提供探测候选和默认值。
+6. 连接成功后，用户选择 Environment、要部署的 Component、各 Component 使用的 Destination、部署目录及服务方式（不管理、自定义命令或 systemd 预设）；选择 systemd 时优先提供 unit 候选并自动填充命令和检查规则。
 7. 系统展示规范化配置预览。用户确认后，在项目根目录原子写入唯一的 `shipforge.yaml`，并将项目目录登记到本机项目注册表；部署预检、计划与执行另行确认。
 8. 用户取消时不得保存未确认的项目草稿或 Destination；先前已经明确确认并保存的连接保留。写入结果不确定时明确要求重新加载，不将其误报为未写入或盲目回退其他文件。
 
@@ -143,7 +146,7 @@ MVP 仅支持以下范围：
 - 本地构建只使用“程序 + 参数数组”，不接受 Shell 字符串；项目需提供适用于当前本地平台的命令。
 - 用户无需填写 Unix 权限。单文件 `artifact` 按 `0755` 打包；目录按 `0755`、普通文件按 `0644` 打包，在 Unix 构建机上仅保留源文件“是否可执行”这一位语义。MVP 不提供任意权限映射。
 
-固定格式如下；完整规则见 `docs/configuration-guide.md`：
+当前实现的固定格式如下；自定义服务命令的新规范由下一工作包 `SVC-01` 统一实现后更新示例，不得提前写入当前程序不支持的字段。完整规则见 `docs/configuration-guide.md`：
 
 ```yaml
 schemaVersion: 1
@@ -251,7 +254,7 @@ Destination 通过 TUI 连接管理页写入用户级注册表，系统自动生
 - 使用 SFTP 上传到远端临时目录。
 - 支持上传进度、超时和有限次数重试。
 - 上传后在远端校验 Release SHA-256，校验失败不得激活版本。
-- TUI 的环境检查操作必须检查远端 Shell、解压、哈希、软链接、原子重命名、磁盘及权限能力；按配置检查 systemd 和 Destination 端 HTTP 客户端，并报告实际采用的命令。
+- TUI 的环境检查操作必须检查远端 Shell、解压、哈希、软链接、原子重命名、磁盘及权限能力；按配置检查服务命令所需程序和 Destination 端 HTTP 客户端，并报告实际采用的命令。自定义方式不强制依赖 systemd；只读预检不得试运行启动、重启或停止命令。
 - Destination ID 创建后不可修改且无需用户命名。Driver 类型、host、port 或 user 变化必须增加 Destination revision 并改变端点指纹；凭据轮换可增加 revision，但不得改变端点指纹。
 - Destination 修改操作自动增加 revision；仍被 Release 引用的非秘密历史修订必须保留，以支持历史观察和清理。当前部署使用该 key 的最新 revision，历史 Release 始终使用自身记录的 revision。
 - TUI 只能移除没有被已登记 Project、Deployment 或 Release 引用的 Destination；存在引用时必须拒绝并列出引用来源。
@@ -265,7 +268,10 @@ Destination 通过 TUI 连接管理页写入用户级注册表，系统自动生
 - Prepare 阶段允许构建以及可安全清理的上传、校验、解压和候选 Release 组装；这些暂存写入必须记录并可重试或清理，但不得改变 `current`、服务、`shared`、数据库或业务状态。
 - Activation 阶段只包含 `current` 切换、所选 Component 的服务激活和健康检查。数据库迁移与任意业务数据变更不进入 MVP。
 - 每个 Component 使用自己的 `current` 软链接，并以原子方式切换。
-- MVP 只支持可选的 systemd unit 激活；自定义服务命令延后设计。
+- MVP 必须以可配置的远端服务命令为基础，systemd 仅为自动填充命令与检查规则的内置预设；两者使用同一执行、日志、超时、取消及补偿机制，不新增 PM2 Driver。
+- 服务命令逐 Environment/Component 保存到项目根目录 `shipforge.yaml`，不放入共享 Destination 或本地构建脚本。TUI 覆盖首次启动、更新、恢复旧版本和恢复未部署状态时停止；可复用相同命令以减少填写，缺少必要恢复动作时在副作用前拒绝计划。
+- 命令使用程序与参数数组；工作目录绑定本次激活或恢复的实际版本。命令、工作目录与检查策略必须预览确认并纳入冻结计划；PM2 不能只凭 `current` 变化或进程名重启就假设已使用新代码。
+- 服务命令不自动安装远端依赖或提升权限，不允许修改 ShipForge 保留元数据；不编排数据库迁移和任意业务数据变更。有副作用命令失败或结果未知时不能盲目重试，版本观察不等于服务执行成功。
 - 每一步都必须记录开始时间、结束时间、状态和输出。
 - 任务被中断后，系统应能识别残留临时目录和未完成的发布状态。
 - 原子性边界是单个 Component 的 `current` 切换；服务重启、健康检查和多个 Component 均不宣称原子。
@@ -278,7 +284,8 @@ Destination 通过 TUI 连接管理页写入用户级注册表，系统自动生
 - 可选 `health` URL 由 Destination 端执行 HTTP/HTTPS 检查，因此可检查仅监听回环地址或内网地址的服务。
 - `systemd` 检查在服务达到 active 后记录 `NRestarts` 等基线，并要求 Unit 在 `stableFor` 时间内保持 active 且基线不增加。
 - Component 声明 `systemd` 时自动加入必需的 systemd 检查；同时声明 URL `health` 时再加入必需的 Destination 端 HTTP 检查，两项必须全部通过。
-- 不对外提供端口的服务使用 systemd 稳定性检查；自定义命令检查不进入 MVP。
+- 不对外提供端口的服务可以使用只读命令检查，退出码 0 表示该次检查通过，非零、超时或未知均不通过；systemd 预设继续使用 active/NRestarts 稳定窗口，不退化为一次命令成功。
+- 自定义服务不会自动附加 systemd 检查；可选 HTTP 与命令检查按显式配置执行，未配置的检查不得显示为已验证。当前 `systemd` 字段的转换和检查规则兼容性由 `SVC-01` 验收，不形成永久双格式。
 - 所有检查支持超时、间隔和重试次数；配置为必需的检查全部通过后，该 Component 才视为健康。
 - 一个 Component 的激活和必需健康检查通过后，该 Release 才可记为该 Component 的健康版本。
 - 未受本次 Deployment 影响的 Component 保持原状态，不进入本次结果。
@@ -551,8 +558,8 @@ failed deployment → compensation → restored | manual intervention required
 2. 再次选择已有项目目录时，系统直接加载根目录配置；用户可从 TUI 选择 Environment 及 Component，一个 Environment 可将不同 Component 发布到至少两个 SSH Destination。
 3. 系统能接受文件或目录构建输出，并统一生成带 SHA-256 的 `<version>.tar.gz` Release。
 4. 应用层通过 Deployment Driver SPI 完成发布；`linux-ssh` Driver 能通过 SSH/SFTP 保存带版本号和 SHA-256 的 Component Release 压缩包并解压运行。
-5. 系统能按 Component 原子切换 `current` 软链接并执行服务重启命令。
-6. 系统能按 Component 执行 Destination 端 HTTP/HTTPS 和 systemd 稳定性检查，并正确判断发布成功或失败。
+5. 系统能按 Component 原子切换 `current`，执行 TUI 保存的自定义远端服务命令；systemd 作为同一机制上的内置预设。覆盖 PM2 首次启动、更新、恢复旧版本和恢复未部署状态，不影响共用 SSH 的未选组件。
+6. 系统能按 Component 执行 Destination 端 HTTP/HTTPS、只读命令检查和 systemd 预设稳定性检查，并正确判断发布成功或失败；自定义服务不依赖 systemd。
 7. 发布失败后，系统能将已操作 Component 恢复到各自激活前的版本；补偿失败时准确记录逐 Component 实际状态。
 8. 用户可查看历史版本、发布时间、Git 提交和发布结果。
 9. 用户可为一个或多个 Component 选择历史健康 Release 完成回滚。
@@ -591,6 +598,7 @@ failed deployment → compensation → restored | manual intervention required
 
 ### 第三阶段：TUI 交互与发布加固
 
+- 下一开发优先完成 `SVC-01`：统一远端服务命令、systemd 预设、配置转换、TUI 与 PM2/恢复验收，再继续 `QA-02` 等发布门禁；
 - 统一项目、环境、组件和 Destination 的导航与呈现；
 - 完善可搜索选择、部署确认、实时步骤和有界日志；
 - 完善发布历史、回滚和恢复体验；
