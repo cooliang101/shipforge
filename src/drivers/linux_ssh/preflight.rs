@@ -60,6 +60,24 @@ pub(super) async fn check_preflight(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<Vec<String>, PreflightError> {
+    if let Some(service) = &target.service {
+        let checks = match &service.check {
+            Some(crate::config::ServiceCheck::Command { argv }) => Some(argv),
+            _ => None,
+        };
+        for argv in service
+            .start
+            .iter()
+            .chain(&service.update)
+            .chain(&service.restore)
+            .chain(&service.stop)
+            .chain(checks)
+        {
+            let command = super::service_command(argv, &format!("{}/current", target.root))
+                .map_err(|_| PreflightError::Command("Invalid service command".into()))?;
+            session.validate_sudo_command(&command)?;
+        }
+    }
     check_with_remote(session, target, timeout, cancellation).await
 }
 

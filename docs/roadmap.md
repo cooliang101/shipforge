@@ -124,6 +124,8 @@ TUI 骨架 → 领域与配置 → Destination 解析 → Driver SPI → Linux S
 
 ### SVC-01：远端服务命令基础与 systemd 预设
 
+2026-09-07 补充：服务命令可显式使用已保存 SSH 密码进行 sudo 认证，无需新增服务器免密权限。服务编辑器 `p` 转换选中动作；schema 与历史恢复语义保持不变。验收范围和限制见 [sudo 密码验证](validation/sudo-password.md)。
+
 状态：**已完成，2026-09-07 通过验收**。schema 2 统一 service.start/stop、可复用的 update/restore 与可选只读检查；TUI 首次设置和项目编辑共用 argv 编辑器，systemd 由 unit 选择生成同一命令计划。历史保存非秘密目标快照，结果未知时禁止竞争性补偿。Windows 全量测试、严格 Clippy、发布版 ConPTY、隔离性能及真实 PM2/systemd 门禁通过；验收结果与限制记录在 [SVC-01](validation/svc-01.md)。
 
 实施范围（已完成）：

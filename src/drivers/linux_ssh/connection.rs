@@ -45,6 +45,7 @@ pub(super) fn client_config() -> Arc<client::Config> {
 pub struct AuthenticatedSession {
     pub(super) handle: client::Handle<HostKeyVerifier>,
     command_events: Option<Arc<dyn EventSink>>,
+    sudo_password: Option<crate::config::ProtectedPassword>,
 }
 
 impl fmt::Debug for AuthenticatedSession {
@@ -56,6 +57,13 @@ impl fmt::Debug for AuthenticatedSession {
 }
 
 impl AuthenticatedSession {
+    pub(super) fn validate_sudo_command(
+        &self,
+        command: &CommandSpec,
+    ) -> Result<(), SshConnectionError> {
+        sudo::Request::for_command(command, self.sudo_password.as_ref()).map(|_| ())
+    }
+
     pub(super) fn with_command_events(mut self, events: Arc<dyn EventSink>) -> Self {
         self.command_events = Some(events);
         self
@@ -93,16 +101,30 @@ impl AuthenticatedSession {
         if cancellation.is_cancelled() {
             return Err(SshConnectionError::Cancelled);
         }
-        let rendered = command
+        let sudo = sudo::Request::for_command(command, self.sudo_password.as_ref())?;
+        let execution = sudo.as_ref().map_or(command, |request| &request.command);
+        let rendered = execution
             .render_posix()
             .map_err(|error| SshConnectionError::Command(error.to_string()))?;
         let accepted = AtomicBool::new(false);
-        let result =
-            execute_command(&self.handle, &rendered, &accepted, timeout, cancellation).await;
+        let result = execute_command(
+            &self.handle,
+            &rendered,
+            &accepted,
+            timeout,
+            cancellation,
+            sudo.as_ref(),
+        )
+        .await;
+        let result = if sudo.is_some() {
+            sudo::sanitize(result)
+        } else {
+            result
+        };
         if let Some(events) = &self.command_events {
             record_command_result(
                 events.as_ref(),
-                command,
+                execution,
                 accepted.load(Ordering::Acquire),
                 accepted_statuses,
                 &result,
@@ -167,6 +189,7 @@ async fn execute_command(
     accepted: &AtomicBool,
     timeout: Duration,
     cancellation: &CancellationToken,
+    sudo: Option<&sudo::Request>,
 ) -> Result<RemoteCommandOutput, SshConnectionError> {
     let deadline = tokio::time::Instant::now().checked_add(timeout);
     let mut channel = tokio::select! {
@@ -201,7 +224,15 @@ async fn execute_command(
         .await;
     }
 
-    receive_command_output(&mut channel, accepted, timeout, deadline, cancellation).await
+    receive_command_output(
+        &mut channel,
+        accepted,
+        timeout,
+        deadline,
+        cancellation,
+        sudo,
+    )
+    .await
 }
 
 async fn receive_command_output(
@@ -210,8 +241,10 @@ async fn receive_command_output(
     timeout: Duration,
     deadline: Option<tokio::time::Instant>,
     cancellation: &CancellationToken,
+    sudo: Option<&sudo::Request>,
 ) -> Result<RemoteCommandOutput, SshConnectionError> {
     let mut state = RemoteCommandState::default();
+    let mut prompt = sudo::Prompt::default();
     loop {
         let message = tokio::select! {
             biased;
@@ -235,6 +268,38 @@ async fn receive_command_output(
         };
         let Some(message) = message else {
             break;
+        };
+        if let (Some(request), ChannelMsg::ExtendedData { data, .. }) = (sudo, &message)
+            && prompt.observe(data)
+        {
+            let response = async {
+                let input = request.response()?;
+                channel
+                    .data(input.as_bytes())
+                    .await
+                    .map_err(|_| sudo::error())?;
+                channel.eof().await.map_err(|_| sudo::error())
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(SshConnectionError::Cancelled),
+                () = wait_for_deadline(deadline) => Err(remote_command_timeout(timeout)),
+                result = response => result,
+            };
+            if let Err(error) = result {
+                return finish_interrupted_command(channel, accepted, state, error).await;
+            }
+        }
+        // Password channels may echo input or partial input. Drain without
+        // retaining stdout/stderr, even when cancellation later settles a result.
+        let message = if sudo.is_some()
+            && matches!(
+                message,
+                ChannelMsg::Data { .. } | ChannelMsg::ExtendedData { .. }
+            ) {
+            ChannelMsg::Eof
+        } else {
+            message
         };
         if let Some(error) = record_command_message(&mut state, accepted, message) {
             close_command_channel(
@@ -493,6 +558,10 @@ async fn connect_and_authenticate(
     Ok(AuthenticatedSession {
         handle,
         command_events: None,
+        sudo_password: match credential {
+            SshCredential::Password { protected } => Some(protected.clone()),
+            _ => None,
+        },
     })
 }
 
@@ -869,6 +938,8 @@ pub enum SshConnectionError {
 
 #[cfg(test)]
 mod diagnostics_tests;
+
+mod sudo;
 
 #[cfg(test)]
 mod tests {

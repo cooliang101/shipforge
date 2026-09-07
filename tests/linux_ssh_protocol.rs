@@ -58,11 +58,13 @@ struct ProtocolServer {
     commands: Arc<Mutex<Vec<String>>>,
     channels: Arc<AsyncMutex<HashMap<ChannelId, Channel<Msg>>>>,
     transfer: Arc<AsyncMutex<TransferState>>,
+    sudo_channels: HashMap<ChannelId, Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
 struct TransferState {
     password_attempts: usize,
+    sudo_responses: usize,
     files: HashMap<String, Vec<u8>>,
     directories: HashSet<String>,
     links: HashMap<String, String>,
@@ -82,6 +84,7 @@ impl server::Server for ProtocolServer {
             // Channel identifiers are local to an SSH connection.
             channels: Arc::new(AsyncMutex::new(HashMap::new())),
             transfer: Arc::clone(&self.transfer),
+            sudo_channels: HashMap::new(),
         }
     }
 }
@@ -181,6 +184,25 @@ impl server::Handler for ProtocolServer {
         self.channels.lock().await.remove(&channel);
         let command = String::from_utf8_lossy(data).into_owned();
         self.commands.lock().unwrap().push(command.clone());
+        if command.contains("'[shipforge-sudo-password]'") {
+            session.channel_success(channel)?;
+            if command.contains("'cached'") {
+                session.exit_status_request(channel, 0)?;
+                session.close(channel)?;
+            } else if !command.contains("'stall'") {
+                self.sudo_channels.insert(
+                    channel,
+                    if command.contains("'denied'") {
+                        b"rejected:".to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                );
+                session.extended_data(channel, 1, b"[shipforge-".to_vec())?;
+                session.extended_data(channel, 1, b"sudo-password]".to_vec())?;
+            }
+            return Ok(());
+        }
         let (status, output) = if let Some(reply) = preflight_protocol::reply(&command) {
             reply
         } else if command.starts_with("'printf' ") {
@@ -228,6 +250,31 @@ impl server::Handler for ProtocolServer {
         session.exit_status_request(channel, status)?;
         session.eof(channel)?;
         session.close(channel)?;
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(input) = self.sudo_channels.get_mut(&channel) {
+            input.extend_from_slice(data);
+            if input.ends_with(b"\n") {
+                self.transfer.lock().await.sudo_responses += 1;
+                let valid = input == "fixture 密码 q$' value\n".as_bytes();
+                // Deliberate hostile echo: the caller must never return or log it.
+                session.data(channel, input.clone())?;
+                session.extended_data(channel, 1, input.clone())?;
+                session.exit_status_request(channel, u32::from(!valid))?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                self.sudo_channels.remove(&channel);
+            }
+        } else {
+            self.transfer.lock().await.sudo_responses += 1;
+        }
         Ok(())
     }
 
@@ -2235,6 +2282,7 @@ async fn validates_real_ssh_transfer_prepare_activate_hash_and_probe() {
         ..TransferState::default()
     }));
     let mut server = ProtocolServer {
+        sudo_channels: HashMap::new(),
         commands: commands.clone(),
         channels: Arc::new(AsyncMutex::new(HashMap::new())),
         transfer: transfer.clone(),

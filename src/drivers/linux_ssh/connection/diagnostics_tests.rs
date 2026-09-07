@@ -387,6 +387,7 @@ fn failure_command() -> CommandSpec {
 async fn client_operations(handle: client::Handle<HostKeyVerifier>, events: &Events) {
     super::super::command_events::relay(events, |sink| async move {
         let session = AuthenticatedSession {
+            sudo_password: None,
             handle,
             command_events: None,
         }
@@ -534,6 +535,7 @@ async fn dispatched_interruptions_signal_and_return_within_cleanup_bound() {
         .unwrap();
         assert!(handle.authenticate_none("fixture").await.unwrap().success());
         let session = AuthenticatedSession {
+            sudo_password: None,
             handle,
             command_events: None,
         };
@@ -637,6 +639,7 @@ async fn continuous_remote_output_cannot_starve_cancellation_or_timeout() {
         .unwrap();
         assert!(handle.authenticate_none("fixture").await.unwrap().success());
         let session = AuthenticatedSession {
+            sudo_password: None,
             handle,
             command_events: None,
         };
@@ -729,6 +732,7 @@ async fn known_exit_status_survives_late_cancellation_and_timeout_before_close()
         .unwrap();
         assert!(handle.authenticate_none("fixture").await.unwrap().success());
         let session = AuthenticatedSession {
+            sudo_password: None,
             handle,
             command_events: None,
         };

@@ -92,6 +92,7 @@ async fn password_authentication_preserves_host_pin_cancellation_and_release_pro
         .await
         .unwrap();
         validate_exec(&session, &cancellation).await;
+        validate_sudo(&session, &cancellation, &transfer).await;
         transfer.lock().await.fail_writes_remaining = 1;
         validate_transfer(&session, directory.path(), &cancellation, &transfer).await;
         let deployment = DeploymentId::new();
@@ -150,4 +151,75 @@ async fn password_authentication_preserves_host_pin_cancellation_and_release_pro
     .await
     .unwrap();
     result.unwrap();
+}
+
+async fn validate_sudo(
+    session: &AuthenticatedSession,
+    cancellation: &CancellationToken,
+    transfer: &Arc<AsyncMutex<TransferState>>,
+) {
+    let command = |action| {
+        CommandSpec::structured(
+            "/usr/bin/sudo",
+            [
+                "-S",
+                "--",
+                "/usr/bin/systemctl",
+                action,
+                "--",
+                "fixture.service",
+            ]
+            .map(CommandArgument::plain),
+        )
+        .unwrap()
+        .in_directory("/fixture/current")
+        .unwrap()
+    };
+    let output = session
+        .execute(&command("restart"), Duration::from_secs(5), cancellation)
+        .await
+        .unwrap();
+    assert_eq!(output.exit_status, 0);
+    assert!(
+        output.stdout.is_empty() && output.stderr.is_empty(),
+        "sudo echoes must not escape transport"
+    );
+    assert_eq!(transfer.lock().await.sudo_responses, 1);
+    let denied = session
+        .execute(&command("denied"), Duration::from_secs(5), cancellation)
+        .await
+        .unwrap();
+    assert_eq!(denied.exit_status, 1);
+    assert!(denied.stdout.is_empty() && denied.stderr.is_empty());
+    assert_eq!(transfer.lock().await.sudo_responses, 2);
+    let output = session
+        .execute(&command("cached"), Duration::from_secs(5), cancellation)
+        .await
+        .unwrap();
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(
+        transfer.lock().await.sudo_responses,
+        2,
+        "no prompt means no password"
+    );
+    let result = session
+        .execute(&command("stall"), Duration::from_millis(50), cancellation)
+        .await;
+    assert!(matches!(
+        result,
+        Err(shipforge::drivers::linux_ssh::SshConnectionError::Timeout { .. })
+    ));
+    let cancelled = CancellationToken::new();
+    let stalled_command = command("stall");
+    let task = session.execute(&stalled_command, Duration::from_secs(5), &cancelled);
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancelled.cancel();
+    };
+    let (result, ()) = tokio::join!(task, cancel);
+    assert!(matches!(
+        result,
+        Err(shipforge::drivers::linux_ssh::SshConnectionError::Cancelled)
+    ));
+    assert_eq!(transfer.lock().await.sudo_responses, 2);
 }

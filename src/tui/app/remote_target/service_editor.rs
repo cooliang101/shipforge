@@ -91,7 +91,7 @@ impl ServiceEditor {
     pub(super) fn help(&self) -> &'static str {
         match self.page {
             Page::Fields(_) => {
-                "↑↓ choose · Enter edit/apply · x clear selected action/check · Esc discard"
+                "↑↓ choose · Enter edit/apply · p password sudo · x clear · Esc discard"
             }
             Page::Action { .. } => "↑↓ command · a add · Enter edit · d remove · Esc fields",
             Page::Arguments { .. } => {
@@ -136,6 +136,14 @@ impl ServiceEditor {
                 self.page = Page::Fields(cursor);
                 match key {
                     KeyCode::Esc => return EditResult::Discard,
+                    KeyCode::Char('p') if cursor < 5 => {
+                        for argv in &mut self.actions[cursor] {
+                            toggle_password_sudo(argv);
+                        }
+                        self.message = Some(
+                            "Password sudo uses the saved SSH login password; no server permissions are changed.",
+                        );
+                    }
                     KeyCode::Char('x') if cursor < 5 => {
                         self.actions[cursor].clear();
                         if cursor == 4 {
@@ -422,6 +430,22 @@ impl ServiceEditor {
     }
 }
 
+fn toggle_password_sudo(argv: &mut Vec<String>) {
+    let is_sudo = argv
+        .first()
+        .is_some_and(|value| matches!(value.as_str(), "sudo" | "/usr/bin/sudo" | "/bin/sudo"));
+    if is_sudo
+        && argv.get(1).is_some_and(|value| value == "-S")
+        && argv.get(2).is_some_and(|value| value == "--")
+    {
+        argv.drain(..3);
+    } else if is_sudo && argv.get(1).is_some_and(|value| value == "-n") {
+        argv.splice(1..2, ["-S".into(), "--".into()]);
+    } else if !is_sudo && !argv.is_empty() {
+        argv.splice(..0, ["/usr/bin/sudo".into(), "-S".into(), "--".into()]);
+    }
+}
+
 fn move_cursor(key: KeyCode, cursor: &mut usize, count: usize) {
     match key {
         KeyCode::Up => *cursor = cursor.saturating_sub(1),
@@ -435,6 +459,27 @@ fn move_cursor(key: KeyCode, cursor: &mut usize, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_sudo_toggle_preserves_check_and_other_actions() {
+        let service = ServiceConfig::systemd("fixture.service");
+        let mut editor = ServiceEditor::new(Some(service.clone()));
+        editor.handle(KeyCode::Char('p'));
+        let updated = editor.config().unwrap();
+        assert_eq!(&updated.start[0][..3], &["/usr/bin/sudo", "-S", "--"]);
+        assert_eq!(updated.stop, service.stop);
+        assert_eq!(updated.check, service.check);
+        editor.handle(KeyCode::Char('p'));
+        assert_eq!(editor.config().unwrap(), service);
+        let mut old = vec![
+            "/usr/bin/sudo".into(),
+            "-n".into(),
+            "systemctl".into(),
+            "stop".into(),
+        ];
+        toggle_password_sudo(&mut old);
+        assert_eq!(old, ["/usr/bin/sudo", "-S", "--", "systemctl", "stop"]);
+    }
 
     fn type_value(editor: &mut ServiceEditor, value: &str) {
         for c in value.chars() {
