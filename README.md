@@ -47,6 +47,7 @@ All gates run locally on Windows; there are no GitHub Actions test workflows, an
 ## Reference
 
 - [Configuration guide](docs/configuration-guide.md) — canonical, TUI-managed configuration.
+- [AI Agent configuration guide](docs/ai-agent-configuration.md) — inspect existing release scripts, prepare configuration inputs, and save through the TUI.
 - [TUI guide](docs/tui-guide.md) — project editing, connections, history, inspection, and explicit rollback.
 - [Requirements](docs/requirements.md) and [architecture](docs/architecture.md) — MVP scope and boundaries.
 - [Contributor guide](AGENTS.md) — style, safety, testing, and per-work-package commits.
