@@ -2,6 +2,8 @@
 
 ShipForge is a Windows Rust TUI for building local project Components and deploying their versioned `tar.gz` Releases to Linux over SSH/SFTP. Components can share a connection or use separate Destinations, with independent versions and compensation boundaries. The MVP client targets Windows x64 GNU only; Linux remains the deployment server, not a supported client platform.
 
+Built for personal deployment to servers you manage, not an enterprise delivery pipeline. Priorities are reusable configuration, straightforward deployment, understandable failures and a runnable exe. Existing safeguards remain; approvals, multi-user governance and exhaustive failure-matrix certification are out of scope. See the [personal-use roadmap](docs/roadmap.md).
+
 ## Deployment behavior
 
 ShipForge publishes application files into the configured existing directory. It preserves existing service/Nginx configuration and runtime data, and keeps one `previous.tar.gz` containing only the previous application files for failed-publish recovery. All service commands run in the configured root. There is no required directory migration, current symlink, remote version tree, database/attachment backup, or permission-policy change.

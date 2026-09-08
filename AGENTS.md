@@ -2,6 +2,8 @@
 
 ## Project Structure & Module Organization
 
+Build a personal deployment assistant, not an enterprise pipeline. Keep existing safety checks and regression tests; prioritize simple TUI setup and clear failures. Do not add approvals, multi-user governance or exhaustive certification gates. Use representative tests and fix concrete risks; documentation-only changes need consistency/link checks, not a fresh binary build.
+
 `docs/requirements.md` is the product specification; `docs/architecture.md` defines safety invariants. Rust code is under `src/`: `main.rs` owns the TUI lifecycle; `domain/` and `application/` hold Driver-neutral rules; `drivers/linux_ssh/` owns SSH/SFTP behavior; `config/`, `projects/`, `history/`, `telemetry/`, and `adapters/` handle local boundaries; `tui/` contains input, state, and Ratatui views.
 
 Keep unit tests beside code in `#[cfg(test)]` modules, integration tests in `tests/`, and fixtures in `tests/fixtures/`. Never commit generated Releases, logs, credentials, local databases, or private test keys.

@@ -1,6 +1,6 @@
 # ShipForge Domain
 
-ShipForge describes delivery from a local project to infrastructure or managed deployment services. This glossary defines the language used by requirements, code, logs, and the TUI.
+ShipForge is a personal deployment assistant for delivering local projects to servers managed by the user. This glossary defines the language used by requirements, code, logs, and the TUI; it does not describe an enterprise delivery pipeline.
 
 ## Language
 
