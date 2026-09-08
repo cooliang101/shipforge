@@ -20,3 +20,15 @@ The executable is `target/release/shipforge.exe`; do not override Cargo target o
 - Release ConPTY smokes remain in `tests/platform_smoke.rs`; run their ignored Windows release tests with `SHIPFORGE_RELEASE_SMOKE_BINARY` set to the absolute release executable.
 
 The prior releases/current Linux deployment and systemd fixtures were retired with that engine. Their validation documents are historical evidence and do not validate the new publisher. Real Linux deployment validation is recorded separately; no test is permitted to discover or mutate production destinations automatically.
+
+## WSL publisher fault checks
+
+Run from Windows against the installed WSL distribution, as its ordinary non-root user:
+
+```powershell
+wsl -d Ubuntu-22.04 -- python3 -B /mnt/d/cdoe/shipforge/tests/inplace_faults.py
+```
+
+Adjust only the repository path when needed. The suite runs 16 inherited contracts plus five Linux fault checks in temporary directories: archive permission denial, partial application replacement failure, state replacement failure, SIGKILL during publishing, and failure during restore. Every case checks an out-of-scope runtime sentinel. Faults are injected only in child test processes around the exact shipped Python entry point; there are no product fault switches. Children have a 20-second deadline and temporary directories are cleaned on completion. Root/non-Linux invocation fails rather than counting skipped checks as success.
+
+This suite does not connect through SSH, launch systemd/PM2, fill a disk, or test host power loss. The Windows protocol suite separately exercises the production Driver with simulated service replies. These are distinct evidence levels; see [WSL fault results](../docs/validation/wsl-inplace-faults.md).

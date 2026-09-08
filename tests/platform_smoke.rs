@@ -501,6 +501,25 @@ impl TerminalPositions {
         observe_first(&mut self.first_frame, bytes, base, FIRST_FRAME_TEXT);
         observe_first(&mut self.alternate_leave, bytes, base, ALT_SCREEN_LEAVE);
         observe_first(&mut self.cursor_show, bytes, base, CURSOR_SHOW);
+        #[cfg(windows)]
+        if self.alternate_enter.is_none()
+            && let (Some(frame), Some(hide), Some(show)) =
+                (self.first_frame, self.cursor_hide, self.cursor_show)
+            && show < frame.min(hide)
+        {
+            // ConPTY can prepend its initial visible-cursor state. That is not
+            // application recovery; still require a later show after setup.
+            self.cursor_show = None;
+            let start = usize::try_from(frame.min(hide).saturating_sub(base))
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            observe_first(
+                &mut self.cursor_show,
+                &bytes[start..],
+                base + u64::try_from(start).unwrap_or(0),
+                CURSOR_SHOW,
+            );
+        }
     }
 }
 
@@ -844,6 +863,25 @@ fn conpty_accepts_screen_before_cursor_hide_but_requires_later_recovery() {
     };
     assert!(!premature_show.initial_frame_ready());
     assert!(validate_terminal_recovery(premature_show).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn conpty_initial_cursor_visibility_is_not_exit_recovery() {
+    let initial = b"\x1b[?25hProjects\x1b[?25l";
+    for chunk_size in 1..=initial.len() {
+        let mut capture = OutputCapture::default();
+        for chunk in initial.chunks(chunk_size) {
+            capture.push(chunk);
+        }
+        assert!(capture.positions.initial_frame_ready());
+        assert!(validate_terminal_recovery(capture.positions).is_err());
+        capture.push(CURSOR_SHOW);
+        assert!(validate_terminal_recovery(capture.positions).is_ok());
+    }
+    let mut capture = OutputCapture::default();
+    capture.push(b"\x1b[?25hProjects\x1b[?25l\x1b[?25h");
+    assert!(validate_terminal_recovery(capture.positions).is_ok());
 }
 
 #[test]
