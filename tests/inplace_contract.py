@@ -1,5 +1,5 @@
 """Exercise the shipped remote executor against disposable local directories."""
-import importlib.util, pathlib, tempfile, unittest, json, tarfile, io, hashlib, os
+import importlib.util, pathlib, tempfile, unittest, json, tarfile, io, hashlib, os, subprocess, sys
 spec=importlib.util.spec_from_file_location('executor',pathlib.Path(__file__).parents[1]/'src/drivers/linux_ssh/inplace.py')
 executor=importlib.util.module_from_spec(spec);spec.loader.exec_module(executor)
 
@@ -100,5 +100,19 @@ class InplaceContract(unittest.TestCase):
         self.put('app',b'old');self.prepare('v1',{'app':b'new'});self.runop('archive');self.runop('phase',phase='service-pending');self.runop('phase',phase='service-failed');self.put('app',b'external')
         with self.assertRaises(ValueError):self.runop('rollback',expected=None,desired=None)
         self.assertEqual((self.root/'app').read_bytes(),b'external')
+
+    def test_corrupt_state_reports_safe_error_without_parser_diagnostics(self):
+        self.put('app',b'old')
+        meta=self.root/'.shipforge-deploy';meta.mkdir()
+        request=dict(root=str(self.root),identity=self.identity,operation='observe')
+        for contents in [b'{private-state', b'\xffprivate-state']:
+            with self.subTest(contents=contents):
+                (meta/'state.json').write_bytes(contents)
+                result=subprocess.run([sys.executable,'-B',executor.__file__,json.dumps(request)],capture_output=True,timeout=20)
+                self.assertEqual(result.returncode,1)
+                self.assertEqual(json.loads(result.stdout),{'error':'Remote application operation failed','recoverable':False})
+                self.assertEqual(result.stderr,b'')
+                self.assertEqual((self.root/'app').read_bytes(),b'old')
+                self.assertEqual((meta/'state.json').read_bytes(),contents)
 
 if __name__=='__main__':unittest.main()

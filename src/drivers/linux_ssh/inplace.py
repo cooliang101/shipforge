@@ -5,8 +5,11 @@ from pathlib import Path
 MAX_ENTRIES = 100000
 META = '.shipforge-deploy'
 
+class ApplicationError(ValueError):
+    """Only explicit, fixed application diagnostics may cross the RPC boundary."""
+
 def fail(message):
-    raise ValueError(message)
+    raise ApplicationError(message)
 
 def canonical(name):
     if not isinstance(name, str) or not name or len(name.encode()) > 3900:
@@ -288,5 +291,5 @@ if __name__ == '__main__':
                     state.update(phase='publish-failed',failedSnapshot=snapshot(root,state['scopes']))
                     atomic_json(path,state);recoverable=True
             except Exception:pass
-        print(json.dumps({'error':str(error) if isinstance(error,ValueError) else 'Remote application operation failed','recoverable':recoverable}))
+        print(json.dumps({'error':str(error) if isinstance(error,ApplicationError) else 'Remote application operation failed','recoverable':recoverable}))
         sys.exit(1)
