@@ -21,7 +21,7 @@ A reusable, Project-independent connection identified by an immutable key and ba
 _Avoid_: Environment, Component
 
 **Deployment Marker**:
-Static metadata at a Linux Component root that identifies its Project, Environment, Component, and generation for later safety checks. It is not read by application services and does not imply ongoing control of the Destination.
+Legacy version-directory metadata, retained as terminology for old history and Driver-neutral types. The current Linux driver uses `root/.shipforge-deploy/state.json` to record identity, application scope and operation phase; it does not create the old Marker.
 
 **Driver**:
 An implementation of deployment behavior for a Destination kind, such as `linux-ssh` or `vercel`.
@@ -57,7 +57,7 @@ The current observed Release, or absence of one, for each configured Component i
 _Avoid_: Release, local deployment intent
 
 **Rollback**:
-A user-requested Deployment linked to an earlier Deployment that activates a selected historical healthy Release, or restores `not_deployed`, for each selected Component. Automatic failure recovery is Compensation, not a Rollback Deployment.
+A user-requested Deployment linked to an earlier Deployment that restores an evidenced previous application state for each selected Component. The Linux driver can only use its single previous application archive; old history does not make arbitrary versions available. Automatic failure recovery is Compensation, not a Rollback Deployment.
 _Avoid_: Undo, downgrade
 
 **Compensation**:
@@ -69,5 +69,5 @@ Environment data that persists across Releases, such as configuration, uploads, 
 _Avoid_: Release files
 
 **Release Retention**:
-The policy that removes eligible Component Releases while protecting the current, previous healthy, referenced, and in-progress versions.
+Legacy capability for multi-version cleanup, retained for Driver-neutral types and old history. The current Linux driver does not advertise it and keeps only one previous application archive.
 _Avoid_: Cleanup

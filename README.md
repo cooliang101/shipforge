@@ -4,6 +4,8 @@ ShipForge is a Windows Rust TUI for building local project Components and deploy
 
 Built for personal deployment to servers you manage, not an enterprise delivery pipeline. Priorities are reusable configuration, straightforward deployment, understandable failures and a runnable exe. Existing safeguards remain; approvals, multi-user governance and exhaustive failure-matrix certification are out of scope. See the [personal-use roadmap](docs/roadmap.md).
 
+For running the exe, reopening saved projects, updating and handling failures, see the short [personal-use guide](docs/personal-use.md)（中文）.
+
 ## Deployment behavior
 
 ShipForge publishes application files into the configured existing directory. It preserves existing service/Nginx configuration and runtime data, and keeps one `previous.tar.gz` containing only the previous application files for failed-publish recovery. All service commands run in the configured root. There is no required directory migration, current symlink, remote version tree, database/attachment backup, or permission-policy change.
