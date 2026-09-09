@@ -666,8 +666,8 @@ fn render_localized(frame: &mut Frame<'_>, app: &App) {
                 Color::Cyan
             });
     frame.render_widget(Paragraph::new(context).style(context_style), areas[0]);
-    render_screen(frame, areas[1], app);
-    let help = i18n::tr(page_help(app));
+    render_content_with_actions(frame, areas[1], app);
+    let help = navigation_help(app);
     let mut footer = vec![Line::from(help)];
     if let Some(message) = app.message.as_deref().or_else(|| {
         matches!(app.screen, Screen::Overview { .. })
@@ -726,8 +726,8 @@ fn render_localized(frame: &mut Frame<'_>, app: &App) {
                 .as_deref()
                 .map_or_else(|| "No current message.".into(), safe_text);
             let instructions = crate::tui::i18n::format!(
-                "Current page: {}\n\nPage keys: {help}\n\nF6 selects and saves the interface language.\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nDeployment/rollback: only unmodified c confirms. SSH fingerprint: only unmodified y trusts.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
-                "当前页面：{}\n\n页面快捷键：{help}\n\nF6 选择语言并保存，F4 搜索候选；Enter 仅定位，不执行操作。\n\nF1 / Esc 关闭帮助，↑/↓ 或 PgUp/PgDn 滚动。Ctrl+C 安全取消活动任务。\n\n发布/回退仅普通 c 确认；SSH 指纹仅普通 y 信任。\n\n> 和反色表示焦点，[x]/[ ] 表示勾选；警告和生产环境有文字标识。\n\n提示：{message}",
+                "Current page: {}\n\nPage keys: {help}\n\nF6 selects and saves the interface language.\n\nF4 finds candidates on choice pages; type to filter, Enter focuses a row, Esc keeps the original selection. It does not run an operation.\n\nF1 / Esc closes this help. Up/Down or PgUp/PgDn scroll. Ctrl+C requests safe cancellation of an active operation.\n\nSelect a confirmation action with Down, then unmodified Enter confirms. Optional shortcuts: c deploy/rollback, y trust a host key.\n\nFocus uses > and reverse video; selections use [x]/[ ]; warnings and production status have text labels, not color alone.\n\nMessage: {message}",
+                "当前页面：{}\n\n页面快捷键：{help}\n\nF6 选择语言并保存，F4 搜索候选；Enter 仅定位，不执行操作。\n\nF1 / Esc 关闭帮助，↑/↓ 或 PgUp/PgDn 滚动。Ctrl+C 安全取消活动任务。\n\n向下选中确认项后，普通 Enter 确认。可选快捷键：c 发布/回退，y 信任主机指纹。\n\n> 和反色表示焦点，[x]/[ ] 表示勾选；警告和生产环境有文字标识。\n\n提示：{message}",
                 app.context_label()
             );
             frame.render_widget(
@@ -741,6 +741,37 @@ fn render_localized(frame: &mut Frame<'_>, app: &App) {
         overview::render_language(frame, app);
     }
     render_exit_overlay(frame, app.exit_state());
+}
+
+fn navigation_help(app: &App) -> &'static str {
+    if matches!(app.screen, Screen::Projects) {
+        i18n::choose(
+            "↑/↓ select · Enter open · Ctrl+C / Esc twice exit",
+            "↑/↓ 选择 · Enter 打开 · Ctrl+C / 连按两次 Esc 退出",
+        )
+    } else if app.page_actions().is_some() {
+        i18n::choose(
+            "↑/↓ select · Enter open / toggle · Esc back · PgUp/PgDn scroll",
+            "↑/↓ 选择（列表末尾进入操作） · Enter 打开 / 勾选 · Esc 返回 · PgUp/PgDn 滚动",
+        )
+    } else {
+        i18n::tr(page_help(app))
+    }
+}
+
+fn render_content_with_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    if app.page_actions().is_some() {
+        let split = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(u16::from(area.height >= 18)),
+            Constraint::Length(app.action_height(area.height)),
+        ])
+        .split(area);
+        render_screen(frame, split[0], app);
+        app.render_actions(frame, split[2]);
+    } else {
+        render_screen(frame, area, app);
+    }
 }
 
 fn render_exit_overlay(frame: &mut Frame<'_>, state: ExitState) {
@@ -1421,7 +1452,7 @@ fn render_host_key_confirmation(
         panel(
             " New SSH Destination · Confirm Host Key ",
             crate::tui::i18n::format!(
-                "Endpoint: {}\n\nHost Key:\n{}\n\nVerify this fingerprint through a trusted channel before confirming. Only y accepts; Enter does not trust the key.","地址：{}\n\n主机密钥：\n{}\n\n请通过可信渠道核对指纹。仅按 y 表示信任，Enter 不会接受密钥。",
+                "Endpoint: {}\n\nHost Key:\n{}\n\nVerify this fingerprint through a trusted channel before confirming. Select Trust this host key with Down, then Enter accepts; y is an optional shortcut.","地址：{}\n\n主机密钥：\n{}\n\n请通过可信渠道核对指纹。向下选中“信任此主机指纹”后按 Enter 确认；也可按 y。",
                 setup_endpoint(draft),
                 fingerprint.as_str()
             ),

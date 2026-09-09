@@ -639,3 +639,40 @@ fn scroll(key: KeyCode, value: &mut u16) {
 
 #[cfg(test)]
 mod tests;
+
+impl ConnectionsScreen {
+    pub(super) fn actions(&self) -> Option<super::actions::Actions> {
+        use super::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        Some(match &self.page {
+            ConnectionsPage::List { items, cursor } => Actions::new(
+                &[
+                    (t("Add connection", "添加连接"), 'a'),
+                    (t("Refresh", "刷新"), 'f'),
+                ],
+                items.len(),
+                *cursor,
+            ),
+            ConnectionsPage::Detail { .. } => Actions::new(
+                &[
+                    (t("Edit connection", "编辑连接"), 'e'),
+                    (t("Verify connection", "验证连接"), 'v'),
+                    (t("Remove connection…", "移除连接…"), 'x'),
+                ],
+                0,
+                0,
+            ),
+            ConnectionsPage::Unavailable => Actions::new(&[(t("Retry", "重试"), 'f')], 0, 0),
+            ConnectionsPage::HostKey { .. } => {
+                Actions::confirmation(t("Trust this host key", "信任此主机指纹"), 'y')
+            }
+            ConnectionsPage::Remove(preview) if preview.can_remove() => {
+                Actions::confirmation(t("Confirm removal", "确认移除"), 'c')
+            }
+            ConnectionsPage::ProjectRemove(_) => {
+                Actions::confirmation(t("Confirm removal", "确认移除"), 'c')
+            }
+            _ => return None,
+        })
+    }
+}

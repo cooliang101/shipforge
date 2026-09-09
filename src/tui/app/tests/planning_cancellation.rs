@@ -82,7 +82,7 @@ async fn cancelled_real_planning_worker_discards_late_success_before_allowing_a_
         let Screen::DeploySelection(original) = app.screen.clone() else {
             panic!("expected selection");
         };
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         tokio::time::timeout(Duration::from_secs(3), async {
             while !gateway.started.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -122,14 +122,17 @@ async fn cancelled_real_planning_worker_discards_late_success_before_allowing_a_
         assert_eq!(restored.config, original.config);
         assert_eq!(restored.selected, original.selected);
         assert_eq!(restored.environment_cursor, original.environment_cursor);
-        assert_eq!(restored.component_cursor, original.component_cursor);
+        assert_eq!(
+            restored.component_cursor,
+            deployment_components(restored).len() - 1
+        );
         assert!(
             app.message
                 .as_deref()
                 .unwrap()
                 .contains("completed plan was discarded")
         );
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         let Screen::DeploymentPlanning {
             request_id: new_id, ..
         } = &app.screen
@@ -149,7 +152,7 @@ async fn cancelled_real_planning_worker_discards_late_success_before_allowing_a_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_and_joins_the_real_planning_worker() {
     let (_directory, mut app, gateway) = fixture();
-    app.handle_key(key(KeyCode::Enter));
+    app.enter_primary();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !gateway.started.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;

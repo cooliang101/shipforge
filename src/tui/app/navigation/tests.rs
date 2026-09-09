@@ -95,17 +95,21 @@ fn environment_choice_survives_view_changes_and_only_same_id_renames() {
     );
 }
 
-#[test]
-fn deployment_environment_choice_is_returned_to_overview_and_management() {
+#[tokio::test]
+async fn deployment_environment_choice_is_returned_to_overview_and_management() {
     let (directory, mut app, config) = fixture();
     app.open_deployment(directory.path().into(), config.clone());
     press(&mut app, KeyCode::Right);
     press(&mut app, KeyCode::Esc);
     assert!(app.context_label().contains("staging"));
     press(&mut app, KeyCode::Char('m'));
+    while app.management_task.is_some() {
+        app.poll_background();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     assert!(app.context_label().contains("staging"));
-    press(&mut app, KeyCode::Left);
     press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Left);
     press(&mut app, KeyCode::Char('d'));
     let Screen::DeploySelection(selection) = &app.screen else {
         panic!("selection")
@@ -221,7 +225,7 @@ fn production_context_and_confirmation_remain_visible_when_plan_is_scrolled() {
     assert!(lines[0].starts_with("[PRODUCTION]"));
     assert!(lines[0].contains("production"));
     assert!(lines[1].contains("Confirm deployment"));
-    assert!(lines[8].contains("c confirm"));
+    assert!(lines[8].contains("Enter"));
     assert!(lines[9].contains("Check targets"));
     press(&mut app, KeyCode::Enter);
     assert!(matches!(app.screen, Screen::DeploymentReview { .. }));
@@ -273,9 +277,9 @@ fn empty_component_selection_does_not_advertise_an_executable_check() {
     };
     selection.selected.clear();
     let lines = draw(&app, 80, 10);
-    assert!(lines[8].contains("required"));
+    assert!(lines[8].contains("Enter"));
     assert!(!lines[8].contains("Enter check"));
-    press(&mut app, KeyCode::Enter);
+    app.enter_primary();
     assert!(matches!(app.screen, Screen::DeploySelection(_)));
     assert!(app.message.as_deref().unwrap().contains("Select at least"));
 }
@@ -305,7 +309,7 @@ fn overview_scroll_reaches_targets_without_losing_fixed_environment_context() {
         assert!(lines[0].starts_with("[PRODUCTION]"));
         assert!(lines[0].contains("production"));
         found_worker |= lines[2..8].join(" ").contains("worker →");
-        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::PageDown);
     }
     assert!(found_worker);
     press(&mut app, KeyCode::Home);

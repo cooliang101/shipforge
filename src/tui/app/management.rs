@@ -204,6 +204,7 @@ impl ManagementRequest {
 
 #[derive(Debug)]
 pub(super) struct ManagementTask {
+    skip_home_on_success: bool,
     id: uuid::Uuid,
     origin: ManagementScreen,
     cancellation: CancellationToken,
@@ -250,6 +251,22 @@ impl App {
     }
 
     pub(super) fn open_management(&mut self, root: PathBuf, config: ProjectConfig) {
+        self.initialize_management(root, config);
+        if let Screen::Management(screen) = &self.screen {
+            self.start_management(
+                screen.clone(),
+                ManagementRequest::History(DeploymentQuery {
+                    limit: PAGE_SIZE,
+                    ..Default::default()
+                }),
+            );
+            if let Some(task) = &mut self.management_task {
+                task.skip_home_on_success = true;
+            }
+        }
+    }
+
+    fn initialize_management(&mut self, root: PathBuf, config: ProjectConfig) {
         self.refresh_destination_labels();
         let Some(environment) = self.preferred_environment(&config) else {
             self.message = Some("This Project has no Environment to manage.".into());
@@ -281,6 +298,14 @@ impl App {
         {
             self.message = Some(HISTORICAL_READ_ONLY.into());
             self.screen = Screen::Management(screen);
+            return;
+        }
+        if matches!(
+            screen.page,
+            ManagementPage::History { .. } | ManagementPage::Reports { .. }
+        ) && matches!(key, KeyCode::Char('h' | 'p' | 'a' | 'i'))
+        {
+            self.handle_management_home(key, screen);
             return;
         }
         if self.handle_management_shortcut(key, &mut screen) {
@@ -496,6 +521,10 @@ impl App {
 
     fn navigate_management(&mut self, key: KeyCode, mut screen: ManagementScreen) {
         if key == KeyCode::Esc {
+            if screen.back.is_empty() && matches!(screen.page, ManagementPage::History { .. }) {
+                self.show_overview(screen.scope.root.clone(), screen.scope.config.clone());
+                return;
+            }
             screen.go_back();
         } else {
             screen.view.handle_key(key);
@@ -640,6 +669,7 @@ impl App {
                     notice: None,
                 });
                 self.management_task = Some(ManagementTask {
+                    skip_home_on_success: false,
                     id,
                     origin,
                     cancellation,
@@ -718,6 +748,9 @@ impl App {
         match result {
             Ok(page) => {
                 screen.accept_result(&task.request, page);
+                if task.skip_home_on_success {
+                    screen.back.clear();
+                }
             }
             Err(error) => {
                 let message = render::safe_text(&error);
@@ -912,4 +945,108 @@ fn move_cursor(key: KeyCode, cursor: &mut usize, count: usize) {
         KeyCode::End => count.saturating_sub(1),
         _ => *cursor,
     };
+}
+
+impl ManagementScreen {
+    pub(super) fn actions(&self) -> Option<super::actions::Actions> {
+        use super::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        let mut actions = match &self.page {
+            ManagementPage::Home => Actions::new(
+                &[
+                    (t("Deployment history", "发布历史"), 'h'),
+                    (t("Saved inspections", "已保存的检查报告"), 'p'),
+                ],
+                0,
+                0,
+            ),
+            ManagementPage::History { page, cursor, .. } => Actions::new(
+                &[
+                    (t("Refresh history", "刷新历史"), 'f'),
+                    (t("Saved inspections", "已保存的检查报告"), 'p'),
+                ],
+                page.items.len(),
+                *cursor,
+            ),
+            ManagementPage::Reports { page, cursor, .. } => Actions::new(
+                &[
+                    (t("Refresh reports", "刷新检查报告"), 'f'),
+                    (t("Deployment history", "发布历史"), 'h'),
+                ],
+                page.items.len(),
+                *cursor,
+            ),
+            ManagementPage::Environments { page, cursor, .. } => Actions::new(
+                &[(t("Refresh environments", "刷新环境"), 'f')],
+                page.items.len(),
+                *cursor,
+            ),
+            ManagementPage::Detail(details) => {
+                let mut a = Actions::new(&[(t("View logs", "查看日志"), 'l')], 0, 0);
+                if self.scope.historical_environment.is_none() && !details.snapshots.is_empty() {
+                    a.items.extend([
+                        (t("Restore / rollback", "恢复 / 回退"), KeyCode::Char('r')),
+                        (
+                            t("Inspect remote state", "检查远端状态"),
+                            KeyCode::Char('i'),
+                        ),
+                    ]);
+                }
+                a
+            }
+            ManagementPage::InspectSelection { names, cursor, .. } => {
+                Actions::choice(names.len(), *cursor)
+            }
+            ManagementPage::RollbackSelection {
+                details, cursor, ..
+            } => Actions::choice(details.snapshots.len(), *cursor),
+            ManagementPage::RollbackTargets {
+                candidates, cursor, ..
+            } => {
+                let mut a = Actions::choice(candidates.components.len(), *cursor);
+                a.items.extend([
+                    (t("Previous version", "上一个版本"), KeyCode::Left),
+                    (t("Next version", "下一个版本"), KeyCode::Right),
+                    (t("Version details", "版本详情"), KeyCode::Char('d')),
+                ]);
+                a
+            }
+            ManagementPage::RollbackReview(_) => {
+                Actions::confirmation(t("Confirm rollback", "确认恢复 / 回退"), 'c')
+            }
+            ManagementPage::Failed { retry: Some(_), .. } => {
+                Actions::new(&[(t("Retry", "重试"), 'f')], 0, 0)
+            }
+            _ => return None,
+        };
+        if matches!(
+            self.page,
+            ManagementPage::Home | ManagementPage::History { .. } | ManagementPage::Reports { .. }
+        ) && self.scope.historical_environment.is_none()
+        {
+            actions.items.extend([
+                (t("Inspect components", "检查组件"), KeyCode::Char('i')),
+                (t("Historical environments", "历史环境"), KeyCode::Char('a')),
+            ]);
+        }
+        let paging = match &self.page {
+            ManagementPage::History { page, offset, .. } => Some((page.more, *offset)),
+            ManagementPage::Reports { page, offset, .. } => Some((page.more, *offset)),
+            ManagementPage::Environments { page, offset, .. } => Some((page.more, *offset)),
+            _ => None,
+        };
+        if let Some((more, offset)) = paging {
+            if more {
+                actions
+                    .items
+                    .push((t("Next page", "下一页"), KeyCode::Char('n')));
+            }
+            if offset > 0 {
+                actions
+                    .items
+                    .push((t("Previous page", "上一页"), KeyCode::Char('b')));
+            }
+        }
+        Some(actions)
+    }
 }

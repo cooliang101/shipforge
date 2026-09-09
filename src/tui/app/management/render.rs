@@ -249,6 +249,54 @@ impl ManagementScreen {
                 inner,
             );
         }
+        self.color_history_states(frame, inner, top, horizontal);
+    }
+
+    fn color_history_states(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        top: usize,
+        horizontal: usize,
+    ) {
+        use crate::domain::DeploymentState;
+        let ManagementPage::History { page, offset, .. } = &self.page else {
+            return;
+        };
+        let first_row = page_header(
+            page.database_missing,
+            page.items.is_empty(),
+            *offset,
+            page.more,
+        )
+        .lines()
+        .count();
+        for (index, record) in page.items.iter().enumerate() {
+            let Some(row) = (first_row + index)
+                .checked_sub(top)
+                .filter(|row| *row < usize::from(area.height))
+            else {
+                continue;
+            };
+            // The kind and state are ASCII enum labels. Keep the viewport's
+            // clipping and all other text styles, tinting only visible state cells.
+            let start = format!("  {:?} / ", record.kind).len();
+            let end = start + format!("{:?}", record.state).len();
+            let color = match record.state {
+                DeploymentState::Succeeded => Color::Green,
+                DeploymentState::Failed => Color::Red,
+                DeploymentState::Running => Color::Cyan,
+                DeploymentState::Cancelled => Color::Yellow,
+                DeploymentState::Created => Color::DarkGray,
+            };
+            for column in start.saturating_sub(horizontal)
+                ..end.saturating_sub(horizontal).min(usize::from(area.width))
+            {
+                let x = area.x + u16::try_from(column).unwrap_or_default();
+                let y = area.y + u16::try_from(row).unwrap_or_default();
+                frame.buffer_mut()[(x, y)].set_fg(color);
+            }
+        }
     }
 
     fn content(&self, app: &super::App) -> (&'static str, String, Option<usize>) {
@@ -371,8 +419,8 @@ impl ManagementScreen {
             ManagementPage::Home if self.scope.historical_environment.is_some() => (
                 "Historical Environment · read-only",
                 crate::tui::i18n::format!(
-                    "Project directory: {}\nEnvironment: {}\n\n[h] Local deployment history and logs\n[p] Saved inspection reports\n\nRead-only local evidence; no remote connections or rollback.\nEnvironment identity, not its name, determines this scope.\nOld configuration is not reconstructed. Esc returns to the previous page.",
-                    "项目目录：{}\n环境：{}\n\n[h] 本地发布历史与日志\n[p] 已保存的检查报告\n\n此页只读取本地记录，不连接远端或执行回退。\n查看范围由环境标识确定，旧配置不会被重建。Esc 返回。",
+                    "Project directory: {}\nEnvironment: {}\n\nRead-only local evidence; no remote connections or rollback.\nEnvironment identity, not its name, determines this scope.\nOld configuration is not reconstructed. Esc returns to the previous page.",
+                    "项目目录：{}\n环境：{}\n\n此页只读取本地记录，不连接远端或执行回退。\n查看范围由环境标识确定，旧配置不会被重建。Esc 返回。",
                     safe_text(&crate::tui::presentation::path_label(&self.scope.root)),
                     self.scope
                         .historical_environment
@@ -384,8 +432,8 @@ impl ManagementScreen {
             ManagementPage::Home => (
                 "Manage",
                 crate::tui::i18n::format!(
-                    "Project directory: {}\n\n[h] Local deployment history and logs\n[i] Inspect selected Components / remote Releases\n[p] Saved inspection reports\n[a] Historical Environment IDs (including removed Environments)\n\nOpening history never connects to a server.\nInspection is read-only on the server; it saves a separate local report.\nInventory is not an environment preflight or a health check.\nIt does not prove service health or historical success.",
-                    "项目目录：{}\n\n[h] 本地发布历史与日志\n[i] 检查所选组件 / 远端发布包\n[p] 已保存的检查报告\n[a] 历史环境（包括已移除环境）\n\n打开历史不会连接服务器。\n检查操作只读取服务器，并在本地保存独立报告。\n文件清单不等于环境预检或健康检查，不能据此判定服务健康或历史发布成功。",
+                    "Project directory: {}\n\nOpening history never connects to a server.\nInspection is read-only on the server; it saves a separate local report.\nInventory is not an environment preflight or a health check.\nIt does not prove service health or historical success.",
+                    "项目目录：{}\n\n打开历史不会连接服务器。\n检查操作只读取服务器，并在本地保存独立报告。\n文件清单不等于环境预检或健康检查，不能据此判定服务健康或历史发布成功。",
                     safe_text(&crate::tui::presentation::path_label(&self.scope.root))
                 ),
                 None,
@@ -467,22 +515,22 @@ impl ManagementScreen {
                     *offset,
                     page.more,
                 );
+                let first_row = text.lines().count();
                 for (index, record) in page.items.iter().enumerate() {
                     let _ = writeln!(
                         text,
-                        "{} {:?} / {:?} · {} · pending:{}\n  {}",
+                        "{} {:?} / {:?} · {} · pending:{}",
                         mark(index == *cursor),
                         record.kind,
                         record.state,
                         timestamp(record.created_at_ms),
-                        record.pending_intent_count,
-                        record.deployment
+                        record.pending_intent_count
                     );
                 }
                 (
                     "Deployment history · local · created time",
                     text,
-                    Some(cursor * 2 + 2),
+                    Some(cursor + first_row),
                 )
             }
             ManagementPage::Detail(details) => {
@@ -1011,12 +1059,87 @@ mod tests {
             offset: 0,
             cursor: 19,
         };
+        let (_, text, cursor) = screen.deployment_content();
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains("pending:"))
+            .collect();
+        assert_eq!(rows.len(), 20);
+        assert!(!text.contains(&selected), "full IDs belong in details");
+        assert!(
+            text.lines()
+                .nth(cursor.unwrap())
+                .unwrap()
+                .starts_with("> Rollback / Failed")
+        );
         app.screen = super::super::Screen::Management(screen);
         let buffer = render_app(&app, 80, 10);
-        assert!(buffer.contains(&selected));
+        assert!(!buffer.contains(&selected));
         assert!(buffer.contains("> Rollback / Failed"));
         assert!(buffer.contains("1970-01-20"));
         assert!(buffer.contains("pending:0"));
+    }
+
+    #[test]
+    fn history_details_preserve_the_full_deployment_id() {
+        let details = details();
+        assert!(deployment_details(&details).contains(&details.record.deployment.to_string()));
+    }
+
+    #[test]
+    fn history_colors_only_state_text_even_when_horizontally_scrolled() {
+        let (_directory, app) = super::super::tests::fixture();
+        let mut screen = super::super::tests::screen(&app);
+        let states = [
+            (DeploymentState::Succeeded, Color::Green),
+            (DeploymentState::Failed, Color::Red),
+            (DeploymentState::Running, Color::Cyan),
+            (DeploymentState::Cancelled, Color::Yellow),
+            (DeploymentState::Created, Color::DarkGray),
+        ];
+        screen.page = ManagementPage::History {
+            page: Arc::new(HistoryPage {
+                items: states
+                    .iter()
+                    .map(|(state, _)| {
+                        let mut item = record();
+                        item.state = *state;
+                        item
+                    })
+                    .collect(),
+                more: false,
+                database_missing: false,
+            }),
+            offset: 0,
+            cursor: 0,
+        };
+        let text = screen.deployment_content().1;
+        for pan in [0, 14, 40] {
+            screen.view.handle_key(super::super::KeyCode::Home);
+            for _ in 0..pan {
+                screen.view.handle_key(super::super::KeyCode::Char('.'));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+            terminal
+                .draw(|frame| screen.render(frame, frame.area(), &app))
+                .unwrap();
+            for (state, color) in states {
+                let label = format!("{state:?}");
+                let row = text.lines().position(|line| line.contains(&label)).unwrap();
+                let start = text.lines().nth(row).unwrap().find(&label).unwrap();
+                for x in 0..78 {
+                    let cell = &terminal.backend().buffer()[(
+                        u16::try_from(x + 1).unwrap(),
+                        u16::try_from(row + 1).unwrap(),
+                    )];
+                    if (start..start + label.len()).contains(&(x + pan)) {
+                        assert_eq!(cell.fg, color, "{state:?}, pan {pan}, column {x}");
+                    } else {
+                        assert_eq!(cell.fg, Color::Reset, "non-state text must keep its style");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

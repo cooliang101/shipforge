@@ -591,3 +591,34 @@ fn valid_service(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"@._:-\\".contains(&b)))
 }
+
+impl RemoteSetupSelectionState {
+    pub(super) fn actions(&self) -> Option<super::actions::Actions> {
+        use super::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        Some(match &self.page {
+            Page::Services => Actions::new(
+                &[
+                    (t("Edit remote directory", "编辑远端目录"), 'r'),
+                    (t("Browse remote directories", "浏览远端目录"), 'b'),
+                    (t("Edit service commands", "编辑服务命令"), 'c'),
+                    (t("Enter systemd unit", "输入 systemd 单元"), 'm'),
+                    (t("Inspect remote state", "检查远端状态"), 'v'),
+                ],
+                self.systemd_units.len() + 2,
+                self.cursor,
+            ),
+            Page::Directories { candidates, cursor } => Actions::new(
+                &[
+                    (t("Use this directory", "使用当前目录"), 's'),
+                    (t("Enter path", "输入路径"), 'g'),
+                    (t("Refresh", "刷新"), 'f'),
+                ],
+                candidates.directories.len(),
+                *cursor,
+            ),
+            Page::CommandEditor(editor) => return editor.actions_menu(),
+            _ => return None,
+        })
+    }
+}

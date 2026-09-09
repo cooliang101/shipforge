@@ -351,7 +351,8 @@ impl Fixture {
         let mut screen = super::tests::screen(&self.app);
         screen.page = ManagementPage::Detail(Arc::clone(&self.details));
         self.app.screen = Screen::Management(screen);
-        press(&mut self.app, KeyCode::Char('r'));
+        press(&mut self.app, KeyCode::Down);
+        press(&mut self.app, KeyCode::Enter);
         let screen = super::tests::screen(&self.app);
         let ManagementPage::RollbackSelection {
             details, selected, ..
@@ -524,6 +525,10 @@ fn name(value: &str) -> ComponentName {
 }
 
 fn press(app: &mut App, code: KeyCode) {
+    if code == KeyCode::Enter {
+        assert!(!app.enter_primary());
+        return;
+    }
     assert!(!app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
 }
 
@@ -593,7 +598,8 @@ async fn keyboard_subset_rollback_requires_plain_confirmation_and_preserves_exac
     ));
     assert!(fixture.driver.0.lock().unwrap().mutations.is_empty());
     fixture.open_review().await;
-    press(&mut fixture.app, KeyCode::Char('c'));
+    press(&mut fixture.app, KeyCode::Down);
+    press(&mut fixture.app, KeyCode::Enter);
     finished(&mut fixture.app).await;
     let screen = super::tests::screen(&fixture.app);
     assert_completed(&fixture, &screen);

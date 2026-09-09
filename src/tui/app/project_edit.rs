@@ -548,3 +548,70 @@ fn scroll_key(key: KeyCode, scroll: &mut u16) {
         _ => *scroll,
     };
 }
+
+impl ProjectEditScreen {
+    pub(super) fn actions(&self) -> Option<super::actions::Actions> {
+        use super::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        let draft = self.draft.as_ref()?;
+        Some(match &self.page {
+            ProjectEditPage::Home => Actions::new(
+                &[
+                    (t("Components", "组件"), 'c'),
+                    (t("Environments", "环境"), 'e'),
+                    (t("Project name", "项目名称"), 'n'),
+                    (t("Preview and save", "预览并保存"), 'p'),
+                ],
+                0,
+                0,
+            ),
+            ProjectEditPage::Components { cursor } => Actions::new(
+                &[
+                    (t("Add component", "添加组件"), 'a'),
+                    (t("Discover components", "发现组件"), 'f'),
+                    (t("Remove selected component…", "移除选中的组件…"), 'd'),
+                ],
+                draft.setup.components.len(),
+                *cursor,
+            ),
+            ProjectEditPage::Environments { cursor } => Actions::new(
+                &[
+                    (t("Add environment", "添加环境"), 'a'),
+                    (t("Remove selected environment…", "移除选中的环境…"), 'd'),
+                ],
+                draft.setup.environments.len(),
+                *cursor,
+            ),
+            ProjectEditPage::Commands { form, cursor } => Actions::new(
+                &[
+                    (t("Add command", "添加命令"), 'a'),
+                    (t("Remove command", "移除命令"), 'd'),
+                ],
+                form.commands.len(),
+                *cursor,
+            ),
+            ProjectEditPage::Command {
+                form,
+                command,
+                cursor,
+            } => Actions::new(
+                &[
+                    (t("Add argument", "添加参数"), 'a'),
+                    (t("Remove argument", "移除参数"), 'd'),
+                ],
+                form.commands.get(*command)?.args.len() + 1,
+                *cursor,
+            ),
+            ProjectEditPage::Preview(_) => {
+                Actions::confirmation(t("Save configuration", "保存配置"), 'c')
+            }
+            ProjectEditPage::Delete(_) => {
+                Actions::confirmation(t("Confirm removal", "确认移除"), 'c')
+            }
+            ProjectEditPage::Discard => {
+                Actions::confirmation(t("Discard changes", "放弃修改"), 'c')
+            }
+            _ => return None,
+        })
+    }
+}

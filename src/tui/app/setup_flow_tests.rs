@@ -1,6 +1,10 @@
 use super::*;
 
 fn press(app: &mut App, code: KeyCode) {
+    if code == KeyCode::Enter {
+        assert!(!app.enter_primary());
+        return;
+    }
     assert!(!app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
 }
 

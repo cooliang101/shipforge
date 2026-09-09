@@ -1034,7 +1034,14 @@ async fn failed_connection_list_is_unknown_not_empty_and_retry_is_read_only() {
     assert!(text.contains("UNKNOWN"));
     assert!(!text.contains("No saved connections."));
     press(&mut app, KeyCode::Enter);
-    assert!(app.connections_task.is_none());
+    wait(&mut app).await;
+    assert!(matches!(
+        app.screen,
+        Screen::Connections(ConnectionsScreen {
+            page: ConnectionsPage::Unavailable,
+            ..
+        })
+    ));
     DestinationRegistry::new()
         .save(&directory.path().join("destinations.yaml"))
         .unwrap();

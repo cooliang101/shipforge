@@ -619,6 +619,35 @@ fn mark_rows(rows: Vec<String>, cursor: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+impl ManualComponentScreen {
+    pub(super) fn actions(&self) -> Option<super::actions::Actions> {
+        use super::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        Some(match self.page {
+            Page::Commands { cursor } => Actions::new(
+                &[
+                    (t("Add command", "添加命令"), 'a'),
+                    (t("Remove selected command", "移除选中命令"), 'd'),
+                ],
+                self.commands.len(),
+                cursor,
+            ),
+            Page::Command { index, cursor } => Actions::new(
+                &[
+                    (t("Add argument", "添加参数"), 'a'),
+                    (t("Remove selected argument", "移除选中参数"), 'd'),
+                ],
+                self.commands.get(index)?.args.len() + 1,
+                cursor,
+            ),
+            Page::Preview { .. } => {
+                Actions::confirmation(t("Add component to draft", "将组件加入草稿"), 'c')
+            }
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

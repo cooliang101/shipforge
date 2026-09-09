@@ -77,7 +77,7 @@ pub(super) fn fixture() -> (TempDir, App) {
         directory.path(),
     )
     .unwrap();
-    app.open_management(directory.path().to_owned(), config);
+    app.initialize_management(directory.path().to_owned(), config);
     (directory, app)
 }
 
@@ -155,7 +155,7 @@ async fn malformed_credentials_never_echo_input_through_management_errors() {
         assert!(app.message.is_none());
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Char('i')));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         finished(&mut app).await;
         let message = app.message.as_deref().unwrap();
         assert!(message.contains("Credential registry"));
@@ -248,6 +248,7 @@ fn stale_results_do_not_replace_current_screen_or_clear_the_active_request() {
     let (_directory, mut app) = fixture();
     let id = uuid::Uuid::now_v7();
     app.management_task = Some(ManagementTask {
+        skip_home_on_success: false,
         id,
         origin: screen(&app),
         cancellation: CancellationToken::new(),
@@ -281,6 +282,7 @@ fn matching_completion_joins_worker_tail_and_reports_tail_panic_without_payload(
     });
     let id = uuid::Uuid::now_v7();
     app.management_task = Some(ManagementTask {
+        skip_home_on_success: false,
         id,
         origin: screen(&app),
         cancellation: CancellationToken::new(),
@@ -319,6 +321,7 @@ fn cancelled_inspection_keeps_report_even_when_worker_tail_panics() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     app.management_task = Some(ManagementTask {
+        skip_home_on_success: false,
         id,
         origin: screen(&app),
         cancellation,
@@ -369,7 +372,7 @@ async fn inspection_sends_only_the_explicitly_selected_component_subset() {
     };
     assert!(names.len() >= 2);
     app.handle_key(key(KeyCode::Char(' ')));
-    app.handle_key(key(KeyCode::Enter));
+    app.enter_primary();
     finished(&mut app).await;
     let requests = fake.requests.lock().unwrap();
     let ManagementRequest::Inspect { selected, source } = &requests[0] else {
@@ -391,7 +394,7 @@ fn empty_inspection_selection_never_starts_a_worker() {
     {
         selected.clear();
     }
-    app.handle_key(key(KeyCode::Enter));
+    app.enter_primary();
     assert!(app.management_task.is_none());
     assert!(render_screen(&screen(&app), &app).contains("Select at least one Component"));
     assert!(!screen(&app).help().contains("Enter inspect"));
@@ -406,14 +409,14 @@ fn management_remembers_current_environment_by_id_without_historical_override() 
     extra.id = EnvironmentId::new();
     config.environments.insert("alpha".into(), extra);
     app.remember_environment(&config, &original.environment);
-    app.open_management(directory.path().to_owned(), config.clone());
+    app.initialize_management(directory.path().to_owned(), config.clone());
     assert_eq!(screen(&app).scope.environment, original.environment);
     app.handle_key(key(KeyCode::Left));
     assert_eq!(app.preferred_environment(&config).as_deref(), Some("alpha"));
     let renamed = config.environments.remove("alpha").unwrap();
     let remembered_id = renamed.id.clone();
     config.environments.insert("z-renamed".into(), renamed);
-    app.open_management(directory.path().to_owned(), config.clone());
+    app.initialize_management(directory.path().to_owned(), config.clone());
     assert_eq!(screen(&app).scope.environment, "z-renamed");
     let mut historical = screen(&app);
     Arc::make_mut(&mut historical.scope).historical_environment =
@@ -425,7 +428,7 @@ fn management_remembers_current_environment_by_id_without_historical_override() 
         Some("z-renamed")
     );
     app.handle_key(key(KeyCode::Esc));
-    app.open_management(directory.path().to_owned(), config);
+    app.initialize_management(directory.path().to_owned(), config);
     assert_eq!(screen(&app).scope.environment_id(), Some(&remembered_id));
     assert!(screen(&app).scope.historical_environment.is_none());
 }
@@ -539,4 +542,35 @@ fn unavailable_rollback_options_cannot_be_selected_and_empty_enter_does_nothing(
         )
         .is_none()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn management_opens_history_directly_and_returns_to_overview_without_creating_files() {
+    let (directory, mut app) = fixture();
+    let config = screen(&app).scope.config.clone();
+    app.open_management(directory.path().into(), config);
+    finished(&mut app).await;
+    assert!(matches!(screen(&app).page, ManagementPage::History { .. }));
+    assert!(screen(&app).back.is_empty());
+    assert!(!directory.path().join("history.sqlite3").exists());
+    app.handle_key(key(KeyCode::Esc));
+    assert!(matches!(app.screen, Screen::Overview { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_initial_history_read_does_not_present_an_empty_history_as_evidence() {
+    let (directory, mut app) = fixture();
+    let config = screen(&app).scope.config.clone();
+    app.open_management(directory.path().into(), config);
+    app.handle_key(key(KeyCode::Esc));
+    finished(&mut app).await;
+    assert!(matches!(screen(&app).page, ManagementPage::Home));
+    assert!(
+        screen(&app)
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("cancelled")
+    );
+    assert!(!directory.path().join("history.sqlite3").exists());
 }

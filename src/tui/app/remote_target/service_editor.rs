@@ -456,6 +456,36 @@ fn move_cursor(key: KeyCode, cursor: &mut usize, count: usize) {
     }
 }
 
+impl ServiceEditor {
+    pub(in crate::tui::app) fn actions_menu(&self) -> Option<crate::tui::app::actions::Actions> {
+        use crate::tui::app::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        Some(match self.page {
+            Page::Action { stage, cursor } => Actions::new(
+                &[
+                    (t("Add command", "添加命令"), 'a'),
+                    (t("Remove selected command", "移除选中命令"), 'd'),
+                ],
+                self.actions[stage].len(),
+                cursor,
+            ),
+            Page::Arguments {
+                stage,
+                command,
+                cursor,
+            } => Actions::new(
+                &[
+                    (t("Add argument", "添加参数"), 'a'),
+                    (t("Remove selected argument", "移除选中参数"), 'd'),
+                ],
+                self.actions[stage][command].len(),
+                cursor,
+            ),
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

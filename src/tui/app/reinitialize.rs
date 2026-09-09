@@ -553,3 +553,21 @@ fn preview_text(preview: &ProjectReinitializePreview) -> String {
 
 #[cfg(test)]
 mod tests;
+
+impl ReinitializeScreen {
+    pub(super) fn actions(&self) -> Option<super::actions::Actions> {
+        use super::actions::Actions;
+        use crate::tui::i18n::choose as t;
+        Some(match self.page {
+            ReinitializePage::Intro => Actions::new(
+                &[(t("Preview reinitialization", "预览重新初始化"), 'r')],
+                0,
+                0,
+            ),
+            ReinitializePage::Preview(_) => {
+                Actions::confirmation(t("Confirm reinitialization", "确认重新初始化"), 'c')
+            }
+            ReinitializePage::Working { .. } => return None,
+        })
+    }
+}

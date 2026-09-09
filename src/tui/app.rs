@@ -14,6 +14,7 @@ use std::{
 use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod actions;
 mod attention;
 mod connections;
 mod logs;
@@ -486,6 +487,7 @@ pub(super) struct App {
     reinitialize_task: Option<reinitialize::ReinitializeTask>,
     remote_target_task: Option<remote_target::RemoteTargetTask>,
     navigation: navigation::ProjectNavigation,
+    action_cursor: Option<usize>,
     pub picker: Option<crate::tui::picker::Picker>,
     pub language: crate::tui::i18n::Language,
     pub language_menu: Option<crate::tui::i18n::Language>,
@@ -497,6 +499,7 @@ pub(super) struct App {
     pub log_workspace: Option<logs::LogWorkspace>,
     pending_clipboard: Option<String>,
     exit_state: ExitState,
+    project_exit_armed_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -598,6 +601,7 @@ impl App {
             reinitialize_task: None,
             remote_target_task: None,
             navigation: navigation::ProjectNavigation::default(),
+            action_cursor: None,
             picker: None,
             help_open: false,
             help_scroll: 0,
@@ -607,6 +611,7 @@ impl App {
             log_workspace: None,
             pending_clipboard: None,
             exit_state: ExitState::Running,
+            project_exit_armed_at: None,
         };
         if language.is_err() {
             app.message = Some(
@@ -706,6 +711,16 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(self.screen, Screen::Projects)
+            || key.code != KeyCode::Esc
+            || !key.modifiers.is_empty()
+            || self.help_open
+            || self.picker.is_some()
+            || self.log_workspace.is_some()
+            || self.language_menu.is_some()
+        {
+            self.project_exit_armed_at = None;
+        }
         if let Some(should_exit) = self.handle_modal_key(key) {
             return should_exit;
         }
@@ -715,9 +730,13 @@ impl App {
             return false;
         }
         if self.handle_search_key(key) {
+            self.action_cursor = None;
             return false;
         }
         self.message = None;
+        let Some(key) = self.action_key(key) else {
+            return false;
+        };
         // Dispatch latency-sensitive pages before the fallback clone. Their
         // config/plan may be large, and log navigation must stay allocation-bounded.
         if matches!(self.screen, Screen::DeploymentRunning { .. }) {
@@ -972,6 +991,10 @@ impl App {
                 return Some(false);
             }
             ExitState::Running => {}
+        }
+
+        if let Some(result) = self.handle_projects_exit(key) {
+            return Some(result);
         }
 
         if key.modifiers.is_empty()
@@ -2600,13 +2623,13 @@ mod tests {
         };
         assert!(!app.handle_key(key(KeyCode::Char('d'))));
         assert!(matches!(app.screen, Screen::DeploySelection(_)));
-        assert!(!app.handle_key(key(KeyCode::Enter)));
+        assert!(!app.enter_primary());
         wait_for_screen(&mut app, |screen| {
             matches!(screen, Screen::DeploymentReview { .. })
         })
         .await;
         assert!(!gateway.executed.load(Ordering::SeqCst));
-        assert!(!app.handle_key(key(KeyCode::Enter)));
+        assert!(!app.enter_primary());
         assert!(!gateway.executed.load(Ordering::SeqCst));
         for modifiers in [
             KeyModifiers::CONTROL,
@@ -2659,7 +2682,7 @@ mod tests {
         if process_exit {
             assert_eq!(app.exit_state(), ExitState::Waiting);
         } else {
-            assert!(!app.handle_key(key(KeyCode::Enter)));
+            assert!(!app.handle_key(key(KeyCode::Esc)));
             assert!(matches!(app.screen, Screen::Overview { .. }));
         }
     }
@@ -2898,9 +2921,9 @@ mod tests {
             service,
         )
         .unwrap();
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         let Screen::SetupDestinations(destinations) = app.screen.clone() else {
             panic!("expected Destination setup");
         };
@@ -2943,7 +2966,7 @@ mod tests {
         )
         .unwrap();
 
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         let Screen::Browser(browser) = &app.screen else {
             panic!("expected browser");
         };
@@ -2962,7 +2985,7 @@ mod tests {
             directory.path(),
         )
         .unwrap();
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
         assert!(matches!(app.screen, Screen::SetupComponents(_)));
         assert!(!directory.path().join("projects.yaml").exists());
@@ -3001,7 +3024,7 @@ mod tests {
             directory.path(),
         )
         .unwrap();
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
         let Screen::SetupComponents(setup) = &app.screen else {
             panic!("expected Component setup");
@@ -3048,9 +3071,9 @@ mod tests {
         )
         .unwrap();
 
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char(' ')));
 
         let Screen::SetupDestinations(setup) = &app.screen else {
@@ -3123,9 +3146,9 @@ mod tests {
         .unwrap();
         app.home_directory = Some(directory.path().to_owned());
 
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('a')));
 
         let Screen::NewSshDestination(draft) = &app.screen else {
@@ -3144,7 +3167,7 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::F(3)));
         assert!(matches!(app.screen, Screen::KeyBrowser { .. }));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
         let Screen::NewSshDestination(draft) = &app.screen else {
             panic!("expected SSH form after key selection");
@@ -3176,9 +3199,9 @@ mod tests {
             directory.path(),
         )
         .unwrap();
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         let Screen::SetupDestinations(destinations) = app.screen.clone() else {
             panic!("expected Destination setup");
         };
@@ -3228,7 +3251,7 @@ mod tests {
             panic!("expected remote setup selection after authentication");
         };
         assert_eq!(selection.root_state, Some(SetupRootState::Missing));
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         let Screen::SetupDestinations(setup) = &app.screen else {
             panic!("expected Destination setup after selecting remote settings");
         };
@@ -3426,7 +3449,7 @@ mod tests {
         allow_background_task_to_run(&mut app).await;
         assert!(matches!(app.screen, Screen::HostKeyConfirm { .. }));
 
-        app.handle_key(key(KeyCode::Enter));
+        app.enter_primary();
         assert!(matches!(app.screen, Screen::HostKeyConfirm { .. }));
         app.handle_key(key(KeyCode::Char('y')));
         allow_background_task_to_run(&mut app).await;
@@ -3461,7 +3484,7 @@ mod tests {
                 panic!("password expected")
             };
             assert_eq!(protected.unlock().unwrap().as_str(), password);
-            app.handle_key(key(KeyCode::Enter));
+            app.enter_primary();
             allow_background_task_to_run(&mut app).await;
             assert!(!directory.path().join("credentials.yaml").exists());
             app.handle_key(key(KeyCode::Char('y')));

@@ -42,11 +42,17 @@ pub(super) fn render(
             path_label(root),
             app.overview_targets(config)
         );
+        let scroll = usize::from(app.overview_scroll()).min(
+            content
+                .lines()
+                .count()
+                .saturating_sub(usize::from(area.height.saturating_sub(2))),
+        );
         frame.render_widget(
             Paragraph::new(content)
                 .block(block(language.choose(" Project overview ", " 项目概览 ")))
                 .wrap(Wrap { trim: false })
-                .scroll((app.overview_scroll(), 0)),
+                .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
             area,
         );
         return;
@@ -58,7 +64,6 @@ pub(super) fn render(
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(if area.width >= 78 { 4 } else { 5 }),
         ])
         .split(area);
     let info = vec![
@@ -82,7 +87,6 @@ pub(super) fn render(
         areas[0],
     );
     render_targets(frame, areas[2], app, config);
-    render_actions(frame, areas[4], language);
 }
 fn render_targets(frame: &mut Frame<'_>, area: Rect, app: &App, config: &ProjectConfig) {
     let language = app.language;
@@ -157,74 +161,6 @@ fn render_targets(frame: &mut Frame<'_>, area: Rect, app: &App, config: &Project
                 .wrap(Wrap { trim: false })
                 .scroll((app.overview_scroll(), 0)),
             area,
-        );
-    }
-}
-fn render_actions(frame: &mut Frame<'_>, area: Rect, language: Language) {
-    let buttons = [
-        (
-            " d ",
-            language.choose("Deploy", "发布"),
-            language.choose("Select components & preview", "选择组件并预览"),
-        ),
-        (
-            " m ",
-            language.choose("History & recovery", "历史与恢复"),
-            language.choose("Inspect status or plan rollback", "查看状态或计划回退"),
-        ),
-        (
-            " e ",
-            language.choose("Configuration", "配置"),
-            language.choose("Edit local project settings", "编辑本地项目配置"),
-        ),
-    ];
-    let actions = area;
-    let outer = block(language.choose(" Actions ", " 操作 "));
-    let inner = outer.inner(actions);
-    frame.render_widget(outer, actions);
-    if area.width >= 78 {
-        let columns = Layout::horizontal([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(inner);
-        for ((key, title, detail), cell) in buttons.into_iter().zip(columns.iter()) {
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled(
-                            key,
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!(" {title}")),
-                    ]),
-                    Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
-                ]),
-                *cell,
-            );
-        }
-    } else {
-        frame.render_widget(
-            Paragraph::new(
-                buttons
-                    .map(|(key, title, _)| {
-                        Line::from(vec![
-                            Span::styled(
-                                key,
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(format!(" {title}")),
-                        ])
-                    })
-                    .to_vec(),
-            ),
-            inner,
         );
     }
 }

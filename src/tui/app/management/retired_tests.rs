@@ -148,7 +148,7 @@ async fn removed_environment_history_logs_and_reports_survive_same_name_recreati
         "private-invalid-credential-input",
     )
     .unwrap();
-    app.open_management(directory.path().to_owned(), config);
+    app.initialize_management(directory.path().to_owned(), config);
     browse_removed_environment(
         &mut app,
         &new_deployment,
