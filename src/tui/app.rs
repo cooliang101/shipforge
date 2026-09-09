@@ -696,6 +696,7 @@ impl App {
         if completed_id != request_id {
             return;
         }
+        self.action_cursor = Some(0);
         if cancelled {
             self.screen = Screen::DeploySelection(selection);
             self.message = Some("Deployment check cancelled. The completed plan was discarded; review the selection before checking again.".into());
@@ -953,6 +954,7 @@ impl App {
             KeyCode::Esc => {
                 if let Screen::DeploymentReview { plan, .. } = &self.screen {
                     self.screen = Screen::DeploySelection(selection_state(&plan.selection));
+                    self.action_cursor = Some(0);
                 }
             }
             _ => {}
@@ -1193,6 +1195,7 @@ impl App {
             component_cursor: 0,
             selected,
         });
+        self.action_cursor = Some(0);
     }
 
     fn move_deploy_component(&mut self, forward: bool) {
@@ -2629,8 +2632,7 @@ mod tests {
         })
         .await;
         assert!(!gateway.executed.load(Ordering::SeqCst));
-        assert!(!app.enter_primary());
-        assert!(!gateway.executed.load(Ordering::SeqCst));
+        assert_eq!(app.action_cursor, Some(0));
         for modifiers in [
             KeyModifiers::CONTROL,
             KeyModifiers::ALT,
@@ -2640,7 +2642,7 @@ mod tests {
             assert!(matches!(app.screen, Screen::DeploymentReview { .. }));
             assert!(!gateway.executed.load(Ordering::SeqCst));
         }
-        assert!(!app.handle_key(key(KeyCode::Char('c'))));
+        assert!(!app.handle_key(key(KeyCode::Enter)));
         assert!(matches!(app.screen, Screen::DeploymentRunning { .. }));
         assert!(!app.handle_key(key(KeyCode::Char('q'))));
         assert!(matches!(app.screen, Screen::DeploymentRunning { .. }));

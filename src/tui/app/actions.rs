@@ -161,7 +161,7 @@ impl App {
             Screen::ManualComponent(screen) => return screen.actions(),
             Screen::Reinitialize(screen) => return screen.actions(),
             Screen::DeploymentReview { .. } => {
-                Actions::confirmation(choose("Confirm deployment", "确认发布"), 'c')
+                Actions::new(&[(choose("Confirm deployment", "确认发布"), 'c')], 0, 0)
             }
             Screen::SetupReview { .. } => {
                 Actions::confirmation(choose("Save configuration", "保存配置"), 'c')
@@ -269,6 +269,7 @@ impl App {
     pub(super) fn enter_primary(&mut self) -> bool {
         if let Some(actions) = self.page_actions()
             && actions.toggle
+            && self.action_cursor.is_none()
         {
             for _ in 0..actions.rows.saturating_sub(actions.row) {
                 self.handle_key(KeyEvent::new(KeyCode::Down, super::KeyModifiers::NONE));
@@ -309,6 +310,26 @@ mod tests {
         assert!(!app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
 
+    fn assert_highlighted_action(app: &App, label: &str) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render(frame, app))
+            .unwrap();
+        let highlighted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.bg == Color::Cyan)
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            highlighted.contains(label),
+            "missing focused {label}: {highlighted}"
+        );
+    }
+
     #[test]
     fn overview_and_component_selection_use_arrows_and_enter() {
         let (_directory, mut app) = fixture();
@@ -318,6 +339,9 @@ mod tests {
         };
         let original = selection.selected.clone();
         let count = super::super::deployment_components(selection).len();
+        assert_eq!(app.action_cursor, Some(0));
+        assert_highlighted_action(&app, "Continue");
+        press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Enter);
         let Screen::DeploySelection(selection) = &app.screen else {
             panic!("Enter must toggle, never plan");
@@ -350,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_requires_explicit_focus_and_rejects_modified_enter() {
+    fn deployment_confirmation_defaults_to_confirm_and_rejects_modified_enter() {
         let (_directory, mut app) = fixture();
         let Screen::Overview { root, config } = app.screen.clone() else {
             unreachable!()
@@ -370,10 +394,9 @@ mod tests {
             },
             scroll: 0,
         };
-        press(&mut app, KeyCode::Enter);
-        assert!(matches!(app.screen, Screen::DeploymentReview { .. }));
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.action_cursor, Some(0));
+        assert_highlighted_action(&app, "Confirm deployment");
+        press(&mut app, KeyCode::PageDown);
+        assert_highlighted_action(&app, "Confirm deployment");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert!(matches!(app.screen, Screen::DeploymentReview { .. }));
         assert_eq!(

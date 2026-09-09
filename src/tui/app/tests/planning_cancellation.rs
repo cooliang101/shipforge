@@ -122,10 +122,7 @@ async fn cancelled_real_planning_worker_discards_late_success_before_allowing_a_
         assert_eq!(restored.config, original.config);
         assert_eq!(restored.selected, original.selected);
         assert_eq!(restored.environment_cursor, original.environment_cursor);
-        assert_eq!(
-            restored.component_cursor,
-            deployment_components(restored).len() - 1
-        );
+        assert_eq!(restored.component_cursor, original.component_cursor);
         assert!(
             app.message
                 .as_deref()
