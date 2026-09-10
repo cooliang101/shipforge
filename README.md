@@ -52,11 +52,11 @@ cargo build --release
 
 ### 让 AI Agent 协助配置（可复制）
 
-在需要部署的项目中打开 AI Agent，复制下面整段内容发送。提示词会引导 Agent 先阅读 [AI Agent 配置接入指南](https://github.com/cooliang101/shipforge/blob/codex/qa-01/docs/ai-agent-configuration.md)，再根据当前项目整理和保存配置。
+在需要部署的项目中打开 AI Agent，复制下面整段内容发送。提示词会引导 Agent 先阅读 [AI Agent 配置接入指南](https://github.com/cooliang101/shipforge/blob/main/docs/ai-agent-configuration.md)，再根据当前项目整理和保存配置。
 
 ```text
 请为当前项目接入 ShipForge 部署配置。先完整阅读以下指南，并按需阅读其中链接的配置规范和 TUI 使用指南，再开始配置：
-https://github.com/cooliang101/shipforge/blob/codex/qa-01/docs/ai-agent-configuration.md
+https://github.com/cooliang101/shipforge/blob/main/docs/ai-agent-configuration.md
 
 请检查当前项目已有的 shipforge.yaml、README、构建与发布脚本，以及 package.json、Cargo.toml、go.mod 等相关文件，沿用实际构建和部署方式。指南中的项目名、连接、路径和服务名只是示例，不要复制到当前项目。
 
@@ -70,8 +70,8 @@ https://github.com/cooliang101/shipforge/blob/codex/qa-01/docs/ai-agent-configur
 ### 3. 发布和后续更新
 
 1. 打开已保存项目，在概览中用左右键选择环境，按 `d` 选择本次要发布的组件。
-2. 按页面提示进入检查和计划预览。本机构建及产物校验完成后，核对连接端点、远端目录、版本、应用文件范围、服务命令和检查。
-3. 在执行确认页按 `c` 发布；回车不能代替执行确认。
+2. 按页面提示完成 Git 与远端预检，进入计划预览，核对连接端点、远端目录、版本、应用文件范围、服务命令和检查。
+3. 在执行确认页按 `c`，或选中确认操作后按回车，开始构建、产物校验及发布。
 4. 完成后查看每个组件的结果、恢复结果和记录保存告警。按 `l` 查看日志。未配置健康检查时，成功不代表已验证业务接口。
 
 下次更新代码后，重新打开项目并重复发布流程即可。修改配置时从概览按 `e`，逐层选择 `Apply`，回到编辑首页按 `p` 预览、`c` 保存。`after` 只排列本次已选组件，不会自动选中或部署依赖组件。
@@ -185,11 +185,11 @@ Create and edit configuration through the TUI. Do not manually edit the YAML or 
 
 ### Configure with an AI Agent (copyable prompt)
 
-Open your AI Agent in the project you want to deploy and send the entire prompt below. It directs the Agent to read the [AI Agent configuration guide](https://github.com/cooliang101/shipforge/blob/codex/qa-01/docs/ai-agent-configuration.md) before preparing and saving configuration for your project.
+Open your AI Agent in the project you want to deploy and send the entire prompt below. It directs the Agent to read the [AI Agent configuration guide](https://github.com/cooliang101/shipforge/blob/main/docs/ai-agent-configuration.md) before preparing and saving configuration for your project.
 
 ```text
 Set up ShipForge deployment configuration for the current project. First read this guide in full, and follow its links to the configuration specification and TUI guide as needed:
-https://github.com/cooliang101/shipforge/blob/codex/qa-01/docs/ai-agent-configuration.md
+https://github.com/cooliang101/shipforge/blob/main/docs/ai-agent-configuration.md
 
 Inspect the project's existing shipforge.yaml, README, build/deployment scripts and relevant manifests such as package.json, Cargo.toml or go.mod. Preserve the existing build and deployment approach. Treat project names, connections, paths and service names in the guide as examples; do not copy them into this project.
 
@@ -203,8 +203,8 @@ Do not read or disclose passwords or private-key contents. Have me enter passwor
 ### 3. Deploy and update an application
 
 1. Open the saved project, select an Environment with Left/Right in the overview, and press `d` to select only the Components you want to publish.
-2. Follow the prompts for checks and plan preview. After local building and artifact validation, review the connection endpoint, remote directory, version, application file scope, service commands and checks.
-3. Press `c` on the execution confirmation page to deploy. Enter does not substitute for execution confirmation.
+2. Follow the prompts for Git and remote preflight checks, then review the connection endpoint, remote directory, version, application file scope, service commands and checks in the plan preview.
+3. Press `c` on the execution confirmation page, or select the confirmation action and press Enter, to start building, artifact validation and deployment.
 4. Review each Component's outcome, recovery result and persistence warnings. Press `l` for logs. Success without a configured health check does not mean a business endpoint was verified.
 
 For later code updates, reopen the project and repeat the deployment flow. To change configuration, press `e` from the overview, Apply each form, then press `p` on the editor home page to preview and `c` to save. `after` orders only Components selected for this deployment; it does not automatically select or deploy dependencies.
