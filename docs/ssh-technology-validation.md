@@ -2,7 +2,7 @@
 
 ## Decision
 
-ShipForge uses `russh` and `russh-sftp` for the built-in `linux-ssh` Driver. It enables the `ring` crypto backend and compression support; the default AWS-LC backend was rejected after requiring an external NASM installation on the Windows GNU toolchain. The optional RSA implementation is disabled because its dependency has an unresolved timing-side-channel advisory, so the MVP accepts modern non-RSA SSH identities only. The selected configuration exposes Tokio-native connection, command-channel, SSH Agent signing, and SFTP APIs.
+ShipForge uses `russh` and `russh-sftp` for the built-in `linux-ssh` Driver. It enables the `ring` crypto backend and compression support; the default AWS-LC backend was rejected after requiring an external NASM installation on the Windows GNU toolchain. RSA IdentityFile and SSH Agent authentication are supported alongside Ed25519/ECDSA. RSA signatures negotiate SHA-512 or SHA-256; servers without signature advertisements are tried with SHA-256, and legacy SHA-1 authentication is not used. The selected configuration exposes Tokio-native connection, command-channel, SSH Agent signing, and SFTP APIs.
 
 ## Verified in Code
 

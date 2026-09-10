@@ -10,7 +10,10 @@ use std::{
 
 use russh::{
     ChannelMsg, Disconnect, Sig, client,
-    keys::{PrivateKey, PrivateKeyWithHashAlg, ssh_key::Algorithm},
+    keys::{
+        PrivateKey, PrivateKeyWithHashAlg,
+        ssh_key::{Algorithm, HashAlg},
+    },
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -671,10 +674,11 @@ async fn authenticate(
         SshCredential::IdentityFile { path } => {
             let key = load_identity_file(path, deadline, timeout).await?;
             connection_phase(deadline, timeout, USER_AUTHENTICATION_PHASE, async {
+                let hash = authentication_hash(handle, &key.algorithm()).await?;
                 handle
                     .authenticate_publickey(
                         destination.user.clone(),
-                        PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                        PrivateKeyWithHashAlg::new(Arc::new(key), hash),
                     )
                     .await
                     .map(|result| result.success())
@@ -716,11 +720,12 @@ async fn authenticate(
                 })
                 .await?;
             connection_phase(deadline, timeout, USER_AUTHENTICATION_PHASE, async {
+                let hash = authentication_hash(handle, &public_key.algorithm()).await?;
                 handle
                     .authenticate_publickey_with(
                         destination.user.clone(),
                         public_key,
-                        None,
+                        hash,
                         &mut agent,
                     )
                     .await
@@ -729,6 +734,33 @@ async fn authenticate(
             })
             .await
         }
+    }
+}
+
+async fn authentication_hash(
+    handle: &client::Handle<HostKeyVerifier>,
+    algorithm: &Algorithm,
+) -> Result<Option<HashAlg>, SshConnectionError> {
+    if !matches!(algorithm, Algorithm::Rsa { .. }) {
+        return Ok(None);
+    }
+    let advertised = handle
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|_| SshConnectionError::Protocol("SSH RSA signature negotiation failed".into()))?;
+    rsa_signature_hash(advertised).map(Some)
+}
+
+// Preserve russh's distinction between absent EXT_INFO and explicit SHA-1-only support.
+#[allow(clippy::option_option)]
+fn rsa_signature_hash(advertised: Option<Option<HashAlg>>) -> Result<HashAlg, SshConnectionError> {
+    match advertised {
+        Some(Some(hash)) => Ok(hash),
+        // Older servers may omit EXT_INFO. Try SHA-256 without falling back to SHA-1.
+        None => Ok(HashAlg::Sha256),
+        Some(None) => Err(SshConnectionError::Protocol(
+            "SSH server does not support RSA SHA-2 authentication".into(),
+        )),
     }
 }
 
@@ -899,6 +931,7 @@ pub(super) fn supported_algorithm(algorithm: &Algorithm) -> bool {
     matches!(
         algorithm,
         Algorithm::Ed25519
+            | Algorithm::Rsa { .. }
             | Algorithm::Ecdsa { .. }
             | Algorithm::SkEd25519
             | Algorithm::SkEcdsaSha2NistP256
@@ -1032,11 +1065,25 @@ mod tests {
     }
 
     #[test]
-    fn mvp_accepts_only_modern_non_rsa_algorithms() {
+    fn identity_algorithms_accept_rsa_but_reject_dsa() {
         assert!(ensure_supported_algorithm(&Algorithm::Ed25519).is_ok());
         assert!(ensure_supported_algorithm(&Algorithm::SkEd25519).is_ok());
-        assert!(ensure_supported_algorithm(&Algorithm::Rsa { hash: None }).is_err());
+        assert!(ensure_supported_algorithm(&Algorithm::Rsa { hash: None }).is_ok());
         assert!(ensure_supported_algorithm(&Algorithm::Dsa).is_err());
+    }
+
+    #[test]
+    fn rsa_signatures_use_sha2_without_legacy_sha1_fallback() {
+        assert_eq!(
+            rsa_signature_hash(Some(Some(HashAlg::Sha512))).unwrap(),
+            HashAlg::Sha512
+        );
+        assert_eq!(
+            rsa_signature_hash(Some(Some(HashAlg::Sha256))).unwrap(),
+            HashAlg::Sha256
+        );
+        assert_eq!(rsa_signature_hash(None).unwrap(), HashAlg::Sha256);
+        assert!(rsa_signature_hash(Some(None)).is_err());
     }
 
     #[test]

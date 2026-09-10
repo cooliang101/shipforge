@@ -819,6 +819,22 @@ async fn wait_for_channel_closes(evidence: &KnownStatusEvidence, expected: usize
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_tcp_handshake_identity_load_and_userauth_path_succeeds() {
+    identity_authentication_roundtrip(Algorithm::Ed25519, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rsa_identity_authentication_supports_openssh_and_pem_with_sha2() {
+    identity_authentication_roundtrip(Algorithm::Rsa { hash: None }, false, Some(HashAlg::Sha512))
+        .await;
+    identity_authentication_roundtrip(Algorithm::Rsa { hash: None }, true, Some(HashAlg::Sha256))
+        .await;
+}
+
+async fn identity_authentication_roundtrip(
+    algorithm: Algorithm,
+    pem: bool,
+    rsa_hash: Option<HashAlg>,
+) {
     let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let fingerprint = HostKeyFingerprint::parse(
         host_key
@@ -827,14 +843,21 @@ async fn split_tcp_handshake_identity_load_and_userauth_path_succeeds() {
             .to_string(),
     )
     .unwrap();
-    let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let identity = PrivateKey::random(&mut rand::rng(), algorithm).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let identity_path = directory.path().join("identity-file-sentinel");
-    std::fs::write(
-        &identity_path,
-        identity.to_openssh(ssh_key::LineEnding::LF).unwrap(),
-    )
-    .unwrap();
+    let mut encoded = Vec::new();
+    if pem {
+        russh::keys::encode_pkcs8_pem(&identity, &mut encoded).unwrap();
+    } else {
+        encoded.extend_from_slice(
+            identity
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        );
+    }
+    std::fs::write(&identity_path, encoded).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let commands = Arc::new(Mutex::new(Vec::new()));
@@ -844,12 +867,19 @@ async fn split_tcp_handshake_identity_load_and_userauth_path_succeeds() {
         authentication_started: None,
         authentication_gate: None,
     };
-    let config = Arc::new(server::Config {
+    let mut config = server::Config {
         keys: vec![host_key],
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
         ..server::Config::default()
-    });
+    };
+    if let Some(hash) = rsa_hash {
+        config.preferred.key = std::borrow::Cow::Owned(vec![
+            Algorithm::Ed25519,
+            Algorithm::Rsa { hash: Some(hash) },
+        ]);
+    }
+    let config = Arc::new(config);
     let server = async {
         let (socket, _) = listener.accept().await.unwrap();
         server::run_stream(config, socket, peer)

@@ -35,6 +35,8 @@ MVP 中用户只选择 SSH 连接，不选择 Driver。TUI 根据连接记录自
 
 ### SSH 密码登录
 
+文件密钥及 SSH Agent 支持 RSA、Ed25519/ECDSA 身份。现有 RSA `.pem` 或 OpenSSH 私钥无需转换；RSA 登录使用 SHA-256/512 签名，不回退到旧的 SHA-1。加密私钥仍需通过 SSH Agent 使用。主机指纹校验与连接认证成功后保存的流程不变。RSA 依赖的兼容性取舍见 [SSH 技术决策](adr/0013-use-russh-for-ssh-transport.md)。
+
 服务命令支持使用已保存的 SSH 登录密码完成 sudo 认证，不要求新增 NOPASSWD 或修改服务器权限。在服务命令编辑页选中启停动作，按 `p` 添加/移除密码 sudo；已有 `sudo -n` 可转为该方式。规范 argv 为 `[/usr/bin/sudo, -S, --, /usr/bin/systemctl, restart, --, app.service]`，停止动作使用 `stop`。保存的命令仍按组件及环境管理，恢复沿用冻结的命令，不增加配置 schema。
 
 执行器为该显式格式设置专用提示，收到 stderr 密码提示后才解密并通过 SSH stdin 发送一次密码，随后关闭 stdin。未提示时不发送；不申请终端、不修改 sudoers，也不把密码放到 Shell/argv。密码 sudo 通道的 stdout/stderr 不返回、不记录，以防 PAM 或子进程回显密码；退出状态及失败命令仍保留。取消、超时和结果未知沿用原有保守恢复规则。此方式适用于 SSH 登录与 sudo 使用同一密码的账号；独立 sudo 密码、密钥/Agent 登录后的 sudo 密码输入、requiretty、MFA 不在该功能范围。缺少保存密码或 argv 格式不正确时预检拒绝，sudo 政策及密码正确性由实际执行结果确定。
