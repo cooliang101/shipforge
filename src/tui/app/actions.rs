@@ -218,10 +218,26 @@ impl App {
         }
         let focus = self.action_cursor.or((actions.rows == 0).then_some(0));
         match (key.code, focus) {
+            (KeyCode::Down, Some(index)) if index + 1 >= actions.items.len() => {
+                if actions.rows == 0 {
+                    self.action_cursor = Some(0);
+                } else {
+                    self.action_cursor = None;
+                    key.code = KeyCode::Home;
+                    return Some(key);
+                }
+            }
             (KeyCode::Down, Some(index)) => {
                 self.action_cursor = Some((index + 1).min(actions.items.len().saturating_sub(1)));
             }
-            (KeyCode::Up, Some(0)) if actions.rows > 0 => self.action_cursor = None,
+            (KeyCode::Up, Some(0)) if actions.rows > 0 => {
+                self.action_cursor = None;
+                key.code = KeyCode::End;
+                return Some(key);
+            }
+            (KeyCode::Up, Some(0) | None) if actions.row == 0 || actions.rows == 0 => {
+                self.action_cursor = Some(actions.items.len().saturating_sub(1));
+            }
             (KeyCode::Up, Some(index)) => self.action_cursor = Some(index.saturating_sub(1)),
             (KeyCode::Down, None) if actions.row + 1 >= actions.rows => {
                 self.action_cursor = Some(0);
@@ -292,6 +308,48 @@ impl App {
 mod tests {
     use super::super::KeyModifiers;
     use super::*;
+
+    #[test]
+    fn browser_navigation_wraps_through_list_and_actions_in_both_directions() {
+        let (directory, mut app) = fixture();
+        std::fs::create_dir(directory.path().join("a")).unwrap();
+        std::fs::create_dir(directory.path().join("b")).unwrap();
+        app.open_browser(directory.path());
+        let actions = app.page_actions().unwrap();
+        let total = actions.rows + actions.items.len();
+        for direction in [KeyCode::Down, KeyCode::Up] {
+            for step in 1..=total * 2 {
+                press(&mut app, direction);
+                let state = app.page_actions().unwrap();
+                let position = app
+                    .action_cursor
+                    .map_or(state.row, |index| state.rows + index);
+                let expected = if direction == KeyCode::Down {
+                    step % total
+                } else {
+                    (total - step % total) % total
+                };
+                assert_eq!(position, expected);
+            }
+        }
+        assert!(matches!(app.screen, Screen::Browser(_)));
+        assert!(!app.registry_path.exists());
+    }
+
+    #[test]
+    fn action_only_navigation_wraps_without_executing_actions() {
+        let (_directory, mut app) = fixture();
+        let count = app.page_actions().unwrap().items.len();
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.action_cursor, Some(count - 1));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.action_cursor, Some(0));
+        for _ in 0..count {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.action_cursor, Some(0));
+        assert!(matches!(app.screen, Screen::Overview { .. }));
+    }
 
     #[test]
     fn project_browser_parent_action_works_with_children_and_empty_directories() {
@@ -408,9 +466,8 @@ mod tests {
             unreachable!()
         };
         assert_eq!(selection.selected, original);
-        for _ in 0..count {
-            press(&mut app, KeyCode::Down);
-        }
+        assert_eq!(selection.component_cursor, count - 1);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.action_cursor, Some(0));
         press(&mut app, KeyCode::Up);
         assert_eq!(app.action_cursor, None);

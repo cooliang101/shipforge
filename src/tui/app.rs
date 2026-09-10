@@ -870,6 +870,15 @@ impl App {
             }
             KeyCode::Up => self.move_deploy_component(false),
             KeyCode::Down => self.move_deploy_component(true),
+            KeyCode::Home | KeyCode::End => {
+                if let Screen::DeploySelection(selection) = &mut self.screen {
+                    selection.component_cursor = if key == KeyCode::Home {
+                        0
+                    } else {
+                        deployment_components(selection).len().saturating_sub(1)
+                    };
+                }
+            }
             KeyCode::Char(' ') => {
                 let component = match &self.screen {
                     Screen::DeploySelection(selection) => selection
@@ -1406,6 +1415,15 @@ impl App {
 
     fn handle_setup_components(&mut self, key: KeyCode, setup: &ComponentSetupState) {
         match key {
+            KeyCode::Home | KeyCode::End => {
+                if let Screen::SetupComponents(current) = &mut self.screen {
+                    current.cursor = if key == KeyCode::Home {
+                        0
+                    } else {
+                        current.report.components.len().saturating_sub(1)
+                    };
+                }
+            }
             KeyCode::Char('a') => {
                 self.screen = Screen::ManualComponent(setup_manual::ManualComponentScreen::new(
                     setup.clone(),
@@ -1467,6 +1485,15 @@ impl App {
             .map(|candidate| candidate.name.clone())
             .collect::<Vec<_>>();
         match key {
+            KeyCode::Home | KeyCode::End => {
+                if let Screen::SetupDestinations(current) = &mut self.screen {
+                    current.destination_cursor = if key == KeyCode::Home {
+                        0
+                    } else {
+                        current.destinations.len().saturating_sub(1)
+                    };
+                }
+            }
             KeyCode::Left => {
                 if let Screen::SetupDestinations(current) = &mut self.screen {
                     current.component_cursor = current.component_cursor.saturating_sub(1);
@@ -2017,6 +2044,8 @@ impl App {
             KeyCode::Char('c') => self.open_connections(),
             KeyCode::Char('x') => self.preview_recent_removal(),
             KeyCode::Char('f') => self.refresh_recent(),
+            KeyCode::Home => self.selected_recent = 0,
+            KeyCode::End => self.selected_recent = item_count.saturating_sub(1),
             KeyCode::Up => self.selected_recent = self.selected_recent.saturating_sub(1),
             KeyCode::Down => {
                 self.selected_recent = (self.selected_recent + 1).min(item_count - 1);
@@ -2038,6 +2067,15 @@ impl App {
 
     fn handle_browser(&mut self, key: KeyCode, browser: &DirectoryBrowser) {
         match key {
+            KeyCode::Home | KeyCode::End => {
+                if let Screen::Browser(current) = &mut self.screen {
+                    current.selected = if key == KeyCode::Home {
+                        0
+                    } else {
+                        current.children.len().saturating_sub(1)
+                    };
+                }
+            }
             KeyCode::Up => {
                 if let Screen::Browser(current) = &mut self.screen {
                     current.selected = current.selected.saturating_sub(1);
