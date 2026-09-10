@@ -131,11 +131,20 @@ impl App {
                 self.recent.len() + 1,
                 self.selected_recent,
             ),
-            Screen::Browser(browser) => Actions::new(
-                &[(choose("Use this directory", "使用当前目录"), 's')],
-                browser.children.len(),
-                browser.selected,
-            ),
+            Screen::Browser(browser) => {
+                let mut actions = Actions::new(
+                    &[(choose("Use this directory", "使用当前目录"), 's')],
+                    browser.children.len(),
+                    browser.selected,
+                );
+                if browser.directory.parent().is_some() {
+                    actions.items.push((
+                        choose("Parent directory (Backspace)", "上一级目录（Backspace）"),
+                        KeyCode::Backspace,
+                    ));
+                }
+                actions
+            }
             Screen::DeploySelection(selection) => {
                 let mut actions = Actions::choice(
                     super::deployment_components(selection).len(),
@@ -283,6 +292,53 @@ impl App {
 mod tests {
     use super::super::KeyModifiers;
     use super::*;
+
+    #[test]
+    fn project_browser_parent_action_works_with_children_and_empty_directories() {
+        let (directory, mut app) = fixture();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        for with_child in [false, true] {
+            if with_child {
+                std::fs::create_dir(nested.join("child")).unwrap();
+            }
+            app.open_browser(&nested);
+            let actions = app.page_actions().unwrap();
+            assert_eq!(actions.items[1].1, KeyCode::Backspace);
+            // Move through the directory list, then past Use this directory.
+            for _ in 0..=actions.rows {
+                press(&mut app, KeyCode::Down);
+            }
+            press(&mut app, KeyCode::Enter);
+            let Screen::Browser(browser) = &app.screen else {
+                panic!("parent action must browse, not select a project");
+            };
+            assert_eq!(
+                browser.directory,
+                std::fs::canonicalize(directory.path()).unwrap()
+            );
+            assert!(super::super::super::navigation_help(&app).contains("Backspace"));
+            assert!(!app.registry_path.exists());
+        }
+    }
+
+    #[test]
+    fn project_browser_root_has_no_parent_action_and_backspace_is_a_noop() {
+        let (directory, mut app) = fixture();
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        let root = canonical.ancestors().last().unwrap().to_path_buf();
+        app.screen = Screen::Browser(super::super::DirectoryBrowser {
+            directory: root.clone(),
+            children: Vec::new(),
+            selected: 0,
+        });
+        assert_eq!(app.page_actions().unwrap().items.len(), 1);
+        press(&mut app, KeyCode::Backspace);
+        let Screen::Browser(browser) = &app.screen else {
+            panic!("stay at filesystem root");
+        };
+        assert_eq!(browser.directory, root);
+    }
 
     fn fixture() -> (tempfile::TempDir, App) {
         let directory = tempfile::tempdir().unwrap();

@@ -744,6 +744,12 @@ fn render_localized(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn navigation_help(app: &App) -> &'static str {
+    if matches!(app.screen, Screen::Browser(_)) {
+        return i18n::choose(
+            "↑/↓ select (actions after list) · Enter open/confirm · Backspace parent · Esc back",
+            "↑/↓ 选择（列表末尾进入操作） · Enter 打开/确认 · Backspace 上一级 · Esc 返回",
+        );
+    }
     if matches!(app.screen, Screen::Projects) {
         i18n::choose(
             "↑/↓ select · Enter open · Ctrl+C / Esc twice exit",
